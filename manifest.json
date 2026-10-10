@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "FastBet for chips.gg Limbo",
+  "version": "2.2.0",
+  "description": "Instant Limbo bets on chips.gg straight over the official websocket API, no animations or delays.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Show / hide FastBet panel",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["scripting"],
+  "host_permissions": ["https://chips.gg/*", "https://www.chips.gg/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chips.gg/*", "https://www.chips.gg/*"],
+      "js": ["fastbet.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

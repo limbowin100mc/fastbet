@@ -1,0 +1,134 @@
+[package]
+name = "fastbet"
+version = "3.0.0"
+edition = "2021"
+description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
+publish = false
+
+[[bin]]
+name = "fastbet"
+path = "src/main.rs"
+
+[dependencies]
+# UI
+eframe = "0.35"
+egui = "0.35"
+
+# async + networking
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = { version = "0.3", features = ["sink"] }
+async-trait = "0.1"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+rand = "0.9"
+parking_lot = "0.12"
+thiserror = "2"
+
+# http + images (slot providers, game tiles)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# embedded login window (child process)
+wry = "0.57"
+tao = "0.37"
+
+# sound
+rodio = { version = "0.20", default-features = false }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+# local time zone for bet history times
+libc = "0.2"
+
+# Installers, built by .github/workflows/release.yml with cargo-packager:
+# NSIS setup .exe on Windows, .deb and AppImage on Linux.
+[package.metadata.packager]
+product-name = "FastBet"
+identifier = "gg.fastbet.app"
+description = "Instant casino bets straight over the casino APIs."
+category = "Utility"
+icons = ["assets/icon.png", "assets/icon.ico"]
+
+[package.metadata.packager.deb]
+depends = ["libgtk-3-0", "libwebkit2gtk-4.1-0"]
+
+# WebKit's helper processes must ship inside the AppImage or the login window won't open.
+[package.metadata.packager.appimage]
+libs = [
+  "WebKitNetworkProcess",
+  "WebKitWebProcess",
+  "libwebkit2gtkinjectedbundle.so",
+]
+
+[package.metadata.packager.appimage.linuxdeploy-plugins]
+"gtk" = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+
+[package.metadata.packager.nsis]
+# offered for removal by the uninstaller: settings + saved logins, webview profiles + image cache
+appdata-paths = ["$APPDATA/fastbet/FastBet", "$LOCALAPPDATA/fastbet/FastBet"]
+# Installs Microsoft's WebView2 runtime if it's missing (the login window and slots need it).
+preinstall-section = """
+; Setup messages
+; English
+LangString webview2AbortError ${LANG_ENGLISH} "Failed to install WebView2! The app can't run without it. Try restarting the installer."
+LangString webview2DownloadError ${LANG_ENGLISH} "Error: Downloading WebView2 Failed - $0"
+LangString webview2DownloadSuccess ${LANG_ENGLISH} "WebView2 bootstrapper downloaded successfully"
+LangString webview2Downloading ${LANG_ENGLISH} "Downloading WebView2 bootstrapper..."
+LangString webview2InstallError ${LANG_ENGLISH} "Error: Installing WebView2 failed with exit code $1"
+LangString webview2InstallSuccess ${LANG_ENGLISH} "WebView2 installed successfully"
+
+Section PreInstall
+  ; Check if Webview2 is already installed and skip this section
+  ${If} ${RunningX64}
+    ReadRegStr $4 HKLM "SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${Else}
+    ReadRegStr $4 HKLM "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${EndIf}
+  ReadRegStr $5 HKCU "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+
+  StrCmp $4 "" 0 webview2_done
+  StrCmp $5 "" 0 webview2_done
+
+  Delete "$TEMP\\MicrosoftEdgeWebview2Setup.exe"
+  DetailPrint "$(webview2Downloading)"
+  nsis_tauri_utils::download "https://go.microsoft.com/fwlink/p/?LinkId=2124703" "$TEMP\\MicrosoftEdgeWebview2Setup.exe"
+  Pop $0
+  ${If} $0 == 0
+      DetailPrint "$(webview2DownloadSuccess)"
+  ${Else}
+      DetailPrint "$(webview2DownloadError)"
+      Abort "$(webview2AbortError)"
+  ${EndIf}
+  StrCpy $6 "$TEMP\\MicrosoftEdgeWebview2Setup.exe"
+
+  ; $6 holds the path to the webview2 installer
+  ExecWait "$6 /install" $1
+  ${If} $1 == 0
+    DetailPrint "$(webview2InstallSuccess)"
+  ${Else}
+    DetailPrint "$(webview2InstallError)"
+    Abort "$(webview2AbortError)"
+  ${EndIf}
+  webview2_done:
+SectionEnd
+"""
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
