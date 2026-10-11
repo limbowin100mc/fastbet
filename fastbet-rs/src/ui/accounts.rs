@@ -24,7 +24,8 @@ fn footer(ui: &Ui, full: Rect) {
     ui.painter().text(pos2(full.left() + 20.0, full.bottom() - 16.0), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(10.5), DIM);
 }
 
-/// "Pick your account": one row per casino.
+/// "Pick your account": one row per saved account (several per casino if the user likes),
+/// then "Add account", which lists the casinos.
 pub fn accounts(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     widgets::dot_grid(ui, full);
@@ -35,6 +36,11 @@ pub fn accounts(app: &mut App, ui: &mut Ui) {
         ui.add_space(22.0);
         let w = 500.0_f32.min(full.width() - 40.0);
         let mut picked = None;
+        let mut add = None;
+        // grouped by casino, in the order they were added
+        let mut accounts = app.settings.accounts.clone();
+        accounts.sort_by_key(|a| CasinoId::ALL.iter().position(|c| *c == a.casino));
+        let adding = app.adding_account || accounts.is_empty();
         Frame::new()
             .fill(BG1)
             .stroke(Stroke::new(1.0, LINE))
@@ -43,19 +49,32 @@ pub fn accounts(app: &mut App, ui: &mut Ui) {
             .show(ui, |ui| {
                 ui.set_width(w);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for id in CasinoId::ALL {
-                    let name = app.username_for(*id);
-                    let value = name.clone().unwrap_or_else(|| "Add account".to_string());
+                for a in &accounts {
+                    let value = app.account_name(a).unwrap_or_else(|| "Not logged in yet".to_string());
                     let logos = &mut app.logos;
-                    let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), *id, TEXT);
-                    if list_row(ui, mark, id.name(), &value, true).clicked() {
-                        picked = Some(*id);
+                    let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), a.casino, TEXT);
+                    if list_row(ui, mark, a.casino.name(), &value, true).clicked() {
+                        picked = Some(a.id.clone());
+                    }
+                }
+                if !accounts.is_empty() && list_row(ui, |p, r| widgets::letter_mark(p, r, "+", G2), "Add account", if adding { "Pick the casino" } else { "Another login, any casino" }, true).clicked() {
+                    app.adding_account = !app.adding_account;
+                }
+                if adding {
+                    for id in CasinoId::ALL {
+                        let logos = &mut app.logos;
+                        let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), *id, TEXT);
+                        if list_row(ui, mark, id.name(), "Add account", true).clicked() {
+                            add = Some(*id);
+                        }
                     }
                 }
                 list_row(ui, |p, r| widgets::letter_mark(p, r, "?", DIM), "More casinos", "Coming soon", false);
             });
         if let Some(id) = picked {
-            app.open_account(id);
+            app.open_account(&id);
+        } else if let Some(casino) = add {
+            app.add_account(casino);
         }
     });
     footer(ui, full);
@@ -116,7 +135,7 @@ pub fn account(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     widgets::dot_grid(ui, full);
     let id = app.casino();
-    let name = app.username_for(id);
+    let name = app.active_name();
     let busy = matches!(app.stage, Stage::Checking(_) | Stage::Login(_));
 
     // scrolls once the settings card (with the Cloudflare section open) outgrows a small window
@@ -148,7 +167,8 @@ pub fn account(app: &mut App, ui: &mut Ui) {
         });
         if app.settings.token().is_none() && !matches!(app.stage, Stage::Settings) {
             ui.add_space(8.0);
-            ui.label(widgets::semi(format!("No {} yet. Open Settings to add one.", id.key_label()), 11.5, MUTED));
+            let note = if id.window_only() { "Not logged in yet. Open Settings to log in.".to_string() } else { format!("No {} yet. Open Settings to add one.", id.key_label()) };
+            ui.label(widgets::semi(note, 11.5, MUTED));
         }
         if open_settings {
             app.open_settings();
@@ -160,6 +180,8 @@ pub fn account(app: &mut App, ui: &mut Ui) {
         if matches!(app.stage, Stage::Settings) {
             ui.add_space(18.0);
             settings_card(app, ui);
+            ui.add_space(10.0);
+            remove_button(app, ui);
         }
 
         ui.add_space(22.0);
@@ -182,6 +204,9 @@ pub fn account(app: &mut App, ui: &mut Ui) {
 
 fn settings_card(app: &mut App, ui: &mut Ui) {
     let id = app.casino();
+    if id.window_only() {
+        return window_settings_card(app, ui);
+    }
     let w = 460.0_f32.min(ui.available_width() - 32.0);
     let mut save = false;
     let mut close = false;
@@ -266,6 +291,135 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
     }
     if window {
         app.start_login();
+    }
+}
+
+/// "Remove account", under the settings card: a second press confirms.
+fn remove_button(app: &mut App, ui: &mut Ui) {
+    let armed = app.remove_armed;
+    let label = if armed { "Press again to remove this account" } else { "Remove account" };
+    let hint = "Forgets this account's login on this PC (the casino account itself stays)";
+    if pill_button(ui, label, RED, armed).on_hover_text(hint).clicked() {
+        if armed {
+            app.remove_account();
+        } else {
+            app.remove_armed = true;
+        }
+    }
+}
+
+/// Settings of a casino linked only through the login window (Shuffle), Antebot-style: the
+/// mirror, and a button that opens it to log in.
+fn window_settings_card(app: &mut App, ui: &mut Ui) {
+    let id = app.casino();
+    let w = 460.0_f32.min(ui.available_width() - 32.0);
+    let (mut open, mut close, mut clear, mut manual_save) = (false, false, false, false);
+    Frame::new()
+        .fill(BG1)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(18, 16))
+        .show(ui, |ui| {
+            ui.set_width(w);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| {
+                    ui.label(widgets::bold("Account settings", 14.0, TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::icon_button(ui, "×", MUTED, true, "Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if !id.mirrors().is_empty() {
+                    widgets::caption(ui, "Mirror");
+                    mirror_picker(app, ui);
+                }
+                if id.manual_tokens() {
+                    widgets::caption(ui, "Authentication method");
+                    if let Some(i) = widgets::segmented(ui, &["Automatic", "Manual"], usize::from(app.login_manual), true) {
+                        app.login_manual = i == 1;
+                        app.onboard_error = None;
+                    }
+                }
+                if app.login_manual && id.manual_tokens() {
+                    manual_tokens(app, ui, &mut manual_save);
+                    return;
+                }
+                ui.add(egui::Label::new(RichText::new(id.token_hint()).size(11.5).color(TEXT2)).wrap());
+                ui.add_space(2.0);
+                let (state, color) = match (app.settings.token().is_some(), app.active_name()) {
+                    (true, Some(u)) => (format!("Saved login: {u}"), G2),
+                    (true, None) => ("Login saved".to_string(), G2),
+                    (false, _) => ("Not logged in yet".to_string(), MUTED),
+                };
+                ui.label(widgets::semi(state, 11.5, color));
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let site = if id.mirrors().is_empty() { id.name().to_ascii_lowercase() } else { picked_mirror(app) };
+                    if button(ui, &format!("Open {site} to log in"), Btn::Primary, true, None).clicked() {
+                        open = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let hint = format!("Logs the login window out of {}, to log in to another account", id.name());
+                        if pill_button(ui, "Clear cookies", RED, false).on_hover_text(hint).clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                if app.cookies_cleared {
+                    ui.label(widgets::semi("Cookies cleared: the login window opens logged out", 11.5, G2));
+                }
+                if let Some(e) = &app.onboard_error {
+                    ui.label(widgets::semi(e.clone(), 11.5, RED));
+                }
+            });
+        });
+    if open {
+        app.open_login_window();
+    }
+    if close {
+        app.close_settings();
+    }
+    if clear {
+        app.clear_login_cookies();
+    }
+    if manual_save {
+        app.save_manual_tokens();
+    }
+}
+
+/// Manual login (Goated): the site's access token and refresh token, copied from the browser.
+fn manual_tokens(app: &mut App, ui: &mut Ui, save: &mut bool) {
+    let note = |ui: &mut Ui, text: &str| {
+        ui.add(egui::Label::new(RichText::new(text).size(11.0).color(MUTED)).wrap());
+    };
+    widgets::caption(ui, "Access token");
+    let masked = !app.token_visible && !app.manual_access.is_empty();
+    widgets::text_box(ui, &mut app.manual_access, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…", None, true, masked);
+    note(
+        ui,
+        "Open Goated in your normal browser, press F12 and go to the Console tab. Type localStorage.getItem('g3_token') and press Enter, then copy the value shown, without the quotes around it.",
+    );
+    widgets::caption(ui, "Refresh token");
+    let masked = !app.token_visible && !app.manual_refresh.is_empty();
+    widgets::text_box(ui, &mut app.manual_refresh, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…", None, true, masked);
+    note(
+        ui,
+        "In the same F12 tools open the Application tab, then Cookies and the Goated site. Find the refresh_token cookie, click it and copy its value.",
+    );
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        let ready = !app.manual_access.trim().is_empty() && !app.manual_refresh.trim().is_empty();
+        if button(ui, "Authenticate with tokens", Btn::Primary, ready, None).clicked() {
+            *save = true;
+        }
+        if pill_button(ui, if app.token_visible { "hide" } else { "show" }, MUTED, app.token_visible).clicked() {
+            app.token_visible = !app.token_visible;
+        }
+    });
+    if let Some(e) = &app.onboard_error {
+        ui.label(widgets::semi(e.clone(), 11.5, RED));
     }
 }
 
@@ -613,6 +767,8 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
     let stuck = cloudflare && reach == 0 && since.elapsed() > Duration::from_secs(25);
     let mut open_settings = false;
     let mut set_cookie = false;
+    let mut relogin = false;
+    let window_only = app.casino().window_only();
     let close = modal_frame(ui, "Account connection check", |ui| {
         step(ui, reach, &format!("Reaching {}", app.casino_site()));
         // e.g. Stake's Cloudflare check, which can take a few seconds
@@ -625,6 +781,9 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
             let msg = if app.status == ConnStatus::Offline && !app.status_detail.is_empty() { app.status_detail.clone() } else { app.status.long(&app.status_detail) };
             ui.add(egui::Label::new(widgets::semi(msg, 11.5, RED)).wrap());
             ui.horizontal(|ui| {
+                if window_only && cred == 2 && button(ui, "Log in again", Btn::Primary, true, None).clicked() {
+                    relogin = true;
+                }
                 if button(ui, "Open settings", Btn::Ghost, true, None).clicked() {
                     open_settings = true;
                 }
@@ -654,6 +813,11 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
     }
     if set_cookie {
         app.open_cookie_settings();
+    }
+    if relogin {
+        app.cancel_check();
+        app.open_settings();
+        app.open_login_window();
     }
     let _ = StrokeKind::Inside;
 }

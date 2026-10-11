@@ -16,10 +16,23 @@ use crate::casino::CasinoId;
 
 const TOKEN_PREFIX: &str = "TOKEN ";
 
-/// Where the webview keeps cookies, so the next login is instant.
-fn profile_dir(id: CasinoId) -> Option<PathBuf> {
+/// Where the webview keeps cookies, so the next login is instant. One profile per account
+/// (named after it), so two accounts on one casino never share a site session.
+fn profile_dir(profile: &str) -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("gg", "fastbet", "FastBet")?;
-    Some(dirs.data_local_dir().join("webview").join(id.key()))
+    let safe: String = profile.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
+    (!safe.is_empty()).then(|| dirs.data_local_dir().join("webview").join(safe))
+}
+
+/// Forgets a login window profile's cookies and site storage, so the next login starts logged
+/// out (to log in to another account). Only while no login window is open.
+pub fn clear_profile(profile: &str) -> Result<(), String> {
+    let Some(dir) = profile_dir(profile) else { return Ok(()) };
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Could not clear the cookies: {e}")),
+    }
 }
 
 /// Puts a webview into a tao window. On Linux a plain `build` only works under
@@ -38,8 +51,9 @@ pub(crate) fn attach<'a>(builder: wry::WebViewBuilder<'a>, window: &'a tao::wind
 
 // ---------------------------------------------------------------- child side
 
-/// Runs the login window. Never returns on success; the parent kills us.
-pub fn run_window(id: CasinoId) -> Result<(), String> {
+/// Runs the login window on `url` (the casino's own login page if `None`) in the browser
+/// profile `profile` (the casino's key if `None`). Never returns on success; the parent kills us.
+pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Result<(), String> {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -60,22 +74,27 @@ pub fn run_window(id: CasinoId) -> Result<(), String> {
 
     // FASTBET_WATCH_SCRIPT overrides the injected script, handy when adding a casino.
     let script = std::env::var("FASTBET_WATCH_SCRIPT").unwrap_or_else(|_| id.token_watch_script().to_string());
-    let mut ctx = WebContext::new(profile_dir(id));
+    let mut ctx = WebContext::new(profile_dir(profile.unwrap_or(id.key())));
     let builder = WebViewBuilder::new_with_web_context(&mut ctx)
-        .with_url(id.login_url())
+        .with_url(url.map(str::to_string).unwrap_or_else(|| id.login_url(None)))
         .with_initialization_script(script)
         .with_devtools(true)
         .with_ipc_handler(move |req| {
             let _ = proxy.send_event(UserEvent::Token(req.body().clone()));
         });
-    let _webview = attach(builder, &window).map_err(|e| e.to_string())?;
+    let webview = attach(builder, &window).map_err(|e| e.to_string())?;
 
     let mut last = String::new();
+    let mut misses = 0u32;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::Token(t)) => {
+                let t = match id.login_cookie() {
+                    Some((url, name)) => with_cookie(&webview, &t, url, name, &mut misses),
+                    None => t,
+                };
                 let t = t.trim().to_string();
                 if !t.is_empty() && t != last {
                     last = t.clone();
@@ -86,6 +105,33 @@ pub fn run_window(id: CasinoId) -> Result<(), String> {
             _ => {}
         }
     })
+}
+
+/// A logged-in report whose token is the access token -> one carrying the pair, with the refresh
+/// token taken from the browser's cookie `name` (HttpOnly: the page can't read it). Until the
+/// cookie is there the report says "not yet"; after ~10 reports without it, the access token goes
+/// alone (it works until it runs out).
+fn with_cookie(webview: &wry::WebView, report: &str, url: &str, name: &str, misses: &mut u32) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(report) else { return report.to_string() };
+    let access = v["token"].as_str().unwrap_or("").to_string();
+    if v["loggedIn"].as_bool() != Some(true) || access.is_empty() {
+        *misses = 0;
+        return serde_json::json!({ "token": "", "loggedIn": false }).to_string();
+    }
+    let refresh = webview.cookies_for_url(url).ok().and_then(|cs| cs.iter().find(|c| c.name() == name).map(|c| c.value().to_string()));
+    let pair = match refresh {
+        Some(r) => crate::casino::creds::Creds { access, refresh: r },
+        None if *misses >= 10 => crate::casino::creds::Creds { access, refresh: String::new() },
+        None => {
+            *misses += 1;
+            return serde_json::json!({ "token": "", "loggedIn": false }).to_string();
+        }
+    };
+    v["token"] = serde_json::Value::String(pair.to_token());
+    if let Some(o) = v.as_object_mut() {
+        o.remove("tick");
+    }
+    v.to_string()
 }
 
 /// Traffic capture for reverse-engineering a slot provider: opens `url` in a
@@ -108,7 +154,7 @@ pub fn run_capture(url: &str) -> Result<(), String> {
         .with_inner_size(LogicalSize::new(1280.0, 860.0))
         .build(&event_loop)
         .map_err(|e| e.to_string())?;
-    let mut ctx = WebContext::new(profile_dir(CasinoId::ChipsGg).map(|p| p.join("capture")));
+    let mut ctx = WebContext::new(profile_dir(CasinoId::ChipsGg.key()).map(|p| p.join("capture")));
     // FASTBET_CAP_DRIVE=1 also clicks the game and presses Space every few seconds
     let inspect: Vec<String> = std::env::var("FASTBET_CAP_INSPECT").map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
     let base = CAPTURE_SCRIPT.replace("__FB_INSPECT__", &serde_json::to_string(&inspect).unwrap_or_else(|_| "[]".into()));
@@ -309,10 +355,11 @@ pub struct LoginSession {
 }
 
 impl LoginSession {
-    pub fn spawn(id: CasinoId, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+    /// Opens the login window on `url`, in the account's own browser profile.
+    pub fn spawn(id: CasinoId, url: &str, profile: &str, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
-        cmd.arg("--login").arg(id.key()).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        cmd.arg("--login").arg(id.key()).arg(url).arg(profile).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

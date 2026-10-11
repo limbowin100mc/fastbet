@@ -7,7 +7,7 @@ use super::super::theme::{self, alpha, BG2, GREEN, LINE2, MUTED, RED, TEXT, TEXT
 use super::super::widgets::{caption, chip_button_sized, segmented, text_box};
 use super::super::App;
 use crate::money;
-use crate::originals::{dice_chance, dice_multiplier, dice_target, Game, Round, DICE_CHANCE};
+use crate::originals::{dice_chance, dice_multiplier, dice_target, Game, Round};
 
 const QUICK: &[f64] = &[1.1, 1.5, 2.0, 3.0, 5.0, 10.0];
 
@@ -19,12 +19,14 @@ fn target(app: &App) -> Option<f64> {
 fn valid(app: &App) -> Option<f64> {
     let t = target(app)?;
     let chance = dice_chance(t, app.settings.orig.dice_over);
-    (chance >= DICE_CHANCE.0 - 1e-9 && chance <= DICE_CHANCE.1 + 1e-9).then_some(t)
+    let (lo, hi) = app.casino().dice_chance();
+    (chance >= lo - 1e-9 && chance <= hi + 1e-9).then_some(t)
 }
 
 fn set_target(app: &mut App, t: f64) {
     let over = app.settings.orig.dice_over;
-    let chance = dice_chance(t, over).clamp(DICE_CHANCE.0, DICE_CHANCE.1);
+    let (lo, hi) = app.casino().dice_chance();
+    let chance = dice_chance(t, over).clamp(lo, hi);
     app.settings.orig.dice_target = format!("{:.2}", dice_target(chance, over));
     app.mark_dirty();
 }
@@ -51,7 +53,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
                     let c = dice_chance(t, app.settings.orig.dice_over);
                     format!("{c:.2}% win  ·  {:.4}×", dice_multiplier(c))
                 }
-                None => "Win chance 0.01%–98%".into(),
+                None => chance_range(app),
             };
             ui.label(super::super::widgets::semi(txt, 11.0, if valid(app).is_some() { theme::G2 } else { RED }));
         });
@@ -76,8 +78,14 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     });
 }
 
+/// "Win chance 0.01%–98%", with this casino's limits.
+fn chance_range(app: &App) -> String {
+    let (lo, hi) = app.casino().dice_chance();
+    format!("Win chance {}%–{}%", super::trim(lo), super::trim(hi))
+}
+
 pub fn bet_params(app: &App) -> Result<Value, String> {
-    let t = valid(app).ok_or("Pick a target with a 0.01%–98% win chance")?;
+    let t = valid(app).ok_or_else(|| format!("Pick a target with a {} win chance", chance_range(app).trim_start_matches("Win chance ")))?;
     Ok(json!({ "target": t, "condition": if app.settings.orig.dice_over { "above" } else { "below" } }))
 }
 

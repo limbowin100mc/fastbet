@@ -9,14 +9,20 @@ use super::super::App;
 use super::{payout_color, text_color_on, trim};
 use crate::originals::{Game, Round};
 
-const RISKS: [&str; 4] = ["low", "medium", "high", "expert"];
 const FALL: f32 = 0.7;
 
 pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     caption(ui, "Risk");
-    let sel = RISKS.iter().position(|r| *r == app.settings.orig.plinko_risk).unwrap_or(1);
-    if let Some(i) = segmented(ui, &["Low", "Medium", "High", "Expert"], sel, !locked) {
-        app.settings.orig.plinko_risk = RISKS[i].into();
+    let risks = app.casino().plinko_risks();
+    // a risk this casino doesn't have (Shuffle has no expert) falls back to medium
+    if !risks.iter().any(|(k, _)| *k == app.settings.orig.plinko_risk) {
+        app.settings.orig.plinko_risk = "medium".into();
+        app.mark_dirty();
+    }
+    let sel = risks.iter().position(|(k, _)| *k == app.settings.orig.plinko_risk).unwrap_or(1);
+    let labels: Vec<&str> = risks.iter().map(|(_, l)| *l).collect();
+    if let Some(i) = segmented(ui, &labels, sel, !locked) {
+        app.settings.orig.plinko_risk = risks[i].0.into();
         app.mark_dirty();
     }
     caption(ui, "Rows");

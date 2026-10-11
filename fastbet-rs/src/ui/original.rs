@@ -113,7 +113,7 @@ fn header(app: &mut App, ui: &mut Ui, game: Game) {
     }
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(widgets::bold(game.name(), 21.0, TEXT));
+        ui.label(widgets::bold(app.casino().original_name(game), 21.0, TEXT));
         ui.add_space(8.0);
         let elapsed = match (app.stats.started, app.stats.last_at) {
             (Some(s), Some(l)) => (if running { Instant::now() } else { l }).duration_since(s).as_millis(),

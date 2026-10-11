@@ -74,6 +74,8 @@ pub enum Event {
     Status(ConnStatus, String),
     Market(Market),
     Provable(ProvableState),
+    /// The casino renewed its login; the app saves it for that casino.
+    Token(CasinoId, String),
     Bet(BetRecord),
     SeedRotated { at: SystemTime, client_seed: String, reason: &'static str },
     Retry,
@@ -529,6 +531,7 @@ impl Engine {
                     CasinoEvent::Status(s, d) => Event::Status(s, d),
                     CasinoEvent::Market(m) => Event::Market(m),
                     CasinoEvent::Provable(p) => Event::Provable(p),
+                    CasinoEvent::Token(t) => Event::Token(id, t),
                 });
             }
         });

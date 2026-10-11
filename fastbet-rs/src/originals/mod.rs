@@ -1,8 +1,9 @@
-//! Casino originals besides Limbo (Stake's in-house games): which games there
-//! are, what a round looks like once the casino has answered, and the math the
-//! boards show (payout tables, next multipliers). The casino module turns a
-//! [`Game`] plus its params into requests; the UI draws each game from
-//! [`Round::state`], which is the casino's own JSON for that game.
+//! Casino originals besides Limbo (Stake's and Shuffle's in-house games): which
+//! games there are, what a round looks like once the casino has answered, and
+//! the math the boards show (payout tables, next multipliers). The casino module
+//! turns a [`Game`] plus its params into requests; the UI draws each game from
+//! [`Round::state`], which is Stake's JSON for that game (Shuffle's replies are
+//! turned into the same shape, Blitz being Shuffle's own).
 
 use std::collections::HashMap;
 
@@ -42,6 +43,8 @@ pub enum Game {
     ScarabSpin,
     TomeOfLife,
     BlueSamurai,
+    /// Shuffle only.
+    Blitz,
 }
 
 /// How a round left open is found again.
@@ -121,12 +124,19 @@ const GAMES: &[Meta] = &[
     meta(Game::ScarabSpin, "slots", "Scarab Spin", "slots", "slots/bet"),
     steps(meta(Game::TomeOfLife, "tome-of-life", "Tome of Life", "slotsTomeOfLife", "slots-tome-of-life/bet"), "slots-tome-of-life/bonus", None, Resume::ActiveBet),
     steps(meta(Game::BlueSamurai, "slots-samurai", "Blue Samurai", "slotsSamurai", "slots-samurai/bet"), "slots-samurai/next", None, Resume::ActiveBet),
+    // Shuffle's own; the path only names the action
+    meta(Game::Blitz, "blitz", "Blitz", "blitz", "blitz/play"),
 ];
 
 impl Game {
     /// Every game, in lobby order.
     pub fn all() -> impl Iterator<Item = Game> {
         GAMES.iter().map(|m| m.game)
+    }
+
+    /// The games Stake has.
+    pub fn stake() -> impl Iterator<Item = Game> {
+        Game::all().filter(|g| *g != Game::Blitz)
     }
 
     fn meta(self) -> &'static Meta {
@@ -246,6 +256,23 @@ pub fn mines_multiplier(mines: u32, gems: u32) -> f64 {
     0.99 * inverse_odds(25, mines, gems)
 }
 
+/// Mines state in Stake's shape, for casinos that report the picked tiles and (once the round
+/// is over) where the mines were: what each tile paid, nothing from the first mine on.
+pub fn mines_state(count: u32, picks: &[i64], mines: &[i64]) -> Value {
+    let (mut gems, mut hit) = (0, false);
+    let rounds: Vec<Value> = picks
+        .iter()
+        .map(|f| {
+            hit |= mines.contains(f);
+            if !hit {
+                gems += 1;
+            }
+            serde_json::json!({ "field": f, "payoutMultiplier": if hit { 0.0 } else { mines_multiplier(count, gems) } })
+        })
+        .collect();
+    serde_json::json!({ "minesCount": count, "mines": mines, "rounds": rounds })
+}
+
 /// Pump: balloons that pop among the 25 steps, per difficulty.
 pub fn pump_pops(difficulty: &str) -> u32 {
     match difficulty {
@@ -326,8 +353,27 @@ pub fn dice_target(chance: f64, over: bool) -> f64 {
     }
 }
 
-/// Dice accepts win chances from 0.01% to 98%.
-pub const DICE_CHANCE: (f64, f64) = (0.01, 98.0);
+/// Blitz: cards drawn per bet.
+pub const BLITZ_PICKS: (u32, u32) = (5, 36);
+
+/// Blitz: pays when `picks` cards from an endless 52-card deck are all different (2% edge).
+pub fn blitz_multiplier(picks: u32) -> f64 {
+    let all_different: f64 = (0..picks.min(52)).map(|i| (52 - i) as f64 / 52.0).product();
+    if all_different <= 0.0 {
+        0.0
+    } else {
+        0.98 / all_different
+    }
+}
+
+/// Blitz card index (0–51) -> (rank, suit) as the cards are drawn: twos first, aces last,
+/// suits in diamonds, hearts, spades, clubs order.
+pub fn blitz_card(index: u32) -> (&'static str, &'static str) {
+    const RANKS: [&str; 13] = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"];
+    const SUITS: [&str; 4] = ["D", "H", "S", "C"];
+    (RANKS[(index / 4).min(12) as usize], SUITS[(index % 4) as usize])
+}
+
 
 /// HiLo card ranks, low to high, as the casino spells them.
 pub const RANKS: [&str; 13] = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
@@ -563,7 +609,7 @@ mod tests {
         for g in Game::all() {
             assert_eq!(Game::from_slug(g.slug()), Some(g));
         }
-        assert_eq!(Game::all().count(), 28);
+        assert_eq!(Game::stake().count(), 28);
         assert_eq!(Game::Moles.bet_path(true), "moles/autobet");
         assert_eq!(Game::Moles.bet_path(false), "moles/bet");
         assert_eq!(Game::Blackjack.step_path(Step::Cashout), None);
@@ -586,6 +632,17 @@ mod tests {
         }
         assert!(roulette_wins("colorRed", 1) && !roulette_wins("colorRed", 2) && !roulette_wins("colorBlack", 0));
         assert!(roulette_wins("row3", 36) && roulette_wins("range1324", 13) && roulette_wins("number0", 0));
+    }
+
+    #[test]
+    fn blitz_matches_the_site() {
+        // the site's paytable, rounded to 2 decimals
+        for (picks, shown) in [(5, 1.19), (10, 2.47), (14, 6.72), (20, 66.81), (25, 1051.10)] {
+            assert!((blitz_multiplier(picks) - shown).abs() < 0.006, "{picks} picks: {}", blitz_multiplier(picks));
+        }
+        assert_eq!(blitz_card(0), ("2", "D"));
+        assert_eq!(blitz_card(51), ("A", "C"));
+        assert_eq!(blitz_card(37), ("J", "H"));
     }
 
     #[test]

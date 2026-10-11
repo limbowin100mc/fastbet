@@ -39,7 +39,7 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 3 && args[1] == "--login" {
         let id = casino::CasinoId::from_key(&args[2]).unwrap_or(casino::CasinoId::ChipsGg);
-        if let Err(e) = login::run_window(id) {
+        if let Err(e) = login::run_window(id, args.get(3).map(String::as_str), args.get(4).map(String::as_str)) {
             eprintln!("login window failed: {e}");
             std::process::exit(1);
         }

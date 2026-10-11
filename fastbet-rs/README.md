@@ -4,6 +4,8 @@ A native desktop app that places Limbo bets straight over the casino's websocket
 
 - **chips.gg**: Limbo and slots.
 - **Stake**: Limbo, 28 more Stake Originals and Stake Engine slots, through stake.com or any of its 131 mirrors.
+- **Shuffle**: Limbo, Dice, Mines, Keno, Plinko, Blitz, Waifu Tower and Chicken, through shuffle.com or any of its 43 mirrors.
+- **Goated**: Limbo, Dice and Mines.
 - One window, three panes: **controls** on the left, **live** results in the middle, **stats** on the right. The side panes can be dragged wider or narrower.
 - Everything money-related is exact integer math in the currency's smallest unit (18-decimal coins included).
 
@@ -20,7 +22,7 @@ The binary ends up in `target/release/fastbet.exe`. It is self-contained; copy i
 
 ## Screens
 
-1. **Pick your account**: one row per casino with the username last seen. Click it.
+1. **Pick your account**: one row per account (casino logo, casino, the username last seen). A casino can have several accounts. **Add account** lists the casinos; pick one and its settings open. **Remove account**, under an account's settings card, forgets that login on this PC (press it twice).
 2. **Account**: avatar, **Settings** and **Login ›**. Settings holds the **API key**: on chips.gg open *Settings → API Keys → Create API Key*, copy the key (the site shows it only once), paste it and press Save. The same kind of key other betting bots use; it keeps working until you delete it on the site. No key? *log in in a window instead* opens a login window (Microsoft Edge WebView2, part of Windows 11); the app picks up the session token the moment you are in and closes the window by itself. For **Stake** the card asks for the **API token** (*Settings → Security → API Tokens* on Stake; *Get API token ↗* opens it) and the **Mirror** to connect through, a searchable list of stake.com and its mirrors. *Casino website ↗* opens the chosen mirror.
 3. **Login ›** runs the connection check (reaching the casino, checking credentials) and drops you in the **lobby**: left rail, the wallet pill on top, the Limbo tile, and the session stats on the right. The wallet pill shows one balance, in fiat or crypto; click it for the coin list with a search box, **Display in fiat** and **Hide empty balances**. Picking a coin is what you bet with.
 4. **Limbo**: title, session timer and bet count on the left; **Manual Bet / Automatic** tabs in the middle; **Start** on the right. While a run is going, Start becomes **Stop on next win / Pause / Stop**. Settings live in the left panel (General open, the rest as collapsible rows), the result and bet table in the middle.
@@ -49,6 +51,22 @@ On a server (VPS, RDP), Cloudflare often doesn't trust the IP address itself. If
 - Balances come from the account and are updated locally after every bet; while no bet is running they are re-read every 10 s. Stake keeps the selected coin in the browser, not the account, so the app starts on your biggest balance; pick another in the balance pill.
 - Bet amounts go out as floats with 8 decimals, like the site sends them. Each bet carries a random 21-character `identifier`, and the reply's nonce is shown in the table.
 - Stake's "slow down" replies (parallel-bet or rate-limit errors, HTTP 429) count as busy and are retried like on chips.gg.
+
+## Shuffle
+
+Shuffle has no API keys, so the account is linked the way Antebot links it: **Open shuffle.com to log in** opens the site in the login window (on the mirror picked above it), you log in as usual (captcha, 2FA, Google), and the window closes by itself. The site keeps its session in localStorage (`persist:root` → `auth`): a short-lived access token and the refresh token that renews it. The window hands both to the app; your password never reaches it. **Clear cookies** logs that account's login window out, to log in to another account.
+
+- API: GraphQL at `https://<mirror>/main-api/graphql/api/graphql`, `Authorization: Bearer <access token>`, plain HTTPS (the browser bridge only if Cloudflare ever turns the app away). Every request carries an `X-Correlation-Id` built the way the site builds it; bets are refused without one.
+- When the access token runs out, the app trades the refresh token for a new pair (as the site does) and saves it at once: the old refresh token stops working the moment it's used.
+- Originals reuse Stake's boards (the rules and payouts are the same; Waifu Tower plays like Dragon Tower, Plinko has no Expert risk). Blitz is Shuffle's own: cards come from an endless deck and it pays when every one of them is different.
+- Bets of 0 are allowed.
+
+## Goated
+
+**Authentication method**, like Antebot: **Automatic** opens goated.com in the login window; once you're in, the window takes the access token from localStorage (`g3_token`) and the `refresh_token` cookie (HttpOnly, read from the window's own browser) and closes. **Manual** takes the two values pasted from your browser (F12 → Console: `localStorage.getItem('g3_token')`; F12 → Application → Cookies → `refresh_token`).
+
+- API: REST at `https://apis.goated.com`, `Authorization: Bearer <access token>`; the access token lives a day and is renewed an hour before it runs out with the refresh cookie (`/user/auth/token/refresh`).
+- Limbo, Dice (win chance 0.1%–98%: Goated pays at most 990× on Dice) and Mines (manual with cash out, or automatic with tiles picked up front). Bets of 0 are allowed.
 
 ## Slots
 
@@ -81,7 +99,7 @@ On Stake, `startThirdPartySession(slug, source: <coin>, target: usd)` (or `start
 
 Adding a provider means a new driver in `src/slots/` implementing `SlotSession` (open session, list bet levels and features, spin), one line in `Provider::for_producer`, and the producer in `CasinoId::slot_producers` for each casino that offers it.
 
-## Originals (Stake)
+## Originals
 
 On Stake the lobby lists every Stake Original with the site's own artwork; Limbo opens its usual page, the others a page of their own, shaped like Limbo's: bet size on the left with the game's settings under it, the game's board in the middle, its rounds below, the session stats on the right. Manual / Automatic, the strategy (change by % on win / loss), number of bets, delay, async, stop on profit / loss / max bet / hit, force restart and the seed changes work as on Limbo. A bet of 0 is allowed (Stake plays it for free).
 
@@ -115,7 +133,7 @@ How it works: the site posts its originals to `/_api/casino/<game>/<action>` (`d
 |---|---|
 | General | Bet size with ½ and ×2, COIN/USD unit, target with quick buttons. On Stake a bet of 0 is placed too: a real round that pays nothing. Shows win chance and profit on a win. The currency is picked in the balance pill on top (**Site** follows the currency selected on chips.gg). |
 | Increase on win / loss | *Reset to base*, or *Change by %* (+100% after a loss doubles the bet, i.e. martingale). Automatic mode only. |
-| No. of bets, delay & async | Number of bets (0 = no limit), a delay in ms between bets, and **Async mode**: how many bets may be in flight at once (1–8). Automatic mode only. |
+| No. of bets, delay & async | Number of bets (0 = no limit), a delay in ms between bets, and **Async mode**: how many bets may be in flight at once (1, 2, 3, 4, 6 or 8). Automatic mode only. |
 
 ### Why async mode
 
@@ -182,7 +200,9 @@ For UI work: `FASTBET_UPDATE=1` runs the check at start, `FASTBET_PRETEND_VERSIO
 
 ## Settings file
 
-`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, the chosen Stake mirror, your browser's User Agent and cookies if you logged in with your browser, and the login tokens, so keep it private: a Stake API token, like the `session` cookie, works like a password for your account.
+`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, your accounts (casino, login tokens, username, mirror, your browser's User Agent and cookies if you logged in with your browser), so keep it private: a Stake API token, like the `session` cookie or Shuffle's and Goated's tokens, works like a password for your account.
+
+Saving never drops a login the app didn't remove: before every save the file is read again and accounts found there are kept. A file that exists but can't be read leaves the app running without saving; one that can't be parsed is copied to `settings.unreadable-<time>.json` first. The old one-login-per-casino fields are still written, so an older FastBet can read the file.
 
 For UI work, `FASTBET_MIRRORS=<search>` opens the account settings with the mirror list already open (`1` for no search), and `FASTBET_CLOUDFLARE=1` opens them on the Cloudflare cookie section.
 

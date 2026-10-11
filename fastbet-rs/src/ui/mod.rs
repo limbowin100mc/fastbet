@@ -82,6 +82,16 @@ pub struct App {
     pub cf_open: bool,
     pub cf_agent_input: String,
     pub cf_cookie_input: String,
+    /// "Clear cookies" just emptied the login window's profile (settings card note).
+    pub cookies_cleared: bool,
+    /// Account list: the casino picker of "Add account" is open.
+    pub adding_account: bool,
+    /// Settings card: "Remove account" was pressed once and waits for the second press.
+    pub remove_armed: bool,
+    /// Manual login (Goated): the tokens pasted from the browser.
+    pub login_manual: bool,
+    pub manual_access: String,
+    pub manual_refresh: String,
     /// The IP address Cloudflare sees, for the picked mirror.
     cf_ip: Option<IpCheck>,
 
@@ -184,6 +194,12 @@ impl App {
             mirror_search: String::new(),
             mirror_open: false,
             cf_open: false,
+            cookies_cleared: false,
+            adding_account: false,
+            remove_armed: false,
+            login_manual: false,
+            manual_access: String::new(),
+            manual_refresh: String::new(),
             cf_agent_input: String::new(),
             cf_cookie_input: String::new(),
             cf_ip: None,
@@ -307,13 +323,19 @@ impl App {
         }
     }
 
-    pub fn username_for(&self, id: CasinoId) -> Option<String> {
-        if id == self.settings.casino {
+    /// An account's username: live for the account in use, else the last one seen.
+    pub fn account_name(&self, a: &crate::settings::Account) -> Option<String> {
+        if a.id == self.settings.account {
             if let Some(u) = &self.market.username {
                 return Some(u.clone());
             }
         }
-        self.settings.usernames.get(id.key()).cloned()
+        a.username.clone()
+    }
+
+    /// The username of the account in use.
+    pub fn active_name(&self) -> Option<String> {
+        self.market.username.clone().or_else(|| self.settings.active().and_then(|a| a.username.clone()))
     }
 
     pub fn active_currency(&self) -> String {
@@ -458,7 +480,7 @@ impl App {
         }
         let amount = self.to_base(&self.settings.amount, &cur).ok_or("Enter a bet amount")?;
         let id = self.casino();
-        // a 0 bet is still placed where the casino takes it (Stake)
+        // a 0 bet is still placed where the casino takes it (Stake, Shuffle, Goated)
         if amount == 0 && !id.zero_bets() {
             return Err(format!("{} doesn't take bets of 0", id.name()));
         }
@@ -696,10 +718,13 @@ impl App {
         self.engine.send(Command::SetConcurrency(self.settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
     }
 
-    pub fn switch_casino(&mut self, id: CasinoId) {
-        if id == self.settings.casino {
+    /// Makes `account` the one in use and connects to its casino with its login.
+    pub fn switch_account(&mut self, account: &str) {
+        let Some(id) = self.settings.accounts.iter().find(|a| a.id == account).map(|a| a.casino) else { return };
+        if account == self.settings.account {
             return;
         }
+        self.settings.account = account.to_string();
         self.settings.casino = id;
         self.market = Market::default();
         // every casino has its own slot catalog and originals
@@ -735,12 +760,39 @@ impl App {
         self.screen = Screen::Accounts;
     }
 
-    pub fn open_account(&mut self, id: CasinoId) {
-        self.switch_casino(id);
+    pub fn open_account(&mut self, account: &str) {
+        self.switch_account(account);
         self.stage = Stage::Idle;
         self.onboard_error = None;
         self.key_input.clear();
+        self.remove_armed = false;
         self.screen = Screen::Account;
+    }
+
+    /// "Add account" on `casino`: a new, empty account, opened on its settings.
+    pub fn add_account(&mut self, casino: CasinoId) {
+        let a = crate::settings::Account::new(casino);
+        let id = a.id.clone();
+        self.settings.accounts.push(a);
+        self.settings.save();
+        self.adding_account = false;
+        self.open_account(&id);
+        self.open_settings();
+    }
+
+    /// Settings card: "Remove account" pressed twice. Forgets the login and its login window profile.
+    pub fn remove_account(&mut self) {
+        let id = self.settings.account.clone();
+        self.settings.accounts.retain(|a| a.id != id);
+        self.settings.removed.push(id.clone());
+        self.settings.account.clear();
+        self.settings.save();
+        let _ = crate::login::clear_profile(&id);
+        // nothing is connected until another account is opened
+        self.engine.send(Command::SetToken(None));
+        self.market = Market::default();
+        self.remove_armed = false;
+        self.go_accounts();
     }
 
     pub fn open_settings(&mut self) {
@@ -753,6 +805,7 @@ impl App {
         self.cf_agent_input = saved.as_ref().map(|c| c.user_agent.clone()).unwrap_or_default();
         self.cf_cookie_input = saved.map(|c| c.cookie).unwrap_or_default();
         self.cf_ip = None;
+        self.cookies_cleared = false;
         self.onboard_error = None;
         self.stage = Stage::Settings;
     }
@@ -777,11 +830,9 @@ impl App {
         if self.settings.clearance() == clearance {
             return;
         }
-        let key = self.casino().key().to_string();
-        match &clearance {
-            Some(c) => self.settings.clearances.insert(key, c.clone()),
-            None => self.settings.clearances.remove(&key),
-        };
+        if let Some(a) = self.settings.active_mut() {
+            a.clearance = clearance.clone();
+        }
         self.engine.send(Command::SetClearance(clearance));
     }
 
@@ -835,13 +886,7 @@ impl App {
             });
             return;
         };
-        let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
-        if self.settings.mirror().is_some() && !mirror.is_empty() && self.settings.mirror().as_deref() != Some(mirror.as_str()) {
-            self.settings.mirrors.insert(self.casino().key().to_string(), mirror.clone());
-            self.engine.send(Command::SetMirror(mirror));
-            self.status = ConnStatus::Connecting;
-            self.status_detail.clear();
-        }
+        self.apply_picked_mirror();
         if self.casino().behind_cloudflare() {
             if let Some(c) = &clearance {
                 self.cf_agent_input = c.user_agent.clone();
@@ -854,6 +899,54 @@ impl App {
         self.settings.save();
         self.onboard_error = None;
         self.begin_login();
+    }
+
+    /// Stores the mirror picked in the settings card and moves the connection there.
+    fn apply_picked_mirror(&mut self) {
+        let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
+        if self.settings.mirror().is_some() && !mirror.is_empty() && self.settings.mirror().as_deref() != Some(mirror.as_str()) {
+            if let Some(a) = self.settings.active_mut() {
+                a.mirror = Some(mirror.clone());
+            }
+            self.settings.save();
+            self.engine.send(Command::SetMirror(mirror));
+            self.status = ConnStatus::Connecting;
+            self.status_detail.clear();
+        }
+    }
+
+    /// Settings card of a casino linked through the login window: "Open … to log in" pressed.
+    pub fn open_login_window(&mut self) {
+        self.mirror_open = false;
+        self.cookies_cleared = false;
+        self.apply_picked_mirror();
+        self.start_login();
+    }
+
+    /// Manual login: "Authenticate with tokens" pressed. Saves the pair and runs the connection check.
+    pub fn save_manual_tokens(&mut self) {
+        // pasted from the console, the access token may still carry its quotes
+        let clean = |s: &str| s.trim().trim_matches('"').trim().to_string();
+        let (access, refresh) = (clean(&self.manual_access), clean(&self.manual_refresh));
+        if access.split('.').count() != 3 {
+            self.onboard_error = Some("That access token doesn't look right: it has three parts separated by dots (eyJ…).".into());
+            return;
+        }
+        *self.settings.token_mut() = crate::casino::creds::Creds { access, refresh }.to_token();
+        self.settings.save();
+        self.manual_access.clear();
+        self.manual_refresh.clear();
+        self.onboard_error = None;
+        self.begin_login();
+    }
+
+    /// "Clear cookies": logs the login window out of the casino, to log in to another account.
+    pub fn clear_login_cookies(&mut self) {
+        self.onboard_error = None;
+        match crate::login::clear_profile(&self.settings.account) {
+            Ok(()) => self.cookies_cleared = true,
+            Err(e) => self.onboard_error = Some(e),
+        }
     }
 
     /// Login pressed: (re)authenticate with the saved key and show the check modal.
@@ -870,7 +963,11 @@ impl App {
 
     pub fn start_login(&mut self) {
         self.onboard_error = None;
-        match LoginSession::spawn(self.settings.casino, self.repaint.clone()) {
+        let url = self.casino().login_url(self.settings.mirror().as_deref());
+        // a login window before any account exists makes one (`token_mut` does)
+        let _ = self.settings.token_mut();
+        let profile = self.settings.account.clone();
+        match LoginSession::spawn(self.settings.casino, &url, &profile, self.repaint.clone()) {
             Ok(s) => self.stage = Stage::Login(s),
             Err(e) => {
                 self.stage = Stage::Settings;
@@ -1147,15 +1244,22 @@ impl App {
                 }
                 Event::Market(m) => {
                     if let Some(u) = &m.username {
-                        let key = self.settings.casino.key().to_string();
-                        if self.settings.usernames.get(&key) != Some(u) {
-                            self.settings.usernames.insert(key, u.clone());
+                        let casino = self.settings.casino;
+                        if let Some(a) = self.settings.active_mut().filter(|a| a.casino == casino && a.username.as_ref() != Some(u)) {
+                            a.username = Some(u.clone());
                             self.mark_dirty();
                         }
                     }
                     self.market = m;
                 }
                 Event::Provable(p) => self.provable = p,
+                // the old login stopped working the moment the casino renewed it: save right away
+                Event::Token(id, token) => {
+                    if let Some(a) = self.settings.active_mut().filter(|a| a.casino == id) {
+                        a.token = token;
+                        self.settings.save();
+                    }
+                }
                 Event::Bet(rec) => {
                     let dec = self.info(&rec.currency).map(|i| i.decimals).unwrap_or(8);
                     self.stats.settle(&rec, dec);
@@ -1295,10 +1399,10 @@ impl App {
         let title = match self.screen {
             Screen::Accounts | Screen::Account => "FastBet".to_string(),
             _ => {
-                let who = self.username_for(self.casino()).unwrap_or_default();
+                let who = self.active_name().unwrap_or_default();
                 let page = match self.screen {
                     Screen::Limbo => " – Limbo".to_string(),
-                    Screen::Original(g) => format!(" – {}", g.name()),
+                    Screen::Original(g) => format!(" – {}", self.casino().original_name(g)),
                     Screen::Slots => " – Slots".to_string(),
                     Screen::Slot => {
                         let g = self.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Slot".into());
@@ -1403,7 +1507,7 @@ impl App {
     /// Pops up beside the rail button: who and where you are, and Switch account.
     fn account_menu(&mut self, ui: &egui::Ui, anchor: egui::Rect) {
         let id = self.casino();
-        let name = self.username_for(id).unwrap_or_else(|| "Account".into());
+        let name = self.active_name().unwrap_or_else(|| "Account".into());
         let site = self.casino_site();
         let width = 230.0;
         let mut switch = false;
@@ -1496,9 +1600,11 @@ impl eframe::App for App {
             }
         }
         self.orig_dev_play();
-        if self.ready() && !self.orig.info_requested && !self.casino().originals().is_empty() {
+        if self.ready() && !self.orig.info_requested {
             self.orig.info_requested = true;
-            self.engine.send(Command::OriginalInfo);
+            if !self.casino().originals().is_empty() {
+                self.engine.send(Command::OriginalInfo);
+            }
             // FASTBET_ORIG_BET=1: one manual bet on the open original (or Limbo) once connected
             // (UI work; FASTBET_ORIG_BET=auto starts an auto run instead)
             match (self.screen, std::env::var("FASTBET_ORIG_BET").as_deref()) {

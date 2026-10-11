@@ -5,6 +5,7 @@
 mod baccarat;
 mod bars;
 mod blackjack;
+mod blitz;
 mod cases;
 mod chicken;
 mod darts;
@@ -130,6 +131,7 @@ pub fn params(app: &mut App, ui: &mut Ui, game: Game, locked: bool) {
         Game::RockPaperScissors => rps::params(app, ui, locked),
         Game::ScarabSpin | Game::TomeOfLife => reels::params(app, ui, game, locked),
         Game::BlueSamurai => samurai::params(app, ui),
+        Game::Blitz => blitz::params(app, ui, locked),
     }
 }
 
@@ -163,6 +165,7 @@ pub fn board(app: &mut App, ui: &mut Ui, game: Game, rect: Rect) {
         Game::RockPaperScissors => rps::board(app, ui, rect),
         Game::ScarabSpin | Game::TomeOfLife => reels::board(app, ui, rect, game),
         Game::BlueSamurai => samurai::board(app, ui, rect),
+        Game::Blitz => blitz::board(app, ui, rect),
     }
 }
 
@@ -196,6 +199,7 @@ pub fn bet_params(app: &App, game: Game, auto: bool) -> Result<Value, String> {
         Game::RockPaperScissors => rps::bet_params(app, auto),
         Game::ScarabSpin | Game::TomeOfLife => reels::bet_params(app, game),
         Game::BlueSamurai => samurai::bet_params(),
+        Game::Blitz => blitz::bet_params(app),
     }
 }
 
@@ -229,6 +233,7 @@ pub fn result_text(r: &Round) -> String {
         Game::RockPaperScissors => rps::result_text(r),
         Game::ScarabSpin | Game::TomeOfLife => reels::result_text(r),
         Game::BlueSamurai => samurai::result_text(r),
+        Game::Blitz => blitz::result_text(r),
     }
 }
 

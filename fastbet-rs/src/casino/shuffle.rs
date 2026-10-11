@@ -1,0 +1,1201 @@
+//! Shuffle over its GraphQL API (`https://<mirror>/main-api/graphql/api/graphql`).
+//!
+//! Shuffle has no API keys. The user logs in on the site itself, in the login
+//! window, the way Antebot does it: the site keeps its session in localStorage
+//! (`persist:root` → `auth`) as a short-lived access token (a JWT, sent as
+//! `Authorization: Bearer …`) plus a refresh token. The window hands both to the
+//! app ([`Creds`]), which then calls the API itself and trades the refresh token
+//! for a new pair when the access token runs out (the `refreshToken` mutation, as
+//! the site does). Every new pair goes back to the settings: the old refresh
+//! token is spent.
+//!
+//! The API answers plain HTTPS. Should Cloudflare turn the app away, calls go
+//! through the browser bridge parked on the mirror instead.
+//!
+//! Originals (Dice, Mines, Keno, Plinko, Blitz, Waifu Tower, Chicken) are
+//! GraphQL mutations too. Every reply is a `Bet` with one action per step; it is
+//! turned into the state shape of Stake's game, so the same boards draw it
+//! (Waifu Tower plays exactly like Stake's Dragon Tower). Blitz is Shuffle's own.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Notify};
+
+use super::*;
+use crate::bridge::{Bridge, BridgeRequest};
+use crate::money::{f64_from_json, format_units, parse_units, to_f64};
+use crate::originals::{mines_state, Game, Round, Step, Tables};
+use super::creds::Creds;
+
+/// Amounts travel as decimal strings; 8 decimals cover every coin's bet sizes.
+const DECIMALS: u32 = 8;
+const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Balances are re-read this often while idle; bets update them locally.
+const REFRESH: Duration = Duration::from_secs(10);
+const RATES_EVERY: Duration = Duration::from_secs(120);
+/// A hidden bridge gets this long to clear Cloudflare before we show it.
+const SHOW_CHECK_AFTER: Duration = Duration::from_secs(20);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(150);
+/// The access token is renewed this many seconds before it runs out, so a bet never carries an expired one.
+const RENEW_BEFORE: i64 = 60;
+const API_PATH: &str = "/main-api/graphql/api/graphql";
+/// Browser profile of the bridge, apart from the login window's.
+const PROFILE: &str = "shuffle-bridge";
+/// Site build named in the correlation id, as the site's own requests carry it.
+const SITE_VERSION: &str = "v6.14.5";
+/// Plain HTTPS presents itself as desktop Chrome.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+
+pub const DEFAULT_MIRROR: &str = "shuffle.com";
+
+/// Shuffle's domains as its own site lists them, named ones first. Every one reaches the same account.
+pub const MIRRORS: &[&str] = &[
+    "shuffle.com", "shuffle.game", "shuffle.gg", "shuffle.bet", "shuffle.casino", "shuffle.net", "shuffle.vip",
+    "shuffle.site", "shuffle.money", "shuffle.global", "shuffle.online", "shuffle.gold", "shuffle.digital",
+    "shuffle.club", "shuffle.ag", "shuffle.vegas", "shuffle.red", "shuffle.blue", "shuffle.black", "shuffle71.com",
+    "shuffle72.com", "shuffle73.com", "shuffle888.com", "shuffle1060.com", "shuffle1061.com", "shuffle1062.com",
+    "shuffle1063.com", "shuffle1064.com", "shuffle1065.com", "shuffle1066.com", "shuffle1067.com", "shuffle1068.com",
+    "shuffle1069.com", "shuffle1070.com", "disorder1.com", "disorder2.com", "disorder4.com", "disorder5.com",
+    "disorder6.com", "disorder7.com", "disorder8.com", "disorder9.com", "disorder10.com", "disorder11.com",
+];
+
+const PRICES: &str = "query FastbetPrices { cryptoPrices(currency: USD) { name price } }";
+const ME: &str = "query FastbetMe { me { id username account { balances { currency amount: availableAmount } } } }";
+const SEEDS: &str = "query FastbetSeeds { currentGameSeeds { id clientSeed hashedSeed status currentNonce } }";
+const ROTATE: &str = "mutation FastbetSeed($clientSeed: String!) { gameSeedChangeAndReveal(newClientSeed: $clientSeed) { \
+    id clientSeed hashedSeed status currentNonce } }";
+const RENEW: &str = "mutation FastbetRenew($refreshToken: String!) { refreshToken(refreshToken: $refreshToken) { accessToken refreshToken } }";
+const LIMBO: &str = "mutation FastbetLimbo($data: LimboPlayInput!) { limboPlay(data: $data) { id currency amount payout afterBalance \
+    gameSeedNonce shuffleOriginalActions { action { limbo { resultValue userValue } } } } }";
+
+/// What every original's reply carries besides the game's own action fields.
+const BET_FIELDS: &str = "id currency amount payout multiplier afterBalance gameSeedNonce";
+/// Names and artwork of the originals: (our slug, Shuffle's slug).
+const ORIGINAL_SLUGS: &[(&str, &str)] = &[
+    ("limbo", "limbo"),
+    ("dice", "dice"),
+    ("mines", "mines"),
+    ("keno", "keno"),
+    ("plinko", "plinko"),
+    ("blitz", "blitz"),
+    ("dragon-tower", "tower"),
+    ("chicken", "chicken"),
+];
+/// Lobby tile size (2x the tile), as JPEG for the image decoder.
+const THUMB: &str = "w=264&h=346&fit=crop&fm=jpg&q=85";
+
+const EXPIRED: &str = "Your Shuffle login has expired. Log in again in Settings.";
+/// Sweepstakes coins of Shuffle's US site, not money.
+const HIDDEN: &[&str] = &["gc", "sc"];
+
+enum CallError {
+    /// Cloudflare answered instead of Shuffle: plain HTTPS was turned away, or the bridge has to pass the check (again).
+    Cloudflare,
+    /// The access token was refused.
+    Unauthenticated,
+    Casino(CasinoError),
+}
+
+impl From<CallError> for CasinoError {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Cloudflare => CasinoError::Server("Cloudflare check, reconnecting".into()),
+            CallError::Unauthenticated => CasinoError::Server(EXPIRED.into()),
+            CallError::Casino(e) => e,
+        }
+    }
+}
+
+/// How calls reach Shuffle.
+#[derive(Clone)]
+enum Transport {
+    /// Plain HTTPS.
+    Direct(reqwest::Client),
+    /// The hidden browser window, parked on the mirror.
+    Bridge(Bridge),
+}
+
+impl Transport {
+    fn close(&self) {
+        if let Transport::Bridge(b) = self {
+            b.close();
+        }
+    }
+
+    fn show(&self, on: bool) {
+        if let Transport::Bridge(b) = self {
+            b.show(on);
+        }
+    }
+}
+
+/// The way in use, with the origin it reaches.
+#[derive(Clone)]
+struct Link {
+    gen: u64,
+    transport: Transport,
+    origin: String,
+}
+
+pub struct Shuffle {
+    creds: Mutex<Option<Creds>>,
+    /// Refresh tokens already traded in. A stale copy handed back (a Login click racing a
+    /// renewal) would log the account out, so it is ignored.
+    spent: Mutex<HashSet<String>>,
+    /// One renewal at a time; calls that saw the same token refused wait for it.
+    renewing: tokio::sync::Mutex<()>,
+    mirror: Mutex<String>,
+    /// Bumped when the mirror changes: the link is rebuilt.
+    setup: AtomicU64,
+    /// Login or mirror changed.
+    wake: Notify,
+    /// A call found the link dead or challenged; the run loop rebuilds it.
+    broken: Notify,
+    broken_flag: AtomicBool,
+    link: Mutex<Option<Link>>,
+    link_gen: AtomicU64,
+    alive: AtomicBool,
+    ready: AtomicBool,
+    events: mpsc::UnboundedSender<CasinoEvent>,
+    market: Mutex<Market>,
+    published: Mutex<Market>,
+    /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
+    inflight: AtomicUsize,
+    settled: AtomicU64,
+    /// Parts of the `X-Correlation-Id` every request carries (bets are refused without it):
+    /// `<browser>-<window>-<site version>-<time>-<count>::<user id>`. The window id also goes with each bet.
+    browser_id: String,
+    window_id: String,
+    requests: AtomicU64,
+    user_id: Mutex<Option<String>>,
+    /// Open rounds of the originals, as last answered (their id and progress feed the next step).
+    open_rounds: Mutex<HashMap<Game, Round>>,
+}
+
+impl Shuffle {
+    pub fn spawn(setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
+        let mirror = setup.mirror.map(|m| stake::normalize_mirror(&m)).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MIRROR.into());
+        let me = Arc::new(Self {
+            creds: Mutex::new(setup.token.as_deref().and_then(Creds::parse)),
+            spent: Mutex::new(HashSet::new()),
+            renewing: tokio::sync::Mutex::new(()),
+            mirror: Mutex::new(mirror),
+            setup: AtomicU64::new(0),
+            wake: Notify::new(),
+            broken: Notify::new(),
+            broken_flag: AtomicBool::new(false),
+            link: Mutex::new(None),
+            link_gen: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
+            events,
+            market: Mutex::new(Market::default()),
+            published: Mutex::new(Market::default()),
+            inflight: AtomicUsize::new(0),
+            settled: AtomicU64::new(0),
+            browser_id: random_id(),
+            window_id: random_id(),
+            requests: AtomicU64::new(0),
+            user_id: Mutex::new(None),
+            open_rounds: Mutex::new(HashMap::new()),
+        });
+        tokio::spawn(me.clone().run());
+        me
+    }
+
+    fn status(&self, s: ConnStatus, detail: impl Into<String>) {
+        let detail = detail.into();
+        tracing::info!("shuffle: {} {detail}", s.short());
+        self.ready.store(s.is_ready(), Ordering::SeqCst);
+        let _ = self.events.send(CasinoEvent::Status(s, detail));
+    }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn setup_is(&self, setup: u64) -> bool {
+        self.setup.load(Ordering::SeqCst) == setup
+    }
+
+    async fn run(self: Arc<Self>) {
+        let mut retries: u32 = 0;
+        while self.alive() {
+            let setup = self.setup.load(Ordering::SeqCst);
+            let mirror = self.mirror.lock().clone();
+            let res = self.connect(&mirror, setup).await;
+            if res.is_ok() {
+                retries = 0;
+                self.serve(setup).await;
+            }
+            self.drop_link();
+            if !self.alive() {
+                break;
+            }
+            if !self.setup_is(setup) {
+                continue;
+            }
+            self.status(ConnStatus::Offline, res.err().unwrap_or_default());
+            tokio::select! {
+                _ = tokio::time::sleep(backoff(&mut retries)) => {}
+                _ = self.wake.notified() => {}
+            }
+        }
+        self.drop_link();
+    }
+
+    fn install(&self, transport: Transport, origin: String) -> Link {
+        let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, transport, origin };
+        self.broken_flag.store(false, Ordering::SeqCst);
+        if let Some(old) = self.link.lock().replace(link.clone()) {
+            old.transport.close();
+        }
+        link
+    }
+
+    /// Reaches the API on `mirror`: plain HTTPS, or the bridge when Cloudflare turns that away.
+    async fn connect(&self, mirror: &str, setup: u64) -> Result<(), String> {
+        self.status(ConnStatus::Connecting, format!("Opening {mirror}"));
+        let origin = format!("https://{mirror}");
+        let link = self.install(Transport::Direct(direct_client(mirror)?), origin.clone());
+        match self.post(&link, PRICES, json!({}), None, Duration::from_secs(15)).await {
+            Ok(data) => {
+                self.apply_rates(&data);
+                return Ok(());
+            }
+            Err(CallError::Cloudflare) => tracing::info!("shuffle: Cloudflare turned plain HTTPS away, using the browser bridge"),
+            Err(e) => return Err(CasinoError::from(e).to_string()),
+        }
+
+        self.status(ConnStatus::Connecting, "Passing the Cloudflare check…");
+        let bridge = Bridge::open_profile(&format!("{origin}/robots.txt"), Some(PROFILE)).await?;
+        let link = self.install(Transport::Bridge(bridge), origin);
+        let t0 = Instant::now();
+        let mut shown = false;
+        loop {
+            if !self.alive() || !self.setup_is(setup) {
+                return Err(String::new());
+            }
+            match self.post(&link, PRICES, json!({}), None, Duration::from_secs(8)).await {
+                Ok(data) => {
+                    if shown {
+                        link.transport.show(false);
+                    }
+                    self.apply_rates(&data);
+                    return Ok(());
+                }
+                Err(CallError::Cloudflare) => {
+                    if t0.elapsed() > CHECK_TIMEOUT {
+                        return Err(format!("Cloudflare didn't let us through on {mirror}. Try another mirror."));
+                    }
+                    if !shown && t0.elapsed() > SHOW_CHECK_AFTER {
+                        link.transport.show(true);
+                        shown = true;
+                    }
+                    self.status(ConnStatus::Connecting, if shown { "Finish the Cloudflare check in the window that opened" } else { "Passing the Cloudflare check…" });
+                }
+                Err(CallError::Casino(CasinoError::ConnectionLost)) => return Err(format!("The connection to {mirror} was closed")),
+                // a challenge page navigating away drops the request; just ask again
+                Err(e) => {
+                    if t0.elapsed() > Duration::from_secs(60) {
+                        return Err(CasinoError::from(e).to_string());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }
+
+    /// Signs in and keeps balances fresh until the link breaks or the mirror changes.
+    async fn serve(&self, setup: u64) {
+        self.authenticate().await;
+        let mut rates_at = Instant::now();
+        loop {
+            tokio::select! {
+                _ = self.wake.notified() => {
+                    if !self.alive() || !self.setup_is(setup) {
+                        return;
+                    }
+                    self.authenticate().await;
+                }
+                _ = self.broken.notified() => {
+                    // a permit left over from an earlier link is not a reason to rebuild this one
+                    if self.broken_flag.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(REFRESH) => {
+                    if rates_at.elapsed() > RATES_EVERY {
+                        rates_at = Instant::now();
+                        if let Ok(data) = self.gql(PRICES, json!({}), false).await {
+                            self.apply_rates(&data);
+                        }
+                    }
+                    if self.ready.load(Ordering::SeqCst) {
+                        self.refresh_me().await;
+                    }
+                }
+            }
+            if !self.alive() {
+                return;
+            }
+        }
+    }
+
+    fn drop_link(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+        if let Some(link) = self.link.lock().take() {
+            link.transport.close();
+        }
+    }
+
+    async fn authenticate(&self) {
+        if self.creds.lock().is_none() {
+            self.status(ConnStatus::NoToken, "");
+            return;
+        }
+        self.status(ConnStatus::Authenticating, "");
+        match self.gql(ME, json!({}), true).await {
+            Ok(data) => match data.get("me").filter(|u| u.is_object()) {
+                Some(me) => {
+                    self.apply_me(me, true);
+                    self.status(ConnStatus::Ready, "");
+                    if let Ok(st) = self.seeds().await {
+                        let _ = self.events.send(CasinoEvent::Provable(st));
+                    }
+                }
+                None => self.status(ConnStatus::AuthFailed, "Shuffle returned no account for this login"),
+            },
+            Err(CallError::Unauthenticated) => self.status(ConnStatus::AuthFailed, EXPIRED),
+            Err(CallError::Casino(CasinoError::Server(m))) => self.status(ConnStatus::AuthFailed, m),
+            // the link broke; serve() is about to rebuild it
+            Err(e) => self.status(ConnStatus::Offline, CasinoError::from(e).to_string()),
+        }
+    }
+
+    /// Re-reads the account. Balances are only taken when no bet ran meanwhile,
+    /// so a reply older than the latest local update never wins.
+    async fn refresh_me(&self) {
+        let settled = self.settled.load(Ordering::SeqCst);
+        let idle = self.inflight.load(Ordering::SeqCst) == 0;
+        match self.gql(ME, json!({}), true).await {
+            Ok(data) => {
+                if let Some(me) = data.get("me").filter(|u| u.is_object()) {
+                    let fresh = idle && self.inflight.load(Ordering::SeqCst) == 0 && self.settled.load(Ordering::SeqCst) == settled;
+                    self.apply_me(me, fresh);
+                }
+            }
+            Err(CallError::Unauthenticated) => self.status(ConnStatus::AuthFailed, EXPIRED),
+            Err(CallError::Casino(CasinoError::Server(m))) if m == EXPIRED => self.status(ConnStatus::AuthFailed, m),
+            Err(_) => {}
+        }
+    }
+
+    async fn seeds(&self) -> Result<ProvableState, CasinoError> {
+        let data = self.gql(SEEDS, json!({}), true).await?;
+        Ok(provable_from(&data["currentGameSeeds"]))
+    }
+
+    fn apply_me(&self, me: &Value, balances: bool) {
+        {
+            if let Some(id) = me.get("id").and_then(Value::as_str) {
+                *self.user_id.lock() = Some(id.to_string());
+            }
+            let mut m = self.market.lock();
+            m.username = me.get("username").and_then(Value::as_str).map(str::to_string);
+            if balances {
+                if let Some(list) = me.pointer("/account/balances").and_then(Value::as_array) {
+                    m.wallets.clear();
+                    for b in list {
+                        if let (Some(cur), Some(amount)) = (b.get("currency").and_then(Value::as_str), b.get("amount").and_then(coin_units)) {
+                            m.wallets.insert(cur.to_ascii_lowercase(), amount);
+                        }
+                    }
+                }
+                // the site keeps the picked coin in the browser, not the account; start on the biggest balance
+                if m.site_currency.is_none() {
+                    m.site_currency = richest(&m);
+                }
+            }
+        }
+        self.publish();
+    }
+
+    fn apply_rates(&self, data: &Value) {
+        let Some(list) = data.get("cryptoPrices").and_then(Value::as_array) else { return };
+        {
+            let mut m = self.market.lock();
+            for c in list {
+                let Some(name) = c.get("name").and_then(Value::as_str) else { continue };
+                let name = name.to_ascii_lowercase();
+                let price = c.get("price").and_then(f64_from_json).unwrap_or(0.0);
+                let hidden = HIDDEN.contains(&name.as_str());
+                m.currencies.insert(name, CurrencyInfo { decimals: DECIMALS, price, hidden });
+            }
+        }
+        self.publish();
+    }
+
+    /// Books a settled bet into the local wallet.
+    fn credit(&self, cur: &str, delta: Units) {
+        if delta == 0 {
+            return;
+        }
+        *self.market.lock().wallets.entry(cur.to_string()).or_insert(0) += delta;
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let m = self.market.lock().clone();
+        let mut last = self.published.lock();
+        if *last != m {
+            *last = m.clone();
+            let _ = self.events.send(CasinoEvent::Market(m));
+        }
+    }
+
+    /// One GraphQL request over `link`, carrying `access` when given.
+    async fn post(&self, link: &Link, query: &str, variables: Value, access: Option<&str>, timeout: Duration) -> Result<Value, CallError> {
+        let body = json!({ "query": query, "variables": variables }).to_string();
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string()), ("X-Correlation-Id".to_string(), self.correlation_id())];
+        if let Some(t) = access {
+            headers.push(("Authorization".into(), format!("Bearer {t}")));
+        }
+        let url = format!("{}{API_PATH}", link.origin);
+        let (status, text) = match &link.transport {
+            Transport::Bridge(bridge) => {
+                let req = BridgeRequest { method: "POST".into(), url, headers, body: Some(body) };
+                let res = bridge.request_within(req, timeout).await.map_err(|e| {
+                    CallError::Casino(if e.contains("timeout") { CasinoError::Timeout } else { CasinoError::ConnectionLost })
+                })?;
+                (res.status, res.body)
+            }
+            Transport::Direct(client) => {
+                let mut req = client.post(url).timeout(timeout).body(body);
+                for (k, v) in headers {
+                    req = req.header(k, v);
+                }
+                let lost = |e: reqwest::Error| CallError::Casino(if e.is_timeout() { CasinoError::Timeout } else { CasinoError::ConnectionLost });
+                let res = req.send().await.map_err(lost)?;
+                let status = res.status().as_u16();
+                (status, res.text().await.map_err(lost)?)
+            }
+        };
+        parse_reply(status, &text)
+    }
+
+    /// Sends one of an original's mutations (or the open-round query) and reads the `Bet` it answers.
+    async fn play(&self, game: Game, op: Op, data: Option<Value>) -> Result<Option<Round>, CasinoError> {
+        let (key, field, input) = op_names(game, op).ok_or_else(|| CasinoError::Server(format!("{} can't do that on Shuffle", game.name())))?;
+        let fields = format!("{BET_FIELDS} shuffleOriginalActions {{ action {{ {} {{ {} }} }} }}", action_key(game), action_fields(game));
+        let query = match (op, input) {
+            (Op::Active, _) => format!("query Fastbet{key} {{ {field} {{ {fields} }} }}"),
+            (_, Some(input)) => format!("mutation Fastbet{key}($data: {input}!) {{ {field}(data: $data) {{ {fields} }} }}"),
+            (_, None) => format!("mutation Fastbet{key} {{ {field} {{ {fields} }} }}"),
+        };
+        let vars = data.map(|d| json!({ "data": d })).unwrap_or_else(|| json!({}));
+        let reply = self.gql(&query, vars, true).await?;
+        let Some(bet) = reply.get(field).filter(|b| b.is_object()) else {
+            return if op == Op::Active { Ok(None) } else { Err(CasinoError::BadReply(reply.to_string().chars().take(200).collect())) };
+        };
+        let round = round_of(game, bet).ok_or_else(|| CasinoError::BadReply(bet.to_string().chars().take(200).collect()))?;
+        tracing::debug!("shuffle: {} {op:?} -> open {} ×{} {}", game.name(), round.active, round.multiplier, round.state);
+        // the balance after this step, straight from Shuffle
+        if op != Op::Active {
+            if let Some(after) = bet.get("afterBalance").and_then(coin_units) {
+                self.market.lock().wallets.insert(round.currency.clone(), after);
+                self.settled.fetch_add(1, Ordering::SeqCst);
+                self.publish();
+            }
+        }
+        let mut open = self.open_rounds.lock();
+        if round.active {
+            open.insert(game, round.clone());
+        } else {
+            open.remove(&game);
+        }
+        Ok(Some(round))
+    }
+
+    /// The open round of `game`, as last seen (to continue it).
+    fn open_round(&self, game: Game) -> Result<Round, CasinoError> {
+        self.open_rounds.lock().get(&game).cloned().ok_or_else(|| CasinoError::Server("No open round".into()))
+    }
+
+    /// A fresh `X-Correlation-Id`, built the way the site builds it.
+    fn correlation_id(&self) -> String {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let user = self.user_id.lock().clone().unwrap_or_else(|| "anon".into());
+        format!("{}-{}-{SITE_VERSION}-{}-{}::{user}", self.browser_id, self.window_id, base32(ms), base32(n))
+    }
+
+    /// One API call over the current link. A dead or challenged link is flagged for the run loop.
+    async fn gql(&self, query: &str, variables: Value, auth: bool) -> Result<Value, CallError> {
+        let link = self.link.lock().clone().ok_or(CallError::Casino(CasinoError::NotConnected))?;
+        let res = if auth { self.signed(&link, query, variables).await } else { self.post(&link, query, variables, None, RPC_TIMEOUT).await };
+        let broken = matches!(res, Err(CallError::Cloudflare) | Err(CallError::Casino(CasinoError::ConnectionLost)));
+        if broken && link.gen == self.link_gen.load(Ordering::SeqCst) {
+            self.ready.store(false, Ordering::SeqCst);
+            self.broken_flag.store(true, Ordering::SeqCst);
+            self.broken.notify_one();
+        }
+        res
+    }
+
+    /// A signed-in call. The access token is renewed when it is about to run out, or when
+    /// the API refuses it, and then the call goes out once more.
+    async fn signed(&self, link: &Link, query: &str, variables: Value) -> Result<Value, CallError> {
+        let creds = self.creds.lock().clone().ok_or(CallError::Casino(CasinoError::Server("Not logged in".into())))?;
+        let mut access = creds.access.clone();
+        if let Some(left) = creds.expires_in().filter(|l| *l < RENEW_BEFORE && !creds.refresh.is_empty()) {
+            match self.renew(link, &creds.access).await {
+                Ok(fresh) => access = fresh,
+                // still valid for a moment: use it, the next call tries again
+                Err(CallError::Casino(e)) if left > 5 && !matches!(&e, CasinoError::Server(m) if m == EXPIRED) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        match self.post(link, query, variables.clone(), Some(&access), RPC_TIMEOUT).await {
+            Err(CallError::Unauthenticated) => {
+                let fresh = self.renew(link, &access).await?;
+                self.post(link, query, variables, Some(&fresh), RPC_TIMEOUT).await
+            }
+            res => res,
+        }
+    }
+
+    /// Trades the refresh token for a new pair, once for every call that saw `stale` refused.
+    /// The new pair is handed to the app to save.
+    async fn renew(&self, link: &Link, stale: &str) -> Result<String, CallError> {
+        let _one = self.renewing.lock().await;
+        let creds = self.creds.lock().clone().ok_or(CallError::Unauthenticated)?;
+        if creds.access != stale {
+            // renewed (or logged in again) while we waited
+            return Ok(creds.access);
+        }
+        if creds.refresh.is_empty() {
+            return Err(CallError::Unauthenticated);
+        }
+        let data = self.post(link, RENEW, json!({ "refreshToken": creds.refresh }), None, RPC_TIMEOUT).await?;
+        let pair = data
+            .get("refreshToken")
+            .and_then(|p| serde_json::from_value::<Creds>(p.clone()).ok())
+            .filter(|c| !c.access.is_empty() && !c.refresh.is_empty())
+            .ok_or_else(|| CallError::Casino(CasinoError::BadReply(data.to_string())))?;
+        self.spent.lock().insert(creds.refresh.clone());
+        {
+            let mut cur = self.creds.lock();
+            if cur.as_ref() != Some(&creds) {
+                // a new login arrived meanwhile; it wins
+                return cur.as_ref().map(|c| c.access.clone()).ok_or(CallError::Unauthenticated);
+            }
+            *cur = Some(pair.clone());
+        }
+        tracing::info!("shuffle: login renewed");
+        let _ = self.events.send(CasinoEvent::Token(pair.to_token()));
+        Ok(pair.access)
+    }
+}
+
+#[async_trait]
+impl Casino for Shuffle {
+    fn id(&self) -> CasinoId {
+        CasinoId::Shuffle
+    }
+
+    fn set_token(&self, token: Option<String>) {
+        let next = token.as_deref().and_then(Creds::parse);
+        {
+            let mut cur = self.creds.lock();
+            let spent = next.as_ref().is_some_and(|n| !n.refresh.is_empty() && self.spent.lock().contains(&n.refresh));
+            if !(spent && cur.is_some()) {
+                *cur = next;
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    fn set_mirror(&self, mirror: &str) {
+        let m = stake::normalize_mirror(mirror);
+        if m.is_empty() {
+            return;
+        }
+        {
+            let mut cur = self.mirror.lock();
+            if *cur == m {
+                return;
+            }
+            *cur = m;
+            self.setup.fetch_add(1, Ordering::SeqCst);
+        }
+        self.wake.notify_one();
+    }
+
+    fn shutdown(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.drop_link();
+        self.wake.notify_one();
+    }
+
+    async fn bet_limbo(&self, req: &BetRequest) -> Result<BetReply, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let _inflight = InFlight::new(&self.inflight);
+        let cur = req.currency.to_ascii_lowercase();
+        let vars = json!({ "data": {
+            "amount": format_units(req.amount, DECIMALS, DECIMALS),
+            "bet": format!("{:.2}", req.target),
+            "currency": cur.to_ascii_uppercase(),
+            "windowId": self.window_id,
+        } });
+        let data = self.gql(LIMBO, vars, true).await?;
+        let bad = || CasinoError::BadReply(data.to_string().chars().take(200).collect());
+        let bet = data.get("limboPlay").filter(|b| b.is_object()).ok_or_else(bad)?;
+        let limbo = bet.pointer("/shuffleOriginalActions/0/action/limbo").ok_or_else(bad)?;
+        let outcome = limbo.get("resultValue").and_then(f64_from_json).ok_or_else(bad)?;
+        let amount = bet.get("amount").and_then(coin_units);
+        let payout = bet.get("payout").and_then(coin_units);
+        if let (Some(a), Some(p)) = (amount, payout) {
+            let cur = bet.get("currency").and_then(Value::as_str).map(str::to_ascii_lowercase).unwrap_or(cur);
+            self.credit(&cur, p - a);
+        }
+        self.settled.fetch_add(1, Ordering::SeqCst);
+        // a bet of 0 pays 0 either way: the result against the target decides it
+        let target = limbo.get("userValue").and_then(f64_from_json).unwrap_or(req.target);
+        let win = if req.amount == 0 { Some(outcome >= target) } else { payout.map(|p| p > 0) };
+        Ok(BetReply { outcome, amount, winnings: payout, win, nonce: bet.get("gameSeedNonce").and_then(Value::as_u64) })
+    }
+
+    async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {
+        self.gql(ROTATE, json!({ "clientSeed": client_seed }), true).await?;
+        // the reply reveals the seed that was retired; the new pair is read afresh
+        let mut st = self.seeds().await.unwrap_or_default();
+        if st.client_seed.is_none() {
+            st.client_seed = Some(client_seed.to_string());
+        }
+        if st.nonce.is_none() {
+            st.nonce = Some(0);
+        }
+        Ok(st)
+    }
+
+    async fn provable_state(&self) -> Result<ProvableState, CasinoError> {
+        self.seeds().await
+    }
+
+    async fn list_slots(&self, _filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        Ok(vec![])
+    }
+
+    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str) -> Result<String, CasinoError> {
+        Err(CasinoError::Server("Slots aren't available on Shuffle yet".into()))
+    }
+
+    async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: Value, auto: bool) -> Result<Round, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let _inflight = InFlight::new(&self.inflight);
+        let mut data = bet_input(game, &params, auto).map_err(CasinoError::Server)?;
+        data["amount"] = json!(format_units(amount, DECIMALS, DECIMALS));
+        data["currency"] = json!(currency.to_ascii_uppercase());
+        if !game.has_steps() {
+            data["windowId"] = json!(self.window_id);
+        }
+        let op = if auto && game.has_steps() { Op::Auto } else { Op::Start };
+        self.play(game, op, Some(data)).await?.ok_or_else(|| CasinoError::BadReply("no bet in the reply".into()))
+    }
+
+    async fn original_step(&self, game: Game, step: Step, params: Value) -> Result<Round, CasinoError> {
+        let _inflight = InFlight::new(&self.inflight);
+        let (op, data) = match step {
+            Step::Cashout => (Op::Cashout, None),
+            Step::Next => (Op::Next, Some(next_input(game, &self.open_round(game)?, &params).map_err(CasinoError::Server)?)),
+        };
+        self.play(game, op, data).await?.ok_or_else(|| CasinoError::BadReply("no bet in the reply".into()))
+    }
+
+    async fn original_active(&self, game: Game) -> Result<Option<Round>, CasinoError> {
+        if !game.has_steps() {
+            return Ok(None);
+        }
+        self.play(game, Op::Active, None).await
+    }
+
+    async fn original_tables(&self) -> Result<Tables, CasinoError> {
+        // Shuffle's Keno and Plinko pay exactly like Stake's (Plinko without the expert risk)
+        Ok(Tables::builtin())
+    }
+
+    async fn list_originals(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        let aliases: Vec<String> = ORIGINAL_SLUGS.iter().map(|(_, s)| format!(r#"{s}: game(slug: "originals/{s}") {{ name edge image {{ key }} }}"#)).collect();
+        let data = self.gql(&format!("query FastbetOriginals {{ {} }}", aliases.join(" ")), json!({}), false).await?;
+        Ok(ORIGINAL_SLUGS
+            .iter()
+            .filter_map(|(ours, theirs)| {
+                let g = data.get(*theirs)?;
+                let key = g.pointer("/image/key")?.as_str()?;
+                let edge = g.get("edge").and_then(f64_from_json).unwrap_or(1.0);
+                Some(crate::slots::SlotGame {
+                    id: ours.to_string(),
+                    name: g.get("name")?.as_str()?.to_string(),
+                    producer: "shuffle".into(),
+                    image: format!("https://shuffle-com.imgix.net/{key}?{THUMB}"),
+                    demo: false,
+                    rtp: 100.0 - edge,
+                    provider_game_id: None,
+                    studio: None,
+                })
+            })
+            .collect())
+    }
+}
+
+/// The kinds of request an original takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    /// Starts a round (and settles it, for the one-shot games).
+    Start,
+    /// Plays a whole round from picks made up front (the stepped games' auto bet).
+    Auto,
+    Next,
+    Cashout,
+    /// The round left open, if any.
+    Active,
+}
+
+/// (operation name, field, input type) of an original's request.
+fn op_names(game: Game, op: Op) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    Some(match (game, op) {
+        (Game::Dice, Op::Start) => ("Dice", "dicePlay", Some("DicePlayInput")),
+        (Game::Keno, Op::Start) => ("Keno", "kenoPlay", Some("KenoPlayInput")),
+        (Game::Plinko, Op::Start) => ("Plinko", "plinkoPlay", Some("PlinkoPlayInput")),
+        (Game::Blitz, Op::Start) => ("Blitz", "blitzPlay", Some("BlitzPlayInput")),
+        (Game::Mines, Op::Start) => ("MinesStart", "minesStart", Some("MinesStartInput")),
+        (Game::Mines, Op::Auto) => ("MinesAuto", "minesAuto", Some("MinesBetInput")),
+        (Game::Mines, Op::Next) => ("MinesNext", "minesNext", Some("MinesNextInput")),
+        (Game::Mines, Op::Cashout) => ("MinesCashout", "minesCashout", None),
+        (Game::Mines, Op::Active) => ("MinesOpen", "minesActiveBet", None),
+        (Game::DragonTower, Op::Start) => ("TowerStart", "towerStart", Some("TowerStartInput")),
+        (Game::DragonTower, Op::Auto) => ("TowerAuto", "towerAuto", Some("TowerBetInput")),
+        (Game::DragonTower, Op::Next) => ("TowerNext", "towerNext", Some("TowerNextInput")),
+        (Game::DragonTower, Op::Cashout) => ("TowerCashout", "towerCashout", None),
+        (Game::DragonTower, Op::Active) => ("TowerOpen", "towerActiveBet", None),
+        (Game::Chicken, Op::Start) => ("ChickenStart", "chickenStart", Some("ChickenStartInput")),
+        (Game::Chicken, Op::Auto) => ("ChickenAuto", "chickenAuto", Some("ChickenBetInput")),
+        (Game::Chicken, Op::Next) => ("ChickenNext", "chickenNext", Some("ChickenNextInput")),
+        (Game::Chicken, Op::Cashout) => ("ChickenCashout", "chickenCashout", None),
+        (Game::Chicken, Op::Active) => ("ChickenOpen", "chickenActiveBet", None),
+        _ => return None,
+    })
+}
+
+/// The game's key inside `shuffleOriginalActions { action { … } }`, and the fields asked for.
+fn action_key(game: Game) -> &'static str {
+    match game {
+        Game::DragonTower => "tower",
+        Game::Mines => "mines",
+        Game::Chicken => "chicken",
+        Game::Keno => "keno",
+        Game::Plinko => "plinko",
+        Game::Blitz => "blitz",
+        _ => "dice",
+    }
+}
+
+fn action_fields(game: Game) -> &'static str {
+    match game {
+        Game::Keno => "results risk multiplier selected",
+        Game::Plinko => "risk results rows multiplier",
+        Game::Blitz => "cards picks maxRepeatedCount maxUniqueCardsBeforeDuplicate",
+        Game::Mines => "minesResult minesCount winMultiplier selected",
+        Game::DragonTower => "towerResult towerDifficulty winMultiplier selected",
+        Game::Chicken => "chickenResult chickenDifficulty winMultiplier selectedLane",
+        _ => "userDiceDirection userValue resultValue",
+    }
+}
+
+/// Keno and Plinko risks: the boards' names <-> Shuffle's (`classic` / `LOW_RISK` …).
+fn risk_up(risk: &str) -> String {
+    match risk {
+        "classic" => "CLASSIC".into(),
+        r => format!("{}_RISK", r.to_ascii_uppercase()),
+    }
+}
+
+fn risk_down(risk: &str) -> String {
+    risk.trim_end_matches("_RISK").to_ascii_lowercase()
+}
+
+/// A board's params (Stake's field names) -> Shuffle's input for a new round, without the stake.
+fn bet_input(game: Game, p: &Value, auto: bool) -> Result<Value, String> {
+    let difficulty = || p["difficulty"].as_str().unwrap_or("easy").to_ascii_uppercase();
+    Ok(match game {
+        Game::Dice => {
+            let target = p["target"].as_f64().ok_or("Pick a target")?;
+            let direction = if p["condition"].as_str() == Some("below") { "BELOW" } else { "ABOVE" };
+            json!({ "bet": format!("{target:.2}"), "direction": direction })
+        }
+        // the boards number keno 0–39, Shuffle 1–40
+        Game::Keno => {
+            let picks: Vec<i64> = p["numbers"].as_array().map(|a| a.iter().filter_map(Value::as_i64).map(|n| n + 1).collect()).unwrap_or_default();
+            if picks.is_empty() {
+                return Err("Pick some numbers".into());
+            }
+            json!({ "risk": risk_up(p["risk"].as_str().unwrap_or("classic")), "selected": picks })
+        }
+        Game::Plinko => json!({ "risk": risk_up(p["risk"].as_str().unwrap_or("medium")), "rows": p["rows"].as_u64().unwrap_or(16) }),
+        Game::Blitz => json!({ "picks": p["picks"].as_u64().unwrap_or(10) }),
+        Game::Mines if auto => json!({ "minesCount": p["minesCount"].as_u64().unwrap_or(3), "selected": p["fields"].clone() }),
+        Game::Mines => json!({ "minesCount": p["minesCount"].as_u64().unwrap_or(3) }),
+        Game::DragonTower if auto => json!({ "difficulty": difficulty(), "selected": p["eggs"].clone() }),
+        Game::DragonTower => json!({ "difficulty": difficulty() }),
+        // the board counts lanes to cross, Shuffle wants the last lane (0-based)
+        Game::Chicken if auto => {
+            let lanes = p["round"].as_u64().unwrap_or(1).max(1);
+            json!({ "difficulty": difficulty(), "selectedLane": lanes - 1 })
+        }
+        Game::Chicken => json!({ "difficulty": difficulty() }),
+        _ => return Err(format!("{} isn't on Shuffle", game.name())),
+    })
+}
+
+/// A board's next step -> Shuffle's input, continuing `open`.
+fn next_input(game: Game, open: &Round, p: &Value) -> Result<Value, String> {
+    Ok(match game {
+        Game::Mines => json!({ "selected": p["fields"].clone() }),
+        Game::DragonTower => {
+            let row = open.state["tilesSelected"].as_array().map(Vec::len).unwrap_or(0);
+            json!({ "selected": p["egg"].as_u64().ok_or("Pick a tile")?, "row": row, "betId": open.id })
+        }
+        // the next lane over
+        Game::Chicken => json!({ "selectedLane": open.state["round"].as_u64().unwrap_or(0), "betId": open.id }),
+        _ => return Err(format!("{} has no steps", game.name())),
+    })
+}
+
+/// Whole numbers from a number, a list of them, or numeric strings.
+fn ints(v: &Value) -> Vec<i64> {
+    match v {
+        Value::Array(a) => a.iter().filter_map(|x| x.as_i64().or_else(|| x.as_str()?.parse().ok())).collect(),
+        Value::Number(n) => n.as_i64().into_iter().collect(),
+        _ => vec![],
+    }
+}
+
+/// A Shuffle `Bet` -> a round in the state shape of Stake's board for the game.
+fn round_of(game: Game, bet: &Value) -> Option<Round> {
+    let key = action_key(game);
+    let actions: Vec<&Value> = bet["shuffleOriginalActions"].as_array()?.iter().map(|a| &a["action"][key]).filter(|a| a.is_object()).collect();
+    let first = *actions.first()?;
+    let multiplier = bet.get("multiplier").and_then(f64_from_json).unwrap_or(0.0);
+    // the field only filled in once the round is over
+    let outcome = |field: &str| actions.iter().rev().map(|a| &a[field]).find(|r| r.as_array().is_some_and(|x| !x.is_empty())).cloned();
+    let difficulty = |field: &str| first[field].as_str().unwrap_or("EASY").to_ascii_lowercase();
+    let (active, state) = match game {
+        Game::Dice => {
+            let condition = first["userDiceDirection"].as_str().unwrap_or("ABOVE").to_ascii_lowercase();
+            (false, json!({ "result": f64_from_json(&first["resultValue"])?, "target": f64_from_json(&first["userValue"])?, "condition": condition }))
+        }
+        Game::Keno => {
+            let down = |v: &Value| ints(v).into_iter().map(|n| n - 1).collect::<Vec<_>>();
+            let risk = risk_down(first["risk"].as_str().unwrap_or("CLASSIC"));
+            (false, json!({ "risk": risk, "drawnNumbers": down(&first["results"]), "selectedNumbers": down(&first["selected"]) }))
+        }
+        // one 0/1 per row, 1 bouncing right
+        Game::Plinko => {
+            let path: Vec<&str> = ints(&first["results"]).into_iter().map(|b| if b == 1 { "R" } else { "L" }).collect();
+            (false, json!({ "risk": risk_down(first["risk"].as_str().unwrap_or("MEDIUM_RISK")), "rows": first["rows"], "path": path }))
+        }
+        Game::Blitz => (false, json!({ "cards": first["cards"], "picks": first["picks"], "maxRepeatedCount": first["maxRepeatedCount"] })),
+        // one action per revealed tile (all of them at once for an auto bet)
+        Game::Mines => {
+            let count = first["minesCount"].as_u64().unwrap_or(0) as u32;
+            let mines = outcome("minesResult").map(|r| ints(&r)).unwrap_or_default();
+            let picks: Vec<i64> = actions.iter().flat_map(|a| ints(&a["selected"])).collect();
+            (mines.is_empty(), mines_state(count, &picks, &mines))
+        }
+        // the layout (safe columns per row) comes with the end of the round
+        Game::DragonTower => {
+            let picks: Vec<i64> = actions.iter().flat_map(|a| ints(&a["selected"])).collect();
+            let layout = outcome("towerResult");
+            let state = json!({
+                "difficulty": difficulty("towerDifficulty"),
+                "tilesSelected": picks,
+                "currentRound": picks.len(),
+                "rounds": layout.clone().unwrap_or(json!([])),
+                "playedRounds": [],
+            });
+            (layout.is_none(), state)
+        }
+        // the lanes with cars come with the end of the round
+        Game::Chicken => {
+            let lane = actions.iter().filter_map(|a| a["selectedLane"].as_i64()).max();
+            let cars = outcome("chickenResult").map(|r| ints(&r));
+            // lanes crossed: up to the first car on a loss, else every lane picked
+            let crossed = match (&cars, lane) {
+                (Some(c), _) if multiplier <= 0.0 => c.iter().min().copied().unwrap_or(0),
+                (_, Some(l)) => l + 1,
+                _ => 0,
+            };
+            let now = actions.last().and_then(|a| f64_from_json(&a["winMultiplier"])).unwrap_or(multiplier);
+            (cars.is_none(), json!({ "difficulty": difficulty("chickenDifficulty"), "round": crossed, "payoutMultiplier": now }))
+        }
+        _ => return None,
+    };
+    Some(Round {
+        game,
+        id: bet.get("id")?.as_str()?.to_string(),
+        active,
+        currency: bet.get("currency").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase(),
+        amount: bet.get("amount").and_then(coin_units).unwrap_or(0),
+        amount_mult: 1.0,
+        payout: bet.get("payout").and_then(coin_units).unwrap_or(0),
+        multiplier,
+        state,
+    })
+}
+
+/// Plain HTTPS to the mirror, looking like the site's own requests.
+fn direct_client(mirror: &str) -> Result<reqwest::Client, String> {
+    use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER};
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(ORIGIN, HeaderValue::from_str(&format!("https://{mirror}")).map_err(|e| e.to_string())?);
+    headers.insert(REFERER, HeaderValue::from_str(&format!("https://{mirror}/")).map_err(|e| e.to_string())?);
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        // header names as browsers write them: Cloudflare turns away lowercase ones over HTTP/1.1
+        .http1_title_case_headers()
+        // keeps the cookies Cloudflare hands out
+        .cookie_store(true)
+        .default_headers(headers)
+        .gzip(true)
+        .build()
+        .map_err(|e| format!("Could not set up the connection: {e}"))
+}
+
+/// Shuffle answers `{data, errors}`; anything that isn't JSON came from Cloudflare.
+fn parse_reply(status: u16, body: &str) -> Result<Value, CallError> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        if status == 429 {
+            return Err(CallError::Casino(CasinoError::Busy("Too many requests".into())));
+        }
+        let challenge = ["challenge-platform", "Just a moment", "Attention Required", "cf-chl"].iter().any(|k| body.contains(k));
+        if challenge || status == 403 || status == 503 {
+            return Err(CallError::Cloudflare);
+        }
+        if body.trim_start().starts_with('<') {
+            return Err(CallError::Casino(CasinoError::BadReply(format!("HTTP {status} error page"))));
+        }
+        let snippet: String = body.chars().take(160).collect();
+        return Err(CallError::Casino(CasinoError::BadReply(format!("HTTP {status}: {snippet}"))));
+    };
+    if let Some(e) = v.get("errors").and_then(Value::as_array).and_then(|a| a.first()) {
+        return Err(error_of(e.get("message").and_then(Value::as_str).unwrap_or("Unknown error")));
+    }
+    if status == 429 {
+        return Err(CallError::Casino(CasinoError::Busy("Too many requests".into())));
+    }
+    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// Shuffle's errors carry a code as the message (`BALANCE_NOT_ENOUGH`).
+fn error_of(code: &str) -> CallError {
+    match code {
+        "UNAUTHENTICATED" => CallError::Unauthenticated,
+        "INVALID_REFRESH_TOKEN" | "REFRESH_TOKEN_EXPIRED" | "USER_SESSION_NOT_FOUND" | "INVALID_ACCESS_TOKEN" => {
+            CallError::Casino(CasinoError::Server(EXPIRED.into()))
+        }
+        "TOO_MANY_CONCURRENT_REQUESTS" | "TOO_MANY_REQUEST" | "TOO_MANY_REQUESTS" => CallError::Casino(CasinoError::Busy("Please slow down".into())),
+        "ACTIVE_BET_EXISTS" | "ACTIVE_MINES_EXISTS" | "INCOMPLETE_BET" | "GAME_IN_PROGRESS" => CallError::Casino(CasinoError::RoundOpen),
+        "INVALID_ACTIVE_BET" => CallError::Casino(CasinoError::Server("No open round".into())),
+        c => CallError::Casino(CasinoError::Server(readable(c))),
+    }
+}
+
+/// The site's own English for the codes a bet can meet; any other code reads as words.
+fn readable(code: &str) -> String {
+    let text = match code {
+        "BALANCE_NOT_ENOUGH" => "Insufficient balance",
+        "INVALID_AMOUNT" => "Enter a valid amount",
+        "AMOUNT_TOO_LARGE" => "Amount too large",
+        "LIMBO_GAME_BOUNDS" => "Multiplier out of bounds",
+        "EXCEED_MAX_PAYOUT_LIMIT" | "ESTIMATED_PAYOUT_EXCEEDED_MAX_PAYOUT" => "Max payout exceeded. Reduce stake.",
+        "DISABLED_CURRENCY" => "The currency provided is disabled.",
+        "NOT_ALLOW_FIAT_CURRENCY" => "Fiat currency is not allowed",
+        "GEO_REGION_RESTRICTED" => "Shuffle isn't available from your region",
+        "WITHDRAWAL_MODE_ONLY" => "Your account is in withdrawal-only mode",
+        "LOSS_LIMIT_EXCEED" => "You have exceeded your loss limit",
+        "ROLLOVER_MAX_BET_EXCEED" => "Bet amount must not exceed maximum during rollover.",
+        "ROLLOVER_RESTRICTED_GAME" => "You are not allowed to play this game.",
+        "USER_SELF_EXCLUDED" => "You have self-excluded",
+        "USER_SUSPENDED" => "Your account is suspended. Contact support for help.",
+        "EMAIL_UNVERIFIED" => "Email has not been verified",
+        "GAME_GENERIC_ERROR" | "ERROR_GENERIC" | "ERROR_OCCURRED" => "Shuffle couldn't place the bet. Try again.",
+        _ => "",
+    };
+    if !text.is_empty() {
+        return text.into();
+    }
+    if !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        let words = code.replace('_', " ").to_ascii_lowercase();
+        let mut chars = words.chars();
+        return chars.next().map(|f| f.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default();
+    }
+    code.to_string()
+}
+
+/// The seed pair in use, from one seed or a list of them (the active one and the next).
+fn provable_from(v: &Value) -> ProvableState {
+    let seed = match v {
+        Value::Array(list) => list.iter().find(|s| s["status"].as_str().is_some_and(|st| st.eq_ignore_ascii_case("active"))).or_else(|| list.first()),
+        Value::Object(_) => Some(v),
+        _ => None,
+    };
+    let Some(s) = seed else { return ProvableState::default() };
+    ProvableState {
+        client_seed: s.get("clientSeed").and_then(Value::as_str).map(str::to_string),
+        server_seed_hash: s.get("hashedSeed").and_then(Value::as_str).map(str::to_string),
+        nonce: s.get("currentNonce").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok()))),
+    }
+}
+
+/// "0.00012345" (or a number) -> 12345 base units. Digits past the 8th decimal are dropped.
+fn coin_units(v: &Value) -> Option<Units> {
+    match v {
+        Value::String(s) => parse_units(s, DECIMALS),
+        Value::Number(_) => {
+            let f = f64_from_json(v).filter(|f| f.is_finite() && *f >= 0.0)?;
+            parse_units(&format!("{f:.8}"), DECIMALS)
+        }
+        _ => None,
+    }
+}
+
+/// The coin holding the most value, else USDT.
+fn richest(m: &Market) -> Option<String> {
+    let usd = |cur: &str, v: Units| to_f64(v, DECIMALS) * m.info(cur).map(|i| i.price).unwrap_or(0.0);
+    m.wallets
+        .iter()
+        .map(|(c, v)| (c, usd(c, *v)))
+        .filter(|(_, u)| *u > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(c, _)| c.clone())
+        .or_else(|| m.wallets.contains_key("usdt").then(|| "usdt".to_string()))
+        .or_else(|| m.wallets.keys().next().cloned())
+}
+
+/// A random id the way the site makes its browser and window ids: a number below 10^15 in base 32.
+fn random_id() -> String {
+    use rand::Rng;
+    base32(rand::rng().random_range(0..=1_000_000_000_000_000))
+}
+
+/// JavaScript's `n.toString(32)`.
+fn base32(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuv";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 32) as usize]);
+        n /= 32;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn new(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every originals request as it goes out, one JSON line each, to check against the live
+    /// schema: `cargo test shuffle_queries -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn shuffle_queries() {
+        let games = [Game::Dice, Game::Keno, Game::Plinko, Game::Blitz, Game::Mines, Game::DragonTower, Game::Chicken];
+        for game in games {
+            for op in [Op::Start, Op::Auto, Op::Next, Op::Cashout, Op::Active] {
+                let Some((key, field, input)) = op_names(game, op) else { continue };
+                let fields = format!("{BET_FIELDS} shuffleOriginalActions {{ action {{ {} {{ {} }} }} }}", action_key(game), action_fields(game));
+                let q = match (op, input) {
+                    (Op::Active, _) => format!("query Fastbet{key} {{ {field} {{ {fields} }} }}"),
+                    (_, Some(input)) => format!("mutation Fastbet{key}($data: {input}!) {{ {field}(data: $data) {{ {fields} }} }}"),
+                    (_, None) => format!("mutation Fastbet{key} {{ {field} {{ {fields} }} }}"),
+                };
+                println!("{}", json!({ "name": key, "query": q }));
+            }
+        }
+        println!("{}", json!({ "name": "Limbo", "query": LIMBO }));
+    }
+
+    #[test]
+    fn mirrors_are_unique_bare_hosts() {
+        let mut seen = HashSet::new();
+        for m in MIRRORS {
+            assert_eq!(stake::normalize_mirror(m), *m, "{m} is not a bare lowercase host");
+            assert!(seen.insert(*m), "{m} listed twice");
+        }
+        assert_eq!(MIRRORS[0], DEFAULT_MIRROR);
+    }
+
+
+
+    #[test]
+    fn replies() {
+        let ok = parse_reply(200, r#"{"data":{"me":{"username":"x"}}}"#).ok().unwrap();
+        assert_eq!(ok["me"]["username"], "x");
+        let unauth = r#"{"errors":[{"message":"UNAUTHENTICATED","extensions":{"code":"UNAUTHENTICATED"}}],"data":null}"#;
+        assert!(matches!(parse_reply(200, unauth), Err(CallError::Unauthenticated)));
+        let spent = r#"{"errors":[{"message":"INVALID_REFRESH_TOKEN"}],"data":null}"#;
+        assert!(matches!(parse_reply(200, spent), Err(CallError::Casino(CasinoError::Server(m))) if m == EXPIRED));
+        let busy = r#"{"errors":[{"message":"TOO_MANY_CONCURRENT_REQUESTS"}]}"#;
+        assert!(matches!(parse_reply(200, busy), Err(CallError::Casino(e)) if e.is_busy()));
+        let poor = r#"{"errors":[{"message":"BALANCE_NOT_ENOUGH"}]}"#;
+        assert!(matches!(parse_reply(200, poor), Err(CallError::Casino(CasinoError::Server(m))) if m == "Insufficient balance"));
+        assert!(matches!(parse_reply(403, "<html>Just a moment...</html>"), Err(CallError::Cloudflare)));
+        assert_eq!(readable("SOME_NEW_CODE"), "Some new code");
+        assert_eq!(readable("Invalid request!"), "Invalid request!");
+    }
+
+    #[test]
+    fn seeds_and_amounts() {
+        let list = json!([{ "clientSeed": "next", "hashedSeed": "h2", "status": "NEXT", "currentNonce": 0 },
+                          { "clientSeed": "cs", "hashedSeed": "h1", "status": "ACTIVE", "currentNonce": "42" }]);
+        let st = provable_from(&list);
+        assert_eq!((st.client_seed.as_deref(), st.server_seed_hash.as_deref(), st.nonce), (Some("cs"), Some("h1"), Some(42)));
+        assert_eq!(coin_units(&json!("1.234567891")), Some(123_456_789));
+        assert_eq!(coin_units(&json!("0")), Some(0));
+        assert_eq!(format_units(100, DECIMALS, DECIMALS), "0.000001");
+        assert_eq!(base32(0), "0");
+        assert_eq!(base32(1_791_740_000_000), "1k4m0ddo0");
+        assert!(random_id().chars().all(|c| c.is_ascii_digit() || ('a'..='v').contains(&c)));
+    }
+}

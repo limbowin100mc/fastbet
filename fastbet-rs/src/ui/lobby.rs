@@ -131,7 +131,7 @@ fn originals(app: &mut App, ui: &mut Ui, x0: f32, mut y: f32, avail: f32) -> f32
         let row = (i / cols) as f32;
         let rect = Rect::from_min_size(pos2(x0 + col * (TILE_W + TILE_GAP), y + row * (TILE_H + TILE_GAP)), vec2(TILE_W, TILE_H));
         let slug = g.map(|g| g.slug()).unwrap_or("limbo");
-        let name = g.map(|g| g.name()).unwrap_or("Limbo");
+        let name = g.map(|g| id.original_name(g)).unwrap_or("Limbo");
         let art = app.orig.catalog.iter().find(|c| c.id == slug).map(|c| c.image.clone()).unwrap_or_default();
         if original_tile(app, ui, rect, slug, name, &art).clicked() {
             open = Some(*g);

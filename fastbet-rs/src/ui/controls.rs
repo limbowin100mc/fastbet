@@ -205,10 +205,10 @@ pub(super) fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
         });
         widgets::hsep(ui);
         caption(ui, "Async mode · bets in flight");
-        const LANES: [u32; 5] = [1, 2, 3, 4, 8];
+        const LANES: [u32; 6] = [1, 2, 3, 4, 6, 8];
         let cur = app.settings.async_bets.max(1);
         let sel = LANES.iter().position(|n| *n == cur).unwrap_or(0);
-        if let Some(i) = segmented(ui, &["1", "2", "3", "4", "8"], sel, !locked) {
+        if let Some(i) = segmented(ui, &["1", "2", "3", "4", "6", "8"], sel, !locked) {
             app.settings.async_bets = LANES[i];
             app.mark_dirty();
             app.sync_concurrency();

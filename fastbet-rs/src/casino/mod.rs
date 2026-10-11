@@ -3,6 +3,9 @@
 //! here and one variant to [`CasinoId`].
 
 pub mod chipsgg;
+pub mod creds;
+pub mod goated;
+pub mod shuffle;
 pub mod stake;
 
 use std::collections::BTreeMap;
@@ -22,15 +25,19 @@ use crate::originals::{Game, Round, Step, Tables};
 pub enum CasinoId {
     ChipsGg,
     Stake,
+    Shuffle,
+    Goated,
 }
 
 impl CasinoId {
-    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake];
+    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake, CasinoId::Shuffle, CasinoId::Goated];
 
     pub fn key(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "chipsgg",
             CasinoId::Stake => "stake",
+            CasinoId::Shuffle => "shuffle",
+            CasinoId::Goated => "goated",
         }
     }
 
@@ -38,6 +45,8 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "Chips.gg",
             CasinoId::Stake => "Stake.com",
+            CasinoId::Shuffle => "Shuffle.com",
+            CasinoId::Goated => "Goated.com",
         }
     }
 
@@ -48,8 +57,9 @@ impl CasinoId {
     /// Domains the casino can be reached on; empty when there is only one.
     pub fn mirrors(self) -> &'static [&'static str] {
         match self {
-            CasinoId::ChipsGg => &[],
+            CasinoId::ChipsGg | CasinoId::Goated => &[],
             CasinoId::Stake => stake::MIRRORS,
+            CasinoId::Shuffle => shuffle::MIRRORS,
         }
     }
 
@@ -62,14 +72,33 @@ impl CasinoId {
         matches!(self, CasinoId::Stake)
     }
 
-    /// Takes bets of 0: they play a real round that pays nothing (Stake).
+    /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated).
     pub fn zero_bets(self) -> bool {
-        matches!(self, CasinoId::Stake)
+        matches!(self, CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
     }
 
     /// Whether the account can also be linked through the embedded login window.
     pub fn window_login(self) -> bool {
-        matches!(self, CasinoId::ChipsGg)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Shuffle | CasinoId::Goated)
+    }
+
+    /// Linked through the login window: the casino has no API keys to paste (Shuffle, Goated).
+    pub fn window_only(self) -> bool {
+        matches!(self, CasinoId::Shuffle | CasinoId::Goated)
+    }
+
+    /// The site's tokens can also be pasted by hand: the access token and the refresh token (Goated).
+    pub fn manual_tokens(self) -> bool {
+        matches!(self, CasinoId::Goated)
+    }
+
+    /// A cookie the login window reads from its browser (it is HttpOnly, out of the page's reach)
+    /// and hands over as the refresh token: (a URL it is sent to, its name).
+    pub fn login_cookie(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            CasinoId::Goated => Some(("https://apis.goated.com/user/auth/token/refresh", goated::REFRESH_COOKIE)),
+            _ => None,
+        }
     }
 
     /// Slot producers the app can autoplay here, in lobby order. Empty: no slots.
@@ -77,6 +106,7 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => &["hacksawgaming", "avatarux", "bgaming"],
             CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
+            CasinoId::Shuffle | CasinoId::Goated => &[],
         }
     }
 
@@ -88,7 +118,33 @@ impl CasinoId {
     pub fn originals(self) -> Vec<Game> {
         match self {
             CasinoId::ChipsGg => vec![],
-            CasinoId::Stake => Game::all().collect(),
+            CasinoId::Stake => Game::stake().collect(),
+            CasinoId::Goated => vec![Game::Dice, Game::Mines],
+            CasinoId::Shuffle => vec![Game::Dice, Game::Mines, Game::Keno, Game::Plinko, Game::Blitz, Game::DragonTower, Game::Chicken],
+        }
+    }
+
+    /// An original's name here (Shuffle calls its tower "Waifu Tower").
+    pub fn original_name(self, game: Game) -> &'static str {
+        match (self, game) {
+            (CasinoId::Shuffle, Game::DragonTower) => "Waifu Tower",
+            _ => game.name(),
+        }
+    }
+
+    /// Dice win chances accepted here, in percent (Goated pays at most 990×).
+    pub fn dice_chance(self) -> (f64, f64) {
+        match self {
+            CasinoId::Goated => (0.1, 98.0),
+            _ => (0.01, 98.0),
+        }
+    }
+
+    /// Plinko's risk levels here, as (key, label).
+    pub fn plinko_risks(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            CasinoId::Shuffle => &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
+            _ => &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("expert", "Expert")],
         }
     }
 
@@ -103,14 +159,17 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "API key",
             CasinoId::Stake => "API token",
+            CasinoId::Shuffle | CasinoId::Goated => "login",
         }
     }
 
-    /// Page the embedded login window opens.
-    pub fn login_url(self) -> &'static str {
+    /// Page the embedded login window opens, on the given mirror.
+    pub fn login_url(self, mirror: Option<&str>) -> String {
         match self {
-            CasinoId::ChipsGg => "https://chips.gg/",
-            CasinoId::Stake => "https://stake.com/",
+            CasinoId::ChipsGg => "https://chips.gg/".into(),
+            CasinoId::Stake => format!("https://{}/", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
+            CasinoId::Shuffle => format!("https://{}/", mirror.unwrap_or(shuffle::DEFAULT_MIRROR)),
+            CasinoId::Goated => "https://www.goated.com/".into(),
         }
     }
 
@@ -119,6 +178,7 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "https://chips.gg/settings/api-keys".into(),
             CasinoId::Stake => format!("https://{}/settings/security", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
+            CasinoId::Shuffle | CasinoId::Goated => self.login_url(mirror),
         }
     }
 
@@ -210,6 +270,63 @@ impl CasinoId {
   }, 400);
 })();"#
             }
+            // Shuffle keeps its login in localStorage as the redux-persist `auth` slice:
+            // an access token (JWT) and the refresh token that renews it. Logged in means
+            // both are there and neither has run out, the site's own test.
+            CasinoId::Shuffle => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  var last = '';
+  function claims(jwt) {
+    var s = String(jwt).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    return JSON.parse(atob(s));
+  }
+  function live(jwt, strict) {
+    try { var exp = claims(jwt).exp; return !exp || exp > Date.now() / 1000 + 5; } catch (e) { return !strict; }
+  }
+  setInterval(function () {
+    try {
+      var root = localStorage.getItem('persist:root') || localStorage.getItem('persist:us:root');
+      var auth = root ? JSON.parse(JSON.parse(root).auth || '{}') : {};
+      var a = auth.accessToken || '', r = auth.refreshToken || '';
+      var ok = !!(a && r && live(a, true) && live(r, false));
+      var msg = JSON.stringify({ token: ok ? JSON.stringify({ accessToken: a, refreshToken: r }) : '', loggedIn: ok });
+      if (msg !== last) { last = msg; window.ipc.postMessage(msg); }
+    } catch (e) {}
+  }, 400);
+})();"#
+            }
+            // Goated keeps the access token in localStorage `g3_token` (JSON-quoted); the
+            // refresh token is an HttpOnly cookie the window adds itself (`login_cookie`).
+            // Reported every second while logged in, so the window looks for the cookie again
+            // until it is there.
+            CasinoId::Goated => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  var last = '', n = 0;
+  function live(jwt) {
+    try {
+      var s = String(jwt).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (s.length % 4) s += '=';
+      var exp = JSON.parse(atob(s)).exp;
+      return !exp || exp > Date.now() / 1000 + 5;
+    } catch (e) { return false; }
+  }
+  setInterval(function () {
+    try {
+      var raw = localStorage.getItem('g3_token') || '';
+      var token = '';
+      try { token = raw ? JSON.parse(raw) : ''; } catch (e) { token = raw; }
+      var ok = !!(token && typeof token === 'string' && live(token));
+      var msg = JSON.stringify({ token: ok ? token : '', loggedIn: ok, tick: ok ? n++ : 0 });
+      if (msg !== last) { last = msg; window.ipc.postMessage(msg); }
+    } catch (e) {}
+  }, 1000);
+})();"#
+            }
             // Stake links with an API token only
             CasinoId::Stake => "",
         }
@@ -220,25 +337,27 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "On chips.gg open Settings → API Keys → Create API Key, copy the key (it is shown only once) and paste it here.",
             CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
+            CasinoId::Shuffle => "Shuffle has no API keys: log in to Shuffle in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
+            CasinoId::Goated => "Goated has no API keys: log in to Goated in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
         }
     }
 
     pub fn min_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake => 1.01,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated => 1.01,
         }
     }
 
     pub fn max_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake => 1_000_000.0,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated => 1_000_000.0,
         }
     }
 
     /// Payout multiplier at which the house edge is already deducted (99% RTP).
     pub fn win_chance(self, target: f64) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake => 99.0 / target,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated => 99.0 / target,
         }
     }
 }
@@ -349,6 +468,8 @@ pub enum CasinoEvent {
     Status(ConnStatus, String),
     Market(Market),
     Provable(ProvableState),
+    /// The casino renewed the login (Shuffle): save this token in place of the old one, which stopped working.
+    Token(String),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -444,6 +565,8 @@ pub fn connect(id: CasinoId, setup: Setup, events: mpsc::UnboundedSender<CasinoE
     match id {
         CasinoId::ChipsGg => chipsgg::ChipsGg::spawn(setup.token, events),
         CasinoId::Stake => stake::Stake::spawn(setup, events),
+        CasinoId::Shuffle => shuffle::Shuffle::spawn(setup, events),
+        CasinoId::Goated => goated::Goated::spawn(setup, events),
     }
 }
 

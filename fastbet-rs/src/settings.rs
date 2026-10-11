@@ -47,17 +47,55 @@ impl Default for Sections {
     }
 }
 
+/// One login on one casino; a casino can have several.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Account {
+    /// Stable id. It also names the login window's browser profile, so every account keeps
+    /// its own site session (accounts from before multi-account use the casino's key).
+    pub id: String,
+    pub casino: CasinoId,
+    pub token: String,
+    /// Last seen username, for the account list.
+    pub username: Option<String>,
+    /// Chosen domain, for casinos with mirrors.
+    pub mirror: Option<String>,
+    /// Cookies and User Agent the user copied from their browser (casinos behind Cloudflare).
+    pub clearance: Option<Clearance>,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self { id: String::new(), casino: CasinoId::ChipsGg, token: String::new(), username: None, mirror: None, clearance: None }
+    }
+}
+
+impl Account {
+    /// A new, empty account on `casino`.
+    pub fn new(casino: CasinoId) -> Self {
+        let tag: u32 = rand::random();
+        Self { id: format!("{}-{:06x}", casino.key(), tag & 0xff_ffff), casino, ..Self::default() }
+    }
+
+    pub fn token(&self) -> Option<String> {
+        Some(self.token.trim().to_string()).filter(|s| !s.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Every saved login, in the order they were added.
+    pub accounts: Vec<Account>,
+    /// Id of the account in use; empty for none.
+    pub account: String,
+    /// The account in use's casino.
     pub casino: CasinoId,
-    /// Login token per casino, keyed by `CasinoId::key()`.
+    // Before multi-account: one login per casino, keyed by `CasinoId::key()`. Read once to make the
+    // first accounts, and still written (from the first account of each casino) for older FastBets.
     pub tokens: BTreeMap<String, String>,
-    /// Last seen username per casino, for the account list.
     pub usernames: BTreeMap<String, String>,
-    /// Chosen domain per casino that has mirrors (Stake).
     pub mirrors: BTreeMap<String, String>,
-    /// Cloudflare cookie the user copied from their browser, per casino behind Cloudflare.
     pub clearances: BTreeMap<String, Clearance>,
 
     pub mode: Mode,
@@ -103,6 +141,13 @@ pub struct Settings {
 
     /// The originals' own settings (risk, rows, picked tiles …).
     pub orig: OriginalPrefs,
+
+    /// The file exists but couldn't be read: saving is off so it is never overwritten.
+    #[serde(skip)]
+    pub unreadable: bool,
+    /// Accounts removed by the user this session: the only logins a save may drop.
+    #[serde(skip)]
+    pub removed: Vec<String>,
 }
 
 /// What each original's board was last set to.
@@ -160,6 +205,8 @@ pub struct OriginalPrefs {
     pub roulette_chips: BTreeMap<String, u32>,
     pub scarab_lines: u8,
     pub tome_lines: u8,
+    /// Blitz (Shuffle): cards drawn per bet.
+    pub blitz_picks: u8,
 }
 
 impl Default for OriginalPrefs {
@@ -201,6 +248,7 @@ impl Default for OriginalPrefs {
             roulette_chips: BTreeMap::new(),
             scarab_lines: 20,
             tome_lines: 20,
+            blitz_picks: 10,
         }
     }
 }
@@ -215,6 +263,8 @@ pub struct SlotPrefs {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            accounts: vec![],
+            account: String::new(),
             casino: CasinoId::ChipsGg,
             tokens: Default::default(),
             usernames: Default::default(),
@@ -253,6 +303,8 @@ impl Default for Settings {
             slot_stop_loss: String::new(),
             slot_prefs: Default::default(),
             orig: OriginalPrefs::default(),
+            unreadable: false,
+            removed: vec![],
         }
     }
 }
@@ -268,49 +320,190 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let Some(path) = Self::path() else { return Self::default() };
-        match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                tracing::warn!("settings unreadable ({e}), using defaults");
-                Self::default()
-            }),
-            Err(_) => Self::default(),
+        let mut s = Self::load_file();
+        s.migrate();
+        if let Some(c) = s.active().map(|a| a.casino) {
+            s.casino = c;
+        }
+        s
+    }
+
+    /// Accounts from the one-login-per-casino fields, the first time a multi-account FastBet runs.
+    fn migrate(&mut self) {
+        if !self.accounts.is_empty() {
+            return;
+        }
+        for casino in CasinoId::ALL {
+            let key = casino.key();
+            let token = self.tokens.get(key).cloned().unwrap_or_default();
+            if token.trim().is_empty() && !self.usernames.contains_key(key) {
+                continue;
+            }
+            self.accounts.push(Account {
+                id: key.to_string(),
+                casino: *casino,
+                token,
+                username: self.usernames.get(key).cloned(),
+                mirror: self.mirrors.get(key).cloned(),
+                clearance: self.clearances.get(key).cloned(),
+            });
+        }
+        if let Some(a) = self.accounts.iter().find(|a| a.casino == self.casino) {
+            self.account = a.id.clone();
         }
     }
 
-    pub fn save(&self) {
+    /// The old per-casino fields, from the first account of each casino (the one in use first).
+    fn sync_legacy(&mut self) {
+        self.tokens.clear();
+        self.usernames.clear();
+        self.mirrors.clear();
+        self.clearances.clear();
+        let active = self.account.clone();
+        let mut order: Vec<&Account> = self.accounts.iter().filter(|a| a.id == active).collect();
+        order.extend(self.accounts.iter().filter(|a| a.id != active));
+        for a in order {
+            let key = a.casino.key().to_string();
+            if self.tokens.contains_key(&key) || self.usernames.contains_key(&key) {
+                continue;
+            }
+            self.tokens.insert(key.clone(), a.token.clone());
+            if let Some(u) = &a.username {
+                self.usernames.insert(key.clone(), u.clone());
+            }
+            if let Some(m) = &a.mirror {
+                self.mirrors.insert(key.clone(), m.clone());
+            }
+            if let Some(c) = &a.clearance {
+                self.clearances.insert(key, c.clone());
+            }
+        }
+    }
+
+    fn load_file() -> Self {
+        let Some(path) = Self::path() else { return Self::default() };
+        let text = match Self::read(&path) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Self::default(),
+            Err(e) => {
+                tracing::warn!("settings can't be read ({e}); running on defaults without saving, so they aren't overwritten");
+                return Self { unreadable: true, ..Self::default() };
+            }
+        };
+        match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                // a casino from a newer FastBet: start on the first one, keep everything else
+                if let Some(s) = Self::without_unknown_casino(&text) {
+                    tracing::warn!("settings name a casino this build doesn't know; starting on {}", s.casino.name());
+                    return s;
+                }
+                // the next save would overwrite every saved login with the defaults: keep a copy
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let backup = path.with_file_name(format!("settings.unreadable-{secs}.json"));
+                let _ = std::fs::copy(&path, &backup);
+                tracing::warn!("settings unreadable ({e}), using defaults; the old file is kept as {}", backup.display());
+                Self::default()
+            }
+        }
+    }
+
+    /// The settings with an unknown `casino` replaced by the default one.
+    fn without_unknown_casino(text: &str) -> Option<Self> {
+        let mut v: serde_json::Value = serde_json::from_str(text).ok()?;
+        let casino = v.get("casino")?.as_str()?;
+        if serde_json::from_value::<CasinoId>(serde_json::Value::String(casino.to_string())).is_ok() {
+            return None;
+        }
+        v["casino"] = serde_json::to_value(Self::default().casino).ok()?;
+        serde_json::from_value(v).ok()
+    }
+
+    /// The file's text; `None` when there is no file. A file another program has open is read again
+    /// a few times before giving up.
+    fn read(path: &std::path::Path) -> std::io::Result<Option<String>> {
+        let mut tries = 0;
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(t) => return Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) if tries >= 5 => return Err(e),
+                Err(_) => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+            }
+        }
+    }
+
+    pub fn save(&mut self) {
         let Some(path) = Self::path() else { return };
+        if self.unreadable {
+            tracing::warn!("not saving settings: the file couldn't be read at start");
+            return;
+        }
+        // logins in the file that this copy doesn't hold (another FastBet added them, or this one
+        // started without them) stay: only an account removed here may go
+        if let Ok(Some(text)) = Self::read(&path) {
+            if let Ok(mut disk) = serde_json::from_str::<Settings>(&text) {
+                disk.migrate();
+                for a in disk.accounts {
+                    if !self.removed.contains(&a.id) && !self.accounts.iter().any(|x| x.id == a.id) {
+                        tracing::info!("keeping the {} account {} found in the settings file", a.casino.name(), a.id);
+                        self.accounts.push(a);
+                    }
+                }
+            }
+        }
+        self.sync_legacy();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
-                    tracing::warn!("could not save settings: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("could not serialise settings: {e}"),
+        let text = match serde_json::to_string_pretty(self) {
+            Ok(t) => t,
+            Err(e) => return tracing::warn!("could not serialise settings: {e}"),
+        };
+        // written aside and swapped in, so the file is never half-written
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+            tracing::warn!("could not save settings: {e}");
         }
     }
 
+    /// The account in use.
+    pub fn active(&self) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.id == self.account)
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut Account> {
+        let id = self.account.clone();
+        self.accounts.iter_mut().find(|a| a.id == id)
+    }
+
     pub fn token(&self) -> Option<String> {
-        self.tokens.get(self.casino.key()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        self.active().and_then(Account::token)
     }
 
+    /// The account in use's token, to replace (an account is made for the casino if there is none).
     pub fn token_mut(&mut self) -> &mut String {
-        self.tokens.entry(self.casino.key().to_string()).or_default()
+        if self.active().is_none() {
+            let a = Account::new(self.casino);
+            self.account = a.id.clone();
+            self.accounts.push(a);
+        }
+        &mut self.active_mut().expect("just made").token
     }
 
-    /// Domain to reach the current casino on, for casinos with mirrors.
+    /// Domain to reach the account's casino on, for casinos with mirrors.
     pub fn mirror(&self) -> Option<String> {
         let default = self.casino.default_mirror()?;
-        let saved = self.mirrors.get(self.casino.key()).map(|m| crate::casino::stake::normalize_mirror(m)).filter(|m| !m.is_empty());
+        let saved = self.active().and_then(|a| a.mirror.as_deref()).map(crate::casino::stake::normalize_mirror).filter(|m| !m.is_empty());
         Some(saved.unwrap_or_else(|| default.to_string()))
     }
 
-    /// Saved Cloudflare cookie for the current casino.
+    /// Saved Cloudflare cookie for the account in use.
     pub fn clearance(&self) -> Option<Clearance> {
-        self.clearances.get(self.casino.key()).filter(|c| c.is_complete()).cloned()
+        self.active().and_then(|a| a.clearance.clone()).filter(Clearance::is_complete)
     }
 
     /// Everything the current casino connects with.
@@ -325,5 +518,75 @@ impl Settings {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_casino_keeps_the_logins() {
+        let text = r#"{"casino":"SomeNewCasino","tokens":{"shuffle":"t1","stake":"t2"},"target":"10"}"#;
+        assert!(serde_json::from_str::<Settings>(text).is_err());
+        let s = Settings::without_unknown_casino(text).expect("readable without the casino");
+        assert_eq!(s.casino, Settings::default().casino);
+        assert_eq!(s.tokens.get("shuffle").map(String::as_str), Some("t1"));
+        assert_eq!(s.target, "10");
+        // a known casino isn't this fallback's business
+        assert!(Settings::without_unknown_casino(r#"{"casino":"Shuffle"}"#).is_none());
+    }
+
+    #[test]
+    fn one_login_per_casino_becomes_accounts() {
+        let old = r#"{"casino":"Shuffle","tokens":{"chipsgg":"c1","shuffle":"s1","stake":""},"usernames":{"shuffle":"sx","stake":"st"},"mirrors":{"stake":"stake.bet"}}"#;
+        let mut s: Settings = serde_json::from_str(old).unwrap();
+        s.migrate();
+        let ids: Vec<&str> = s.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["chipsgg", "stake", "shuffle"]);
+        assert_eq!(s.account, "shuffle");
+        assert_eq!(s.token().as_deref(), Some("s1"));
+        assert_eq!(s.accounts[1].mirror.as_deref(), Some("stake.bet"));
+
+        // a second Shuffle login, in use: older FastBets see it as the Shuffle login
+        let mut second = Account::new(CasinoId::Shuffle);
+        second.token = "s2".into();
+        s.account = second.id.clone();
+        s.accounts.push(second);
+        s.sync_legacy();
+        assert_eq!(s.tokens.get("shuffle").map(String::as_str), Some("s2"));
+        assert_eq!(s.tokens.get("chipsgg").map(String::as_str), Some("c1"));
+        // migrating again changes nothing
+        let n = s.accounts.len();
+        s.migrate();
+        assert_eq!(s.accounts.len(), n);
+    }
+
+    #[test]
+    fn a_save_never_drops_logins_it_did_not_remove() {
+        let dir = std::env::temp_dir().join(format!("fastbet-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{"casino":"Stake","tokens":{"stake":"t1","shuffle":"t2"}}"#).unwrap();
+        // SAFETY: the only test touching this variable
+        unsafe { std::env::set_var("FASTBET_SETTINGS", &file) };
+        // a FastBet that started without the file, then logged in to Goated
+        let mut fresh = Settings::default();
+        fresh.casino = CasinoId::Goated;
+        *fresh.token_mut() = "g1".into();
+        fresh.save();
+        let saved = Settings::load();
+        let mut tokens: Vec<(&str, &str)> = saved.accounts.iter().map(|a| (a.casino.key(), a.token.as_str())).collect();
+        tokens.sort();
+        assert_eq!(tokens, [("goated", "g1"), ("shuffle", "t2"), ("stake", "t1")]);
+        // a removed account does go
+        let mut s = saved;
+        let id = s.accounts.iter().find(|a| a.casino == CasinoId::Shuffle).unwrap().id.clone();
+        s.accounts.retain(|a| a.id != id);
+        s.removed.push(id);
+        s.save();
+        assert!(Settings::load().accounts.iter().all(|a| a.casino != CasinoId::Shuffle));
+        unsafe { std::env::remove_var("FASTBET_SETTINGS") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
