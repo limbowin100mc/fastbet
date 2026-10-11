@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::cloudflare::Clearance;
 use crate::money::Units;
+use crate::originals::{Game, Round, Step, Tables};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CasinoId {
@@ -61,13 +62,40 @@ impl CasinoId {
         matches!(self, CasinoId::Stake)
     }
 
+    /// Takes bets of 0: they play a real round that pays nothing (Stake).
+    pub fn zero_bets(self) -> bool {
+        matches!(self, CasinoId::Stake)
+    }
+
     /// Whether the account can also be linked through the embedded login window.
     pub fn window_login(self) -> bool {
         matches!(self, CasinoId::ChipsGg)
     }
 
+    /// Slot producers the app can autoplay here, in lobby order. Empty: no slots.
+    pub fn slot_producers(self) -> &'static [&'static str] {
+        match self {
+            CasinoId::ChipsGg => &["hacksawgaming", "avatarux", "bgaming"],
+            CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
+        }
+    }
+
     pub fn has_slots(self) -> bool {
-        matches!(self, CasinoId::ChipsGg)
+        !self.slot_producers().is_empty()
+    }
+
+    /// Originals besides Limbo the app can play here, in lobby order.
+    pub fn originals(self) -> Vec<Game> {
+        match self {
+            CasinoId::ChipsGg => vec![],
+            CasinoId::Stake => Game::all().collect(),
+        }
+    }
+
+    /// The slot catalog lists only games the app can play (Stake: Stake Engine games),
+    /// so the lobby has no tested / untested split.
+    pub fn slots_curated(self) -> bool {
+        matches!(self, CasinoId::Stake)
     }
 
     /// What the casino calls the credential the user pastes.
@@ -191,7 +219,7 @@ impl CasinoId {
     pub fn token_hint(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "On chips.gg open Settings → API Keys → Create API Key, copy the key (it is shown only once) and paste it here.",
-            CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. It is stored on this PC only.",
+            CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
         }
     }
 
@@ -338,6 +366,9 @@ pub enum CasinoError {
     ConnectionLost,
     #[error("Bad reply: {0}")]
     BadReply(String),
+    /// An original's round is still open on the account; finish it before starting another.
+    #[error("You still have a round of this game open")]
+    RoundOpen,
 }
 
 impl CasinoError {
@@ -383,6 +414,29 @@ pub trait Casino: Send + Sync {
     async fn list_slots(&self, filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError>;
     /// Launch URL for a slot session (real money needs a logged-in token).
     async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError>;
+
+    /// Starts a round of an original ([`CasinoId::originals`]). `params` are the game's own
+    /// fields; the stake, currency and an idempotency key are added here. `auto`: a bet of an
+    /// auto run, which some games place through their own request.
+    async fn original_bet(&self, _game: Game, _currency: &str, _amount: Units, _params: Value, _auto: bool) -> Result<Round, CasinoError> {
+        Err(CasinoError::Server("This casino has no such game".into()))
+    }
+    /// Continues the open round of `game` (reveal, guess …) or cashes it out.
+    async fn original_step(&self, _game: Game, _step: Step, _params: Value) -> Result<Round, CasinoError> {
+        Err(CasinoError::Server("This casino has no such game".into()))
+    }
+    /// The round of `game` still open on the account, if any.
+    async fn original_active(&self, _game: Game) -> Result<Option<Round>, CasinoError> {
+        Ok(None)
+    }
+    /// Payout tables of the originals that have them.
+    async fn original_tables(&self) -> Result<Tables, CasinoError> {
+        Err(CasinoError::Server("This casino has no payout tables".into()))
+    }
+    /// The originals as the casino lists them (name and artwork), keyed by slug.
+    async fn list_originals(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        Ok(vec![])
+    }
 }
 
 /// Spawns the casino's connection tasks on the current tokio runtime.

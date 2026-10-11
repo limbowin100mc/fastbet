@@ -107,8 +107,8 @@ impl Engine {
             return self.slot_fail(format!("{} games are not supported yet", game.producer));
         };
         let result: Result<Arc<dyn SlotSession>, String> = async {
-            // the casino's launcher → final game URL, for everything except Hacksaw demo
-            let launched = |demo: bool| {
+            // the casino's launch URL, for everything except Hacksaw demo
+            let launch_url = |demo: bool| {
                 let game = game.clone();
                 let currency = currency.clone();
                 async move {
@@ -121,7 +121,7 @@ impl Engine {
                             None => Err("Not connected".to_string()),
                         };
                         match res {
-                            Ok(url) => return resolve_launcher(&url).await,
+                            Ok(url) => return Ok(url),
                             Err(e) if e.contains("Not connected") && attempt < 11 => {
                                 last = e;
                                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -131,6 +131,11 @@ impl Engine {
                     }
                     Err(last)
                 }
+            };
+            // … followed through the launcher's redirects to the final game URL
+            let launched = |demo: bool| {
+                let url = launch_url(demo);
+                async move { resolve_launcher(&url.await?).await }
             };
             match provider {
                 Provider::Hacksaw => {
@@ -156,6 +161,13 @@ impl Engine {
                     let final_url = launched(mode == PlayMode::Demo).await?;
                     let l = crate::slots::bgaming::Launch::from_url(&final_url).ok_or_else(|| format!("Could not read the launch parameters from {final_url}"))?;
                     let s = crate::slots::bgaming::BgamingSession::open(l).await.map_err(|e| e.to_string())?;
+                    Ok(Arc::new(s) as Arc<dyn SlotSession>)
+                }
+                Provider::StakeEngine => {
+                    // the game URL itself carries the RGS session; the game client is never loaded
+                    let url = launch_url(mode == PlayMode::Demo).await?;
+                    let l = crate::slots::stake_engine::Launch::from_url(&url).ok_or("Stake didn't return a game session")?;
+                    let s = crate::slots::stake_engine::StakeEngineSession::open(l).await.map_err(|e| e.to_string())?;
                     Ok(Arc::new(s) as Arc<dyn SlotSession>)
                 }
             }

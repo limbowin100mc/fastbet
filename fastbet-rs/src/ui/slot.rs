@@ -11,7 +11,7 @@ use super::widgets::{self, button, caption, check_field, field, icon, section, t
 use super::App;
 use crate::engine::slots::SpinRecord;
 use crate::money::{self, fmt_int, fmt_multi, fmt_time};
-use crate::slots::{fmt_money, PlayMode, Provider};
+use crate::slots::{fmt_money, PlayMode};
 
 const SETTINGS_W: f32 = 300.0;
 const ROW_H: f32 = 23.0;
@@ -57,7 +57,7 @@ fn header(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         let name = app.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Slot".into());
-        let producer = app.slot.game.as_ref().map(|g| Provider::display_producer(&g.producer).to_string()).unwrap_or_default();
+        let producer = app.slot.game.as_ref().map(|g| g.maker().to_string()).unwrap_or_default();
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(widgets::semi(producer, 10.0, MUTED));

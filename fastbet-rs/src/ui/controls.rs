@@ -23,6 +23,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 strategy(app, ui, w);
                 bets_and_speed(app, ui, w);
                 stops(app, ui, w);
+                force_restart(app, ui, w);
             }
             seed(app, ui, w);
             notifications(app, ui, w);
@@ -33,9 +34,23 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 fn general(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let cur = app.active_currency();
-    let cur_up = cur.to_uppercase();
     let mut open = app.settings.open.general;
     section(ui, w, "General", true, &mut open, |ui| {
+        bet_size(app, ui);
+        target(app, ui, &cur, locked);
+    });
+    if open != app.settings.open.general {
+        app.settings.open.general = open;
+        app.mark_dirty();
+    }
+}
+
+/// Bet size with ½ / 2× and the coin / USD unit switch, shared by every game page.
+pub(super) fn bet_size(app: &mut App, ui: &mut Ui) {
+    let locked = app.auto.running;
+    let cur = app.active_currency();
+    let cur_up = cur.to_uppercase();
+    {
         // bet size
         ui.horizontal(|ui| {
             caption(ui, "Bet size");
@@ -79,7 +94,11 @@ fn general(app: &mut App, ui: &mut Ui, w: f32) {
                 });
             });
         });
-        // target
+    }
+}
+
+fn target(app: &mut App, ui: &mut Ui, cur: &str, locked: bool) {
+    {
         ui.horizontal(|ui| {
             caption(ui, "Target");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -87,8 +106,8 @@ fn general(app: &mut App, ui: &mut Ui, w: f32) {
                 let txt = match app.target() {
                     Some(t) => {
                         let mut s = format!("{:.*}% win", if t > 9900.0 { 4 } else { 2 }, id.win_chance(t));
-                        if let Some(b) = app.to_base(&app.settings.amount, &cur) {
-                            s += &format!("  ·  +{}", app.prim(mul_f(b, t) - b, &cur, false));
+                        if let Some(b) = app.to_base(&app.settings.amount, cur) {
+                            s += &format!("  ·  +{}", app.prim(mul_f(b, t) - b, cur, false));
                         }
                         s
                     }
@@ -114,14 +133,10 @@ fn general(app: &mut App, ui: &mut Ui, w: f32) {
                 }
             }
         });
-    });
-    if open != app.settings.open.general {
-        app.settings.open.general = open;
-        app.mark_dirty();
     }
 }
 
-fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
+pub(super) fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let active = app.settings.on_win != Adjust::Reset || app.settings.on_loss != Adjust::Reset;
     let mut open = app.settings.open.strategy;
@@ -164,7 +179,7 @@ fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
     }
 }
 
-fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
+pub(super) fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let cnt: u32 = app.settings.count.trim().parse().unwrap_or(0);
     let dl = money::num(&app.settings.delay).unwrap_or(0.0);
@@ -206,7 +221,7 @@ fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
     }
 }
 
-fn stops(app: &mut App, ui: &mut Ui, w: f32) {
+pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let s = &app.settings;
     let active = [&s.stop_profit, &s.stop_loss, &s.max_bet].iter().any(|v| !v.trim().is_empty()) || s.stop_on_hit;
@@ -235,7 +250,12 @@ fn stops(app: &mut App, ui: &mut Ui, w: f32) {
             app.mark_dirty();
         }
         widgets::hsep(ui);
-        let hint = app.target().map(|t| format!("empty = target ({})", fmt_multi(t))).unwrap_or("empty = target".into());
+        // on Limbo an empty hit line means the target; the other games have none
+        let hint = if app.screen == super::Screen::Limbo {
+            app.target().map(|t| format!("empty = target ({})", fmt_multi(t))).unwrap_or("empty = target".into())
+        } else {
+            "Stops the run on a round paying at least this many × the stake".into()
+        };
         let mut on = app.settings.stop_on_hit;
         if check_field(ui, "Stop on hit  ≥", &mut on, &mut app.settings.hit_multi, Some("×"), !locked) {
             app.settings.stop_on_hit = on;
@@ -249,7 +269,43 @@ fn stops(app: &mut App, ui: &mut Ui, w: f32) {
     }
 }
 
-fn seed(app: &mut App, ui: &mut Ui, w: f32) {
+/// Force restart betting: a run that ends by itself starts again at once. Not locked while
+/// running, so it can be switched on or off mid-run.
+pub(super) fn force_restart(app: &mut App, ui: &mut Ui, w: f32) {
+    let mut open = app.settings.open.restart;
+    let active = app.settings.force_restart || app.settings.restart_on_error;
+    section(ui, w, "Force restart betting", active, &mut open, |ui| {
+        let (mut always, mut on_error) = (app.settings.force_restart, app.settings.restart_on_error);
+        if toggle(ui, "Force restart betting always", &mut always, true) {
+            app.set_force_restart(always, on_error);
+        }
+        hint(
+            ui,
+            "When the run ends by itself (stop profit or loss, a hit, the number of bets, max bet, an error), it starts again \
+             at once from the base bet, with its counters back at zero.",
+        );
+        widgets::hsep(ui);
+        if toggle(ui, "Force restart on errors", &mut on_error, true) {
+            app.set_force_restart(always, on_error);
+        }
+        hint(
+            ui,
+            "An error doesn't stop the run: it bets again at once, with the same bet size and counters. When errors keep \
+             coming, it waits 1, 2, 4, then 8 s between tries.",
+        );
+        hint(ui, "Stop and Stop on next win always end the run.");
+        let a = &app.auto;
+        if a.running && (a.restarts > 0 || a.errors > 0) {
+            hint_line(ui, &format!("Restarted {}×  ·  errors {}×  ·  {}", a.restarts, a.errors, a.msg));
+        }
+    });
+    if open != app.settings.open.restart {
+        app.settings.open.restart = open;
+        app.mark_dirty();
+    }
+}
+
+pub(super) fn seed(app: &mut App, ui: &mut Ui, w: f32) {
     let every = app.settings.seed_every();
     let mut open = app.settings.open.seed;
     section(ui, w, "Auto seed changes", app.settings.seed_enabled, &mut open, |ui| {
@@ -297,6 +353,20 @@ fn kv(ui: &mut Ui, k: &str, v: String) {
     });
 }
 
+/// Header chips of a run force restart kept going: restarts and errors bet through, hover for the last why.
+pub(super) fn restarts_chip(app: &App, ui: &mut Ui) {
+    let a = &app.auto;
+    if !a.running {
+        return;
+    }
+    if a.restarts > 0 {
+        widgets::meta_chip(ui, "refresh", &format!("Restarted ×{}", a.restarts), theme::G2).on_hover_text(&a.msg);
+    }
+    if a.errors > 0 {
+        widgets::meta_chip(ui, "cross", &format!("Errors ×{}", a.errors), theme::GOLD).on_hover_text(&a.msg);
+    }
+}
+
 /// Muted helper text under a control.
 fn hint(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(DIM));
@@ -306,7 +376,7 @@ fn hint_line(ui: &mut Ui, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).size(11.0).color(MUTED)).truncate());
 }
 
-fn notifications(app: &mut App, ui: &mut Ui, w: f32) {
+pub(super) fn notifications(app: &mut App, ui: &mut Ui, w: f32) {
     let mut open = app.settings.open.keys;
     section(ui, w, "Sound & hotkeys", app.settings.hit_sound || app.settings.hotkeys, &mut open, |ui| {
         let mut snd = app.settings.hit_sound;

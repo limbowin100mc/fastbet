@@ -5,10 +5,14 @@
 //! away (stake.com answers them with its "blocked" page), so every call runs
 //! through the browser bridge parked on the chosen mirror, same-origin with
 //! the API. A fresh bridge clears the check by itself in about 15 s; if the
-//! check wants a click, the bridge window is shown for the user. When it never
-//! passes, the user can copy the `cf_clearance` cookie and User Agent from
-//! their own browser; the bridge then presents both on that mirror. A cookie
-//! Cloudflare refuses is reported, not turned into a check window: that window
+//! check wants a click, the bridge window is shown for the user.
+//!
+//! When it never passes, the user copies their own browser's User Agent and
+//! cookies for the mirror (see [`crate::cloudflare`]). The app then talks to
+//! Stake directly, as that browser: plain HTTPS with the same User Agent and
+//! cookies is let through (measured: `__cf_bm` plus its User Agent turns a 403
+//! into a 200). If Cloudflare refuses that, the bridge tries the same values.
+//! A refused cookie is reported, not turned into a check window: that window
 //! would claim to be the user's browser, and such a check doesn't pass.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,7 +26,8 @@ use tokio::sync::{mpsc, Notify};
 
 use super::*;
 use crate::bridge::{Bridge, BridgeCookie, BridgeRequest, BridgeSetup};
-use crate::cloudflare::{self, Clearance};
+use crate::originals::{Game, Resume, Round, Step, Tables};
+use crate::cloudflare::Clearance;
 use crate::money::{f64_from_json, parse_units, to_f64};
 
 /// Stake sends every amount as a float with at most 8 decimals.
@@ -76,6 +81,34 @@ const LIMBO: &str = "mutation FastbetLimbo($amount: Float!, $multiplierTarget: F
 const ROTATE: &str = "mutation FastbetRotateSeed($seed: String!) { rotateSeedPair(seed: $seed) { clientSeed { user { id \
     activeClientSeed { id seed } activeServerSeed { id nonce seedHash nextSeedHash } } } } }";
 
+// Slots: Stake Engine games only. They sit in one kurator group; a session is a game URL
+// carrying the RGS session (see `slots::stake_engine`).
+const ENGINE_GROUP: &str = "stake-engine";
+const SLOTS_LIST: &str = "query FastbetEngineGames($slug: String!, $limit: Int!, $offset: Int!) { slugKuratorGroup(slug: $slug) { id \
+    groupGamesList(limit: $limit, offset: $offset, sort: popular7d) { game { id name slug thumbnailUrl edge isDemoEnabled \
+    providerGroup { name translation } } } } }";
+const SLOTS_SEARCH: &str = "query FastbetEngineSearch($query: String!, $groupIds: [String!], $limit: Int, $offset: Int) { \
+    kuratorGameQuery(query: $query, groupIds: $groupIds, limit: $limit, offset: $offset) { id name slug thumbnailUrl edge \
+    isDemoEnabled providerGroup { name translation } groupGames { group { slug } } } }";
+const ENGINE_GROUP_ID: &str = "query FastbetEngineGroup($slug: String!) { slugKuratorGroup(slug: $slug) { id } }";
+const START_SLOT: &str = "mutation FastbetStartSlot($slug: String!, $source: CurrencyEnum!, $target: CurrencyEnum!) { \
+    startThirdPartySession(slug: $slug, source: $source, target: $target) { config } }";
+const START_DEMO: &str = "mutation FastbetStartDemo($slug: String!) { startThirdPartyDemoSession(slug: $slug) { config } }";
+/// Stake Engine games run in fiat; Stake converts the bets from the coin the session is started with.
+const SLOT_FIAT: &str = "usd";
+/// Thumbnail size for the lobby tiles (2x the tile), as JPEG for the image decoder.
+const THUMB: &str = "w=264&h=346&fit=min&fm=jpg&q=85";
+
+// Originals: the site posts them to `/_api/casino/<game>/<action>` (REST twins of the GraphQL
+// mutations, same bodies); Flip only exists as GraphQL.
+const ORIGINALS_GROUP: &str = "stake-originals";
+const ORIGINALS_LIST: &str = "query FastbetOriginals($slug: String!) { slugKuratorGroup(slug: $slug) { \
+    groupGamesList(limit: 50, offset: 0) { game { id name slug thumbnailUrl edge isDemoEnabled providerGroup { name translation } } } } }";
+const TABLES: &str = "query FastbetTables { info { kenoPayouts { payouts risk } wheelPayouts { payouts risk rows } \
+    plinkoPayouts { payouts rows risk } } }";
+const FLIP_FIELDS: &str = "id active currency amountMultiplier payoutMultiplier amount payout \
+    state { ... on CasinoGameFlip { currentRound payoutMultiplier playedRounds flips } }";
+
 const INVALID_TOKEN: &str = "Invalid API token";
 
 /// Mirror as typed or saved -> bare host ("https://Stake.bet/" -> "stake.bet").
@@ -103,11 +136,34 @@ impl From<CallError> for CasinoError {
     }
 }
 
-/// The bridge in use, with the origin it is parked on.
+/// How calls reach Stake.
+#[derive(Clone)]
+enum Transport {
+    /// The hidden browser window, parked on the mirror.
+    Bridge(Bridge),
+    /// Plain HTTPS carrying the User Agent and cookies of the user's own browser.
+    Direct(reqwest::Client),
+}
+
+impl Transport {
+    fn close(&self) {
+        if let Transport::Bridge(b) = self {
+            b.close();
+        }
+    }
+
+    fn show(&self, on: bool) {
+        if let Transport::Bridge(b) = self {
+            b.show(on);
+        }
+    }
+}
+
+/// The way in use, with the origin it reaches.
 #[derive(Clone)]
 struct Link {
     gen: u64,
-    bridge: Bridge,
+    transport: Transport,
     origin: String,
 }
 
@@ -132,6 +188,10 @@ pub struct Stake {
     /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
     inflight: AtomicUsize,
     settled: AtomicU64,
+    /// Id of the Stake Engine game group, for searching inside it.
+    engine_group: Mutex<Option<String>>,
+    /// Open rounds of originals and what they have staked so far (already taken off the wallet).
+    open_rounds: Mutex<std::collections::HashMap<String, Units>>,
 }
 
 impl Stake {
@@ -154,6 +214,8 @@ impl Stake {
             published: Mutex::new(Market::default()),
             inflight: AtomicUsize::new(0),
             settled: AtomicU64::new(0),
+            engine_group: Mutex::new(None),
+            open_rounds: Mutex::new(Default::default()),
         });
         tokio::spawn(me.clone().run());
         me
@@ -211,16 +273,26 @@ impl Stake {
         self.status(ConnStatus::Connecting, format!("Opening {mirror}"));
         let origin = format!("https://{mirror}");
         let page = format!("{origin}/robots.txt");
-        let manual = self.clearance_for(mirror);
+        // a paste with only the login leaves Cloudflare to the app's own check
+        let manual = self.clearance_for(mirror).filter(Clearance::has_cloudflare);
+        // the user's browser first: straight to Stake with its User Agent and cookies
+        if let Some(c) = &manual {
+            self.status(ConnStatus::Connecting, format!("Opening {mirror} as your browser"));
+            match self.connect_direct(mirror, c).await {
+                Ok(()) => return Ok(()),
+                Err(Some(e)) => return Err(e),
+                Err(None) => self.status(ConnStatus::Connecting, "Cloudflare didn't take the cookies directly, trying them in the app's browser…"),
+            }
+        }
         let bridge = match &manual {
             Some(c) => {
-                let cookie = BridgeCookie { name: cloudflare::COOKIE.into(), value: c.cookie.clone(), domain: format!(".{mirror}") };
-                let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies: vec![cookie] };
+                let cookies = c.cookies().into_iter().map(|(name, value)| BridgeCookie { name, value, domain: format!(".{mirror}") }).collect();
+                let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies };
                 Bridge::open_with(&page, Some(PROFILE_MANUAL), &setup).await?
             }
             None => Bridge::open_profile(&page, Some(PROFILE)).await?,
         };
-        let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, bridge, origin };
+        let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, transport: Transport::Bridge(bridge), origin };
         self.broken_flag.store(false, Ordering::SeqCst);
         *self.link.lock() = Some(link.clone());
 
@@ -233,7 +305,7 @@ impl Stake {
             match self.post(&link, RATES, json!({}), false, Duration::from_secs(8)).await {
                 Ok(data) => {
                     if shown {
-                        link.bridge.show(false);
+                        link.transport.show(false);
                     }
                     self.apply_rates(&data);
                     return Ok(());
@@ -241,23 +313,23 @@ impl Stake {
                 Err(CallError::Cloudflare) => {
                     if manual.is_some() && t0.elapsed() > SHOW_CHECK_AFTER {
                         return Err(format!(
-                            "Cloudflare didn't accept your cookie on {mirror}. Copy a fresh cookie and the User Agent from the same browser \
-                             on this computer, or remove the cookie."
+                            "Cloudflare didn't accept your browser's cookies on {mirror}. Open {mirror} in that browser, then copy its cookies \
+                             and User Agent again (they expire, and only work from this computer's IP), or remove them."
                         ));
                     }
                     if t0.elapsed() > CHECK_TIMEOUT {
                         return Err(format!(
-                            "Cloudflare didn't let us through on {mirror}. Try another mirror, or set the Cloudflare cookie in Settings. \
+                            "Cloudflare didn't let us through on {mirror}. Try another mirror, or log in with your browser in Settings. \
                              On a server (VPS), Cloudflare may not trust its IP address at all."
                         ));
                     }
                     if manual.is_none() && !shown && t0.elapsed() > SHOW_CHECK_AFTER {
-                        link.bridge.show(true);
+                        link.transport.show(true);
                         shown = true;
                     }
                     let msg = match (shown, manual.is_some()) {
                         (true, _) => "Finish the Cloudflare check in the window that opened",
-                        (false, true) => "Cloudflare didn't take your cookie, passing the check…",
+                        (false, true) => "Cloudflare didn't take your cookies, passing the check…",
                         (false, false) => "Passing the Cloudflare check…",
                     };
                     self.status(ConnStatus::Connecting, msg);
@@ -314,7 +386,29 @@ impl Stake {
     fn drop_link(&self) {
         self.ready.store(false, Ordering::SeqCst);
         if let Some(link) = self.link.lock().take() {
-            link.bridge.close();
+            link.transport.close();
+        }
+    }
+
+    /// Connects without the bridge, as the user's browser. `Err(None)`: Cloudflare (or the
+    /// network) refused it, worth trying the bridge; `Err(Some(_))`: no point going on.
+    async fn connect_direct(&self, mirror: &str, c: &Clearance) -> Result<(), Option<String>> {
+        let client = direct_client(mirror, c).map_err(Some)?;
+        let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, transport: Transport::Direct(client), origin: format!("https://{mirror}") };
+        self.broken_flag.store(false, Ordering::SeqCst);
+        *self.link.lock() = Some(link.clone());
+        match self.post(&link, RATES, json!({}), false, Duration::from_secs(15)).await {
+            Ok(data) => {
+                tracing::info!("stake: connected directly with the browser's cookies");
+                self.apply_rates(&data);
+                Ok(())
+            }
+            Err(CallError::Blocked) => Err(Some(format!("{mirror} is blocked from your location. Pick another mirror."))),
+            Err(e) => {
+                tracing::info!("stake: direct connection refused: {}", CasinoError::from(e));
+                self.link.lock().take();
+                Err(None)
+            }
         }
     }
 
@@ -411,33 +505,105 @@ impl Stake {
     }
 
     async fn post(&self, link: &Link, query: &str, variables: Value, auth: bool, timeout: Duration) -> Result<Value, CallError> {
+        let body = json!({ "query": query, "variables": variables }).to_string();
+        let (status, text) = self.send(link, "/_api/graphql", body, auth, timeout).await?;
+        parse_reply(status, &text)
+    }
+
+    /// POSTs `body` to `path` on the mirror, through the bridge or directly.
+    async fn send(&self, link: &Link, path: &str, body: String, auth: bool, timeout: Duration) -> Result<(u16, String), CallError> {
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if auth {
             let token = self.token.lock().clone().ok_or(CallError::Casino(CasinoError::NotConnected))?;
             headers.push(("x-access-token".into(), token));
         }
-        let req = BridgeRequest {
-            method: "POST".into(),
-            url: format!("{}/_api/graphql", link.origin),
-            headers,
-            body: Some(json!({ "query": query, "variables": variables }).to_string()),
-        };
-        let res = link.bridge.request_within(req, timeout).await.map_err(|e| {
-            CallError::Casino(if e.contains("timeout") { CasinoError::Timeout } else { CasinoError::ConnectionLost })
-        })?;
-        parse_reply(res.status, &res.body)
+        let url = format!("{}{path}", link.origin);
+        match &link.transport {
+            Transport::Bridge(bridge) => {
+                let req = BridgeRequest { method: "POST".into(), url, headers, body: Some(body) };
+                let res = bridge.request_within(req, timeout).await.map_err(|e| {
+                    CallError::Casino(if e.contains("timeout") { CasinoError::Timeout } else { CasinoError::ConnectionLost })
+                })?;
+                Ok((res.status, res.body))
+            }
+            Transport::Direct(client) => {
+                let mut req = client.post(url).timeout(timeout).body(body);
+                for (k, v) in headers {
+                    req = req.header(k, v);
+                }
+                let lost = |e: reqwest::Error| CallError::Casino(if e.is_timeout() { CasinoError::Timeout } else { CasinoError::ConnectionLost });
+                let res = req.send().await.map_err(lost)?;
+                let status = res.status().as_u16();
+                Ok((status, res.text().await.map_err(lost)?))
+            }
+        }
     }
 
-    /// One API call over the current bridge. A dead or challenged bridge is flagged for the run loop.
-    async fn gql(&self, query: &str, variables: Value, auth: bool) -> Result<Value, CallError> {
+    /// One REST call of the originals API (`/_api/casino/<path>`), signed in.
+    async fn rest(&self, path: &str, body: Value) -> Result<Value, CallError> {
         let link = self.link.lock().clone().ok_or(CallError::Casino(CasinoError::NotConnected))?;
-        let res = self.post(&link, query, variables, auth, RPC_TIMEOUT).await;
+        let res = match self.send(&link, &format!("/_api/casino/{path}"), body.to_string(), true, RPC_TIMEOUT).await {
+            Ok((status, text)) => parse_rest(status, &text),
+            Err(e) => Err(e),
+        };
+        self.flag_broken(&link, &res);
+        res
+    }
+
+    /// A call found the bridge dead or challenged: the run loop rebuilds it.
+    fn flag_broken<T>(&self, link: &Link, res: &Result<T, CallError>) {
         let broken = matches!(res, Err(CallError::Cloudflare) | Err(CallError::Blocked) | Err(CallError::Casino(CasinoError::ConnectionLost)));
         if broken && link.gen == self.link_gen.load(Ordering::SeqCst) {
             self.ready.store(false, Ordering::SeqCst);
             self.broken_flag.store(true, Ordering::SeqCst);
             self.broken.notify_one();
         }
+    }
+
+    /// Books an original's reply into the local wallet: new stake comes off when the
+    /// casino takes it, the payout goes on when the round settles.
+    fn book(&self, r: &Round) {
+        let staked = r.stake();
+        let before = {
+            let mut open = self.open_rounds.lock();
+            let before = open.get(&r.id).copied().unwrap_or(0);
+            if r.active {
+                open.insert(r.id.clone(), staked);
+            } else {
+                open.remove(&r.id);
+            }
+            before
+        };
+        let mut delta = before - staked;
+        if !r.active {
+            delta += r.payout;
+            self.settled.fetch_add(1, Ordering::SeqCst);
+        }
+        self.credit(&r.currency, delta);
+    }
+
+    /// A round from an original's reply (`{"minesBet": {...}}` or the bet object itself).
+    fn round_of(game: Game, v: &Value) -> Result<Round, CasinoError> {
+        let bet = if v.get("id").is_some() { Some(v) } else { v.as_object().and_then(|o| o.values().find(|x| x.is_object())) };
+        bet.and_then(|b| round_from(game, b)).ok_or_else(|| CasinoError::BadReply(v.to_string().chars().take(200).collect()))
+    }
+
+    /// One API call over the current bridge. A dead or challenged bridge is flagged for the run loop.
+    /// The Stake Engine group's id, looked up once.
+    async fn engine_group_id(&self) -> Result<String, CasinoError> {
+        if let Some(id) = self.engine_group.lock().clone() {
+            return Ok(id);
+        }
+        let data = self.gql(ENGINE_GROUP_ID, json!({ "slug": ENGINE_GROUP }), false).await?;
+        let id = data.pointer("/slugKuratorGroup/id").and_then(Value::as_str).ok_or_else(|| CasinoError::BadReply(data.to_string()))?.to_string();
+        *self.engine_group.lock() = Some(id.clone());
+        Ok(id)
+    }
+
+    async fn gql(&self, query: &str, variables: Value, auth: bool) -> Result<Value, CallError> {
+        let link = self.link.lock().clone().ok_or(CallError::Casino(CasinoError::NotConnected))?;
+        let res = self.post(&link, query, variables, auth, RPC_TIMEOUT).await;
+        self.flag_broken(&link, &res);
         res
     }
 }
@@ -490,14 +656,7 @@ impl Casino for Stake {
         if !self.ready.load(Ordering::SeqCst) {
             return Err(CasinoError::NotConnected);
         }
-        struct InFlight<'a>(&'a AtomicUsize);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        self.inflight.fetch_add(1, Ordering::SeqCst);
-        let _inflight = InFlight(&self.inflight);
+        let _inflight = InFlight::new(&self.inflight);
 
         let vars = json!({
             "amount": to_f64(req.amount, DECIMALS),
@@ -515,11 +674,13 @@ impl Casino for Stake {
             self.credit(&cur, p - a);
         }
         self.settled.fetch_add(1, Ordering::SeqCst);
+        // a bet of 0 pays 0 either way: the result against the target decides it
+        let win = if req.amount == 0 { Some(outcome >= req.target) } else { bet.get("payoutMultiplier").and_then(f64_from_json).map(|m| m > 0.0) };
         Ok(BetReply {
             outcome,
             amount,
             winnings: payout,
-            win: bet.get("payoutMultiplier").and_then(f64_from_json).map(|m| m > 0.0),
+            win,
             nonce: bet.get("nonce").and_then(Value::as_u64),
         })
     }
@@ -543,19 +704,247 @@ impl Casino for Stake {
         Ok(provable_from(user))
     }
 
-    async fn list_slots(&self, _filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
-        Err(CasinoError::Server("Slots aren't available on Stake yet".into()))
+    async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: Value, auto: bool) -> Result<Round, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let _inflight = InFlight::new(&self.inflight);
+        let stake = to_f64(amount, DECIMALS);
+        let mut body = match game {
+            // the stake goes on the picked sides, or as chips on the table: no top-level amount
+            Game::Baccarat => baccarat_body(&params, stake),
+            Game::Roulette => roulette_body(&params, stake),
+            _ => {
+                let mut b = if params.is_object() { params } else { json!({}) };
+                b["amount"] = json!(stake);
+                b
+            }
+        };
+        body["currency"] = json!(currency.to_ascii_lowercase());
+        body["identifier"] = json!(identifier());
+        let reply = if game == Game::Flip {
+            let q = format!(
+                "mutation FastbetFlip($amount: Float!, $currency: CurrencyEnum!, $identifier: String, $guesses: [FlipConditionEnum!]!) {{ \
+                 flipBet(amount: $amount, currency: $currency, identifier: $identifier, guesses: $guesses) {{ {FLIP_FIELDS} }} }}"
+            );
+            self.gql(&q, body, true).await?
+        } else {
+            self.rest(game.bet_path(auto), body).await?
+        };
+        let round = Self::round_of(game, &reply)?;
+        self.book(&round);
+        Ok(round)
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str) -> Result<String, CasinoError> {
-        Err(CasinoError::Server("Slots aren't available on Stake yet".into()))
+    async fn original_step(&self, game: Game, step: Step, params: Value) -> Result<Round, CasinoError> {
+        let _inflight = InFlight::new(&self.inflight);
+        let mut body = if params.is_object() { params } else { json!({}) };
+        let reply = if game == Game::Flip {
+            let q = match step {
+                Step::Next => format!("mutation FastbetFlipNext($condition: FlipConditionEnum!) {{ flipNext(condition: $condition) {{ {FLIP_FIELDS} }} }}"),
+                Step::Cashout => {
+                    body = json!({ "identifier": identifier() });
+                    format!("mutation FastbetFlipCashout($identifier: String!) {{ flipCashout(identifier: $identifier) {{ {FLIP_FIELDS} }} }}")
+                }
+            };
+            self.gql(&q, body, true).await?
+        } else {
+            let path = game.step_path(step).ok_or_else(|| CasinoError::Server(format!("{} has no cash out", game.name())))?;
+            if step == Step::Cashout || game.next_takes_identifier() {
+                body["identifier"] = json!(identifier());
+            }
+            self.rest(path, body).await?
+        };
+        let round = Self::round_of(game, &reply)?;
+        self.book(&round);
+        Ok(round)
     }
+
+    async fn original_active(&self, game: Game) -> Result<Option<Round>, CasinoError> {
+        let reply = match game.resume() {
+            Resume::Graphql => {
+                let q = format!("query FastbetFlipOpen {{ user {{ activeCasinoBet(game: flip) {{ {FLIP_FIELDS} }} }} }}");
+                self.gql(&q, json!({}), true).await?
+            }
+            Resume::ActiveBet => self.rest(&format!("active-bet/{}", game.key()), json!({})).await?,
+            // `{"chickenGetState": <bet or null>}`, the same shape as active-bet's
+            Resume::GetState(action) => {
+                let v = self.rest(&format!("{}/{action}", game.slug()), json!({})).await?;
+                let bet = v.as_object().and_then(|o| o.values().next().cloned()).unwrap_or(Value::Null);
+                json!({ "user": { "activeCasinoBet": bet } })
+            }
+        };
+        let Some(bet) = reply.pointer("/user/activeCasinoBet").filter(|b| b.is_object()) else { return Ok(None) };
+        let round = round_from(game, bet).ok_or_else(|| CasinoError::BadReply(bet.to_string()))?;
+        // its stake left the wallet before we saw it, so only remember it for the settle
+        if round.active {
+            self.open_rounds.lock().insert(round.id.clone(), round.stake());
+        }
+        Ok(Some(round))
+    }
+
+    async fn original_tables(&self) -> Result<Tables, CasinoError> {
+        let data = self.gql(TABLES, json!({}), false).await?;
+        let info = data.get("info").ok_or_else(|| CasinoError::BadReply(data.to_string()))?;
+        let mut t = Tables::default();
+        for k in info["kenoPayouts"].as_array().into_iter().flatten() {
+            let (Some(risk), Some(p)) = (k["risk"].as_str(), payouts(&k["payouts"])) else { continue };
+            t.keno.entry(risk.to_string()).or_default().push(p);
+        }
+        for (key, table) in [("wheelPayouts", &mut t.wheel), ("plinkoPayouts", &mut t.plinko)] {
+            for w in info[key].as_array().into_iter().flatten() {
+                let (Some(risk), Some(rows), Some(p)) = (w["risk"].as_str(), w["rows"].as_u64(), payouts(&w["payouts"])) else { continue };
+                table.entry(risk.to_string()).or_default().insert(rows.to_string(), p);
+            }
+        }
+        // keno lists come one per number of picks, in order
+        for lists in t.keno.values_mut() {
+            lists.sort_by_key(Vec::len);
+        }
+        Ok(t)
+    }
+
+    async fn list_originals(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        let data = self.gql(ORIGINALS_LIST, json!({ "slug": ORIGINALS_GROUP }), false).await?;
+        let list = data.pointer("/slugKuratorGroup/groupGamesList").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(list.iter().filter_map(|g| slot_game(&g["game"])).collect())
+    }
+
+    async fn list_slots(&self, filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        // Stake answers a bigger page with `numberLessEqual`
+        let limit = filter.limit.clamp(1, 50);
+        let auth = self.ready.load(Ordering::SeqCst);
+        let query = filter.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
+        let Some(query) = query else {
+            let vars = json!({ "slug": ENGINE_GROUP, "limit": limit, "offset": filter.skip });
+            let data = self.gql(SLOTS_LIST, vars, auth).await?;
+            let group = data.get("slugKuratorGroup").filter(|g| g.is_object()).ok_or_else(|| CasinoError::BadReply(data.to_string()))?;
+            if let Some(id) = group.get("id").and_then(Value::as_str) {
+                *self.engine_group.lock() = Some(id.to_string());
+            }
+            let list = group.get("groupGamesList").and_then(Value::as_array).cloned().unwrap_or_default();
+            return Ok(list.iter().filter_map(|g| slot_game(&g["game"])).collect());
+        };
+        let group = self.engine_group_id().await?;
+        let vars = json!({ "query": query, "groupIds": [group], "limit": limit, "offset": filter.skip });
+        let data = self.gql(SLOTS_SEARCH, vars, auth).await?;
+        let list = data.get("kuratorGameQuery").and_then(Value::as_array).cloned().unwrap_or_default();
+        // the group filter is the server's; keep only Stake Engine games either way
+        let in_group = |g: &&Value| {
+            g["groupGames"].as_array().is_none_or(|a| a.iter().any(|x| x.pointer("/group/slug").and_then(Value::as_str) == Some(ENGINE_GROUP)))
+        };
+        Ok(list.iter().filter(in_group).filter_map(slot_game).collect())
+    }
+
+    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError> {
+        let ready = self.ready.load(Ordering::SeqCst);
+        let (key, data) = if demo {
+            // demo sessions need no account; signed in, Stake ties them to it
+            ("startThirdPartyDemoSession", self.gql(START_DEMO, json!({ "slug": catalog_id }), ready).await?)
+        } else {
+            if !ready {
+                return Err(CasinoError::NotConnected);
+            }
+            let source = currency.trim().to_ascii_lowercase();
+            if source.is_empty() {
+                return Err(CasinoError::Server("Pick a currency first".into()));
+            }
+            let vars = json!({ "slug": catalog_id, "source": source, "target": SLOT_FIAT });
+            ("startThirdPartySession", self.gql(START_SLOT, vars, true).await?)
+        };
+        data.get(key)
+            .and_then(|s| s.get("config"))
+            .and_then(Value::as_str)
+            .filter(|u| u.starts_with("https://"))
+            .map(str::to_string)
+            .ok_or_else(|| CasinoError::BadReply(data.to_string()))
+    }
+}
+
+/// A Stake Engine game from a kurator listing.
+fn slot_game(g: &Value) -> Option<crate::slots::SlotGame> {
+    let slug = g.get("slug")?.as_str()?;
+    let name = g.get("name")?.as_str()?.trim();
+    let pg = &g["providerGroup"];
+    // `translation` is sometimes an untranslated key ("game_kurator_group.ovryx_gaming")
+    let studio = [&pg["name"], &pg["translation"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty() && !s.contains("game_kurator_group"))
+        .map(str::to_string);
+    let edge = g.get("edge").and_then(f64_from_json).filter(|e| *e > 0.0 && *e < 1.0);
+    let image = g
+        .get("thumbnailUrl")
+        .and_then(Value::as_str)
+        .map(|u| format!("{u}{}{THUMB}", if u.contains('?') { '&' } else { '?' }))
+        .unwrap_or_default();
+    Some(crate::slots::SlotGame {
+        id: slug.to_string(),
+        name: name.to_string(),
+        producer: crate::slots::STAKE_ENGINE.into(),
+        image,
+        demo: g.get("isDemoEnabled").and_then(Value::as_bool).unwrap_or(true),
+        rtp: edge.map(|e| (1.0 - e) * 100.0).unwrap_or(0.0),
+        provider_game_id: g.get("id").and_then(Value::as_str).map(str::to_string),
+        studio,
+    })
+}
+
+/// A plain HTTPS client that presents itself as the user's browser: its User Agent, and its
+/// cookies for the mirror in a jar that also keeps what Cloudflare and Stake set later.
+fn direct_client(mirror: &str, c: &Clearance) -> Result<reqwest::Client, String> {
+    use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, ORIGIN, REFERER};
+    let jar = Arc::new(browser_jar(mirror, c)?);
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+    let origin = HeaderValue::from_str(&format!("https://{mirror}")).map_err(|e| e.to_string())?;
+    headers.insert(ORIGIN, origin);
+    headers.insert(REFERER, HeaderValue::from_str(&format!("https://{mirror}/")).map_err(|e| e.to_string())?);
+    reqwest::Client::builder()
+        .user_agent(c.user_agent.clone())
+        // header names as browsers write them: Cloudflare turns away lowercase ones over HTTP/1.1
+        .http1_title_case_headers()
+        .cookie_provider(jar)
+        .default_headers(headers)
+        .gzip(true)
+        .build()
+        .map_err(|e| format!("Could not set up the connection: {e}"))
+}
+
+/// The pasted cookies, stored the way Cloudflare sets its own (`Domain=<mirror>`), so the fresh
+/// `__cf_bm` it hands out every few minutes replaces the pasted one instead of sitting beside it.
+fn browser_jar(mirror: &str, c: &Clearance) -> Result<reqwest::cookie::Jar, String> {
+    let url: reqwest::Url = format!("https://{mirror}/").parse().map_err(|e| format!("{e}"))?;
+    let jar = reqwest::cookie::Jar::default();
+    for (name, value) in c.cookies() {
+        jar.add_cookie_str(&format!("{name}={value}; Domain={mirror}; Path=/; Secure"), &url);
+    }
+    Ok(jar)
 }
 
 /// Stake answers `{data, errors}`; anything that isn't JSON came from Cloudflare or a block page.
 fn parse_reply(status: u16, body: &str) -> Result<Value, CallError> {
-    let v: Value = match serde_json::from_str(body) {
-        Ok(v) => v,
+    let v = parse_json(status, body)?;
+    check_errors(&v)?;
+    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// The originals' REST answers: `{"<game>Bet": {...}}`, or `{errors, data: null}` like GraphQL.
+fn parse_rest(status: u16, body: &str) -> Result<Value, CallError> {
+    if status == 404 {
+        // an unknown route; its HTML page carries Cloudflare's script, which isn't a check
+        return Err(CallError::Casino(CasinoError::BadReply("HTTP 404: no such game action".into())));
+    }
+    let v = parse_json(status, body)?;
+    check_errors(&v)?;
+    Ok(v)
+}
+
+fn parse_json(status: u16, body: &str) -> Result<Value, CallError> {
+    match serde_json::from_str(body) {
+        Ok(v) => Ok(v),
         Err(_) => {
             if body.contains("ip-blocked") {
                 return Err(CallError::Blocked);
@@ -567,20 +956,95 @@ fn parse_reply(status: u16, body: &str) -> Result<Value, CallError> {
             if challenge || status == 403 || status == 503 {
                 return Err(CallError::Cloudflare);
             }
+            // an error page (a 502 from Cloudflare …) has nothing to show beyond its status
+            if body.trim_start().starts_with('<') {
+                return Err(CallError::Casino(CasinoError::BadReply(format!("HTTP {status} error page"))));
+            }
             let snippet: String = body.chars().take(160).collect();
-            return Err(CallError::Casino(CasinoError::BadReply(format!("HTTP {status}: {snippet}"))));
+            Err(CallError::Casino(CasinoError::BadReply(format!("HTTP {status}: {snippet}"))))
         }
-    };
-    if let Some(e) = v.get("errors").and_then(Value::as_array).and_then(|a| a.first()) {
-        let msg = e.get("message").and_then(Value::as_str).unwrap_or("Unknown error").to_string();
-        let kind = e.get("errorType").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
-        return Err(CallError::Casino(match kind.as_str() {
-            "invalidsession" => CasinoError::Server(INVALID_TOKEN.into()),
-            k if k.contains("parallel") || k.contains("ratelimit") || k.contains("toomany") => CasinoError::Busy(msg),
-            _ => CasinoError::Server(msg),
-        }));
     }
-    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+}
+
+fn check_errors(v: &Value) -> Result<(), CallError> {
+    let Some(e) = v.get("errors").and_then(Value::as_array).and_then(|a| a.first()) else { return Ok(()) };
+    let msg = e.get("message").and_then(Value::as_str).unwrap_or("Unknown error").to_string();
+    let kind = e.get("errorType").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    Err(CallError::Casino(match kind.as_str() {
+        "invalidsession" => CasinoError::Server(INVALID_TOKEN.into()),
+        "existinggame" => CasinoError::RoundOpen,
+        k if k.contains("parallel") || k.contains("ratelimit") || k.contains("toomany") => CasinoError::Busy(msg),
+        "insufficientbalance" => CasinoError::Server("Insufficient balance".into()),
+        "notfound" => CasinoError::Server("No open round".into()),
+        "nocashoutavailable" => CasinoError::Server("Nothing to cash out yet".into()),
+        "request_invalid_schema" => CasinoError::Server("Stake refused these bet settings".into()),
+        _ => CasinoError::Server(msg),
+    }))
+}
+
+/// Baccarat's body: the stake on every picked side (`{"sides": ["banker", "tie"]}`).
+fn baccarat_body(params: &Value, stake: f64) -> Value {
+    let sides: Vec<&str> = params["sides"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let on = |side: &str| if sides.contains(&side) { stake } else { 0.0 };
+    json!({ "player": on("player"), "banker": on("banker"), "tie": on("tie") })
+}
+
+/// Roulette's body: chips (`{"chips": {"number17": 2, "colorRed": 1}}`, counts of the stake)
+/// grouped the way the site sends them: `{"numbers": [{"value": "number17", "amount": …}], …}`.
+fn roulette_body(params: &Value, stake: f64) -> Value {
+    let mut body = json!({});
+    for (key, count) in params["chips"].as_object().into_iter().flatten() {
+        let n = count.as_f64().unwrap_or(0.0);
+        if n <= 0.0 {
+            continue;
+        }
+        let group = ["number", "color", "parity", "range", "row"].iter().find(|g| key.starts_with(*g)).map(|g| format!("{g}s"));
+        let group = match group.as_deref() {
+            Some("paritys") => "parities".to_string(),
+            Some(g) => g.to_string(),
+            None => continue,
+        };
+        let list = body[group.as_str()].as_array().cloned().unwrap_or_default();
+        let mut list = list;
+        list.push(json!({ "value": key, "amount": stake * n }));
+        body[group.as_str()] = Value::Array(list);
+    }
+    body
+}
+
+/// A bet object of an original as a [`Round`].
+fn round_from(game: Game, b: &Value) -> Option<Round> {
+    Some(Round {
+        game,
+        id: b.get("id")?.as_str()?.to_string(),
+        active: b.get("active").and_then(Value::as_bool).unwrap_or(false),
+        currency: b.get("currency").and_then(Value::as_str).unwrap_or("").to_string(),
+        amount: b.get("amount").and_then(coin_units).unwrap_or(0),
+        amount_mult: b.get("amountMultiplier").and_then(f64_from_json).filter(|m| *m > 0.0).unwrap_or(1.0),
+        payout: b.get("payout").and_then(coin_units).unwrap_or(0),
+        multiplier: b.get("payoutMultiplier").and_then(f64_from_json).unwrap_or(0.0),
+        state: b.get("state").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn payouts(v: &Value) -> Option<Vec<f64>> {
+    v.as_array().map(|a| a.iter().filter_map(f64_from_json).collect())
+}
+
+/// Counts a call in flight for as long as it lives, so a balance poll never overwrites a fresher local balance.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn new(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn provable_from(user: &Value) -> ProvableState {
@@ -652,8 +1116,66 @@ mod tests {
         let busy = r#"{"errors":[{"message":"Slow down","errorType":"parallelCasinoBet"}],"data":null}"#;
         assert!(matches!(parse_reply(200, busy), Err(CallError::Casino(e)) if e.is_busy()));
 
+        // table games build their own bodies
+        let b = baccarat_body(&json!({ "sides": ["banker", "tie"] }), 0.5);
+        assert_eq!(b, json!({ "player": 0.0, "banker": 0.5, "tie": 0.5 }));
+        let r = roulette_body(&json!({ "chips": { "number17": 2, "colorRed": 1, "parityEven": 1, "range0112": 0 } }), 0.25);
+        assert_eq!(r["numbers"], json!([{ "value": "number17", "amount": 0.5 }]));
+        assert_eq!(r["colors"], json!([{ "value": "colorRed", "amount": 0.25 }]));
+        assert_eq!(r["parities"], json!([{ "value": "parityEven", "amount": 0.25 }]));
+        assert!(r.get("ranges").is_none());
+
+        // the originals' REST twins
+        let open = r#"{"errors":[{"path":["/dragonTower/bet"],"message":"You already have an active DragonTower game.","errorType":"existingGame"}],"data":null}"#;
+        assert!(matches!(parse_rest(200, open), Err(CallError::Casino(CasinoError::RoundOpen))));
+        assert!(matches!(parse_rest(404, "<pre>Cannot POST</pre><script>challenge-platform</script>"), Err(CallError::Casino(CasinoError::BadReply(_)))));
+        let mines = r#"{"minesNext":{"id":"cb51","active":true,"currency":"btc","amountMultiplier":1,"payoutMultiplier":0,"amount":0.0001,"payout":0,"state":{"rounds":[{"field":12,"payoutMultiplier":1.125}],"minesCount":3,"mines":null}}}"#;
+        let r = Stake::round_of(Game::Mines, &parse_rest(200, mines).ok().unwrap()).unwrap();
+        assert!(r.active && r.amount == 10_000 && r.state["minesCount"] == 3);
+
         assert!(matches!(parse_reply(403, "<html><title>Just a moment...</title>"), Err(CallError::Cloudflare)));
         assert!(matches!(parse_reply(403, "<!-- saved from url=(0041)https://stake-errors.pages.dev/ip-blocked -->"), Err(CallError::Blocked)));
+    }
+
+    #[test]
+    fn engine_games() {
+        let g = json!({"id": "01a0", "name": "Tongue ", "slug": "twist-gaming-tongue", "thumbnailUrl": "https://mediumrare.imgix.net/858a",
+            "edge": 0.033, "isDemoEnabled": true, "providerGroup": {"name": "Twist Gaming", "translation": "Twist Gaming"}});
+        let s = slot_game(&g).unwrap();
+        assert_eq!((s.id.as_str(), s.name.as_str(), s.studio.as_deref()), ("twist-gaming-tongue", "Tongue", Some("Twist Gaming")));
+        assert!((s.rtp - 96.7).abs() < 1e-9);
+        assert_eq!(s.image, format!("https://mediumrare.imgix.net/858a?{THUMB}"));
+        assert_eq!(crate::slots::Provider::for_producer(&s.producer), Some(crate::slots::Provider::StakeEngine));
+
+        let key = json!({"name": "", "slug": "x", "providerGroup": {"name": "", "translation": "game_kurator_group.ovryx_gaming"}});
+        assert_eq!(slot_game(&key).unwrap().studio, None);
+    }
+
+    #[test]
+    fn browser_cookies_renew() {
+        use reqwest::cookie::CookieStore;
+        let c = Clearance { mirror: "stake.bet".into(), user_agent: "Mozilla/5.0".into(), cookie: "__cf_bm=old; session=s1".into() };
+        let jar = browser_jar("stake.bet", &c).unwrap();
+        let url: reqwest::Url = "https://stake.bet/_api/graphql".parse().unwrap();
+        let sent = |jar: &reqwest::cookie::Jar| jar.cookies(&url).map(|h| h.to_str().unwrap().to_string()).unwrap_or_default();
+        assert!(sent(&jar).contains("__cf_bm=old") && sent(&jar).contains("session=s1"));
+        // Cloudflare's renewal, exactly as it came in a reply
+        let renewal = reqwest::header::HeaderValue::from_static("__cf_bm=new; HttpOnly; SameSite=None; Secure; Path=/; Domain=stake.bet; Expires=Sun, 11 Oct 2099 13:56:16 GMT");
+        jar.set_cookies(&mut std::iter::once(&renewal), &url);
+        let now = sent(&jar);
+        assert!(now.contains("__cf_bm=new") && !now.contains("__cf_bm=old"), "{now}");
+        assert!(now.contains("session=s1"));
+    }
+
+    #[test]
+    fn error_pages_show_their_status() {
+        let page = "<!DOCTYPE html>
+<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->";
+        match parse_json(502, page) {
+            Err(CallError::Casino(e)) => assert_eq!(e.to_string(), "Bad reply: HTTP 502 error page"),
+            _ => panic!("an error page is a bad reply"),
+        }
+        assert!(matches!(parse_json(429, page), Err(CallError::Casino(CasinoError::Busy(_)))));
     }
 
     #[test]

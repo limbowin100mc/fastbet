@@ -3,7 +3,7 @@
 A native desktop app that places Limbo bets straight over the casino's websocket API. No browser, no animations, none of the site's built-in delays. This is the Rust rewrite of the `FastBet for chips.gg Limbo` Chrome extension in the parent folder, built so more casinos can be added later.
 
 - **chips.gg**: Limbo and slots.
-- **Stake**: Limbo, through stake.com or any of its 131 mirrors. No slots yet.
+- **Stake**: Limbo, 28 more Stake Originals and Stake Engine slots, through stake.com or any of its 131 mirrors.
 - One window, three panes: **controls** on the left, **live** results in the middle, **stats** on the right. The side panes can be dragged wider or narrower.
 - Everything money-related is exact integer math in the currency's smallest unit (18-decimal coins included).
 
@@ -33,14 +33,16 @@ Under the hood the login window is a second `fastbet.exe` process (`fastbet --lo
 
 Stake is reached over its GraphQL API (`/_api/graphql`, the `limboBet` and `rotateSeedPair` mutations), signed in with your API token in the `x-access-token` header. Stake's domains sit behind Cloudflare checks that turn plain HTTP clients away (stake.com answers them with its "blocked" page), so every call runs through the same hidden WebView2 browser bridge the slots use, parked on the chosen mirror (its own browser profile, `webview\stake`). A fresh bridge usually passes the check by itself within a few seconds; if Cloudflare wants a click, the bridge window pops up (*FastBet – security check*, centered and kept on top, with the check started over so it runs where you can see it) and hides again once you're through. If a mirror stays blocked, pick another one in Settings.
 
-**Cloudflare cookie by hand.** Some connections never get through the check inside the app even though the site opens fine in a normal browser. For those, the Stake settings card has *Set Cloudflare cookie manually* (the connection check offers it too once it has been stuck on Cloudflare for 25 s):
+**Log in with your browser.** Some connections never get through the check inside the app even though the site opens fine in a normal browser. For those, the Stake settings card has *Log in with your browser* (the connection check offers it too once it has been stuck on Cloudflare for 25 s). It takes your own browser's User Agent and cookies for the mirror, and the app then connects as that browser:
 
-1. In a browser on the same computer, open the same mirror the app uses and wait until the site loads. On Windows, use Microsoft Edge: FastBet's bridge is Edge's engine (WebView2), so the cookie comes from the same browser it is used in. The card shows the engine's version and warns when the pasted User Agent is another browser or version.
-2. *Get User Agent ↗* opens Cloudflare's info page on that mirror (`/cdn-cgi/trace`) in the default browser; open it in the browser the cookie comes from and copy everything after `uag=` into **User Agent**.
-3. Press F12 → *Application* → *Cookies* → `https://<mirror>` and copy the value of `cf_clearance` into **Cloudflare clearance cookie**. A whole `Cookie:` header or `cf_clearance=…` works too; the app picks the value out.
-4. Press **Save**. The app reconnects with that User Agent and cookie (a separate browser profile, `webview\stake-cf`, so the automatic one stays untouched).
+1. In a browser on the same computer, open the mirror picked above the section and wait until the site loads. Being logged in there is best: then the login comes along.
+2. *Get User Agent ↗* opens Cloudflare's info page on that mirror (`/cdn-cgi/trace`) in the default browser; open it in the browser the cookies come from and copy everything after `uag=` into **User Agent**.
+3. Press F12 → *Network*, reload the page, click the first request and copy the value of `cookie` under *Request Headers* into **Cookies**. Only the `cf_clearance` value works too, and so do rows copied from *Application* → *Cookies*. The card says what it found: your Stake login (`session`), `cf_clearance`, `__cf_bm`.
+4. Press **Save**. With a logged-in browser's cookies the API token can stay empty: the `session` cookie is Stake's own website login and works as the token. A token typed in the field wins over it.
 
-Cloudflare ties the cookie to the browser's User Agent, your IP address and the mirror. *Your IP address* in the card is the one Cloudflare sees from the app; *Compare in browser ↗* shows your browser's (the `ip=` line), and they must match. A cookie saved for one mirror is only used on that mirror; after an IP change (new router lease, VPN) copy a fresh one. *Remove* forgets it. If Cloudflare refuses the cookie, the connection check says so after 20 s instead of opening a check window: that window would present your browser's User Agent on another engine, and a check doesn't pass there.
+How it connects: plain HTTPS, no browser window, carrying the pasted User Agent and cookies (and keeping whatever Cloudflare and Stake set later). Cloudflare lets that through the way it lets your browser through: measured from a home connection, `__cf_bm` with its User Agent turns Stake's 403 "Just a moment" into a 200, and with another User Agent it stays 403. The request headers go out in browser casing (`User-Agent`, `Cookie`); Cloudflare turned away the same request with lowercase header names. If Cloudflare refuses the cookies that way, the app tries them in its WebView2 bridge (profile `webview\stake-cf`) before giving up.
+
+Cloudflare ties the cookies to the browser's User Agent, your IP address and the mirror. *Your IP address* in the card is the one Cloudflare sees from the app; *Compare in browser ↗* shows your browser's (the `ip=` line), and they must match. The cookies are saved for the mirror picked when you press Save; after an IP change (new router lease, VPN) or when they've expired, copy fresh ones. *Remove* forgets them. If Cloudflare refuses them, the connection check says so instead of opening a check window.
 
 On a server (VPS, RDP), Cloudflare often doesn't trust the IP address itself. If the check also loops in a normal browser on that server, no cookie can be had there and the app can't get through either; it works from a home connection.
 
@@ -50,32 +52,68 @@ On a server (VPS, RDP), Cloudflare often doesn't trust the IP address itself. If
 
 ## Slots
 
-The **Slots** entry in the rail (chips.gg only) opens the chips.gg slot catalog: a search box, the Hacksaw Gaming games first (marked **Tested**), then every video slot (**Untested** for providers without a driver yet). Click a tested game to open its page:
+The **Slots** entry in the rail opens the casino's slot catalog with a search box.
 
-- **Real Play / Demo** tabs. Demo needs no login and uses the provider's demo wallet; Real Play launches the game through your chips.gg account and bets your wallet.
+- **chips.gg**: the Hacksaw Gaming, AvatarUX and BGaming games first (marked **Tested**), then every video slot (**Untested** for providers without a driver yet).
+- **Stake**: only Stake Engine games (Stake's own platform, games by many small studios), most played this week first. Every game in the list is playable, so there are no Tested/Untested badges; the tile shows the house edge and the game page shows the studio.
+
+Click a game to open its page:
+
+- **Real Play / Demo** tabs. Demo needs no login and uses the provider's demo wallet; Real Play launches the game through your account and bets your wallet. Stake Engine games play in USD: Stake converts each bet from the coin selected in the balance pill, and the slot balance shown is that coin's balance in USD.
 - **Bet size** lists exactly the bet levels the game offers; **Feature spin** lists the game's bonus buys with their cost (×2, ×50, ×100 …).
 - **Stop on multiplier ≥ N** pauses the moment a round pays N × the stake. Press **Resume** to carry on, or **Stop**.
 - **No. of spins** and **Stop on profit / loss** work like for Limbo. **Stop on next win / Pause / Stop** appear while running.
 - The table shows every round (feature, bet, multiplier, payout, balance); the Session panel on the right keeps the slot stats.
 
-How it works: the app launches the game session through chips.gg (demo or real), follows the launcher to the game, then talks to the slot provider's game server directly, skipping the game client and all its animations. Providers sit behind Cloudflare or similar bot checks that reject plain HTTP clients, so the calls go through a hidden WebView2 "browser bridge" (`fastbet --bridge <url>`, a child process) parked on the provider's origin.
+How it works: the app launches the game session through the casino (demo or real), follows the launcher to the game, then talks to the slot provider's game server directly, skipping the game client and all its animations. Providers sit behind Cloudflare or similar bot checks that reject plain HTTP clients, so the calls go through a hidden WebView2 "browser bridge" (`fastbet --bridge <url>`, a child process) parked on the provider's origin.
+
+On Stake, `startThirdPartySession(slug, source: <coin>, target: usd)` (or `startThirdPartyDemoSession(slug)`) returns the game URL, which carries the session id and the game server (`rgs_url`). The app never loads that game; it plays Stake Engine's public RGS protocol on the server instead: `/wallet/authenticate` (bet levels and modes), `/wallet/play` (one call returns the whole round, free spins included) and `/wallet/end-round` (settles a winning round; the next play is refused until then).
 
 | Provider | Status | Notes |
 |---|---|---|
 | Hacksaw Gaming | Tested | ~60 ms per round. Bonus buys supported. Wins need a round-close message, handled. |
 | BGaming | Tested | ~90 ms per round. Free-spin rounds are followed to the end. No bonus buys yet. |
 | AvatarUX | Tested | ~150 ms per round plus a round-close call. Ante and bonus-buy modes exposed as feature spins. |
+| Stake Engine (Stake) | Tested on demo | ~150 ms per call; winning rounds need an end-round call. Every mode the game has (ante, bonus buys …) is a feature spin. The game server's Cloudflare drops calls that come too fast (seen from one PC: a short burst, then about 1–2 calls a second), so the app spaces calls out, widens the spacing whenever a call is refused, pauses a few seconds and retries, and narrows it again slowly. |
 | Nolimit City | Not yet | Launches through Evolution's hub with Akamai bot checks, encrypted websocket messages and LZW-compressed replies. Needs its cipher broken first. |
 | Pragmatic Play | Blocked | chips.gg refuses both demo and real launches for this region. |
 | Others | Untested | Each needs its protocol captured (`fastbet --capture <launch url>` records every request a game makes) and a driver in `src/slots/`. |
 
-Adding a provider means a new driver in `src/slots/` implementing `SlotSession` (open session, list bet levels and features, spin) and one line in `Provider::for_producer`.
+Adding a provider means a new driver in `src/slots/` implementing `SlotSession` (open session, list bet levels and features, spin), one line in `Provider::for_producer`, and the producer in `CasinoId::slot_producers` for each casino that offers it.
+
+## Originals (Stake)
+
+On Stake the lobby lists every Stake Original with the site's own artwork; Limbo opens its usual page, the others a page of their own, shaped like Limbo's: bet size on the left with the game's settings under it, the game's board in the middle, its rounds below, the session stats on the right. Manual / Automatic, the strategy (change by % on win / loss), number of bets, delay, async, stop on profit / loss / max bet / hit, force restart and the seed changes work as on Limbo. A bet of 0 is allowed (Stake plays it for free).
+
+| Game | On the board | Auto |
+|---|---|---|
+| Dice | Drag the target on the 0–100 track; roll over / under; quick multipliers | ✓ |
+| Primedice | One range, two ranges or outside a range | ✓ |
+| Keno | Pick 1–10 of 40 tiles, risk, auto pick, clear, patterns; the payout strip for the picks | ✓ |
+| Mines | Reveal tiles one by one, random tile, cash out. Auto: click the tiles every bet reveals | ✓ |
+| Plinko | Risk (incl. Expert) and 8–16 rows; the ball's path and the buckets | ✓ |
+| Wheel | Risk and 10–50 segments; the wheel spins to the result | ✓ |
+| Dragon Tower | Climb row by row, cash out. Auto: click a path, one tile per row | ✓ |
+| Pump, Chicken, Snakes | Pump / cross / roll and cash out. Auto: pumps, lanes or rolls per bet | ✓ |
+| Moles | Whack a hole each round. Auto: plan the holes up front | ✓ |
+| Flip, Rock Paper Scissors | Call each flip / throw and cash out. Auto: the calls up front | ✓ |
+| HiLo | Higher / lower (or same at A and K), skip, cash out; pick the start card | – |
+| Blackjack | Hit, stand, double, split, insurance | – |
+| Video Poker | Click cards to hold, then draw; the paytable | – |
+| Baccarat | Back the player, banker and / or tie | ✓ |
+| Roulette | Click the table to stack chips of the bet size, right-click removes one | ✓ |
+| Diamonds, Cases, Darts, Tarot, Packs, Bars, Drill | One request per round; the board shows the result and the game's table | ✓ |
+| Scarab Spin, Tome of Life, Blue Samurai | Stake's own slots; bonus spins play out by themselves | ✓ |
+
+Rounds left open (on the site, or when the app closed mid-round) are picked up when the game's page opens. Crash and Slide (live multiplayer rounds) are not in yet.
+
+How it works: the site posts its originals to `/_api/casino/<game>/<action>` (`dice/roll`, `mines/bet`, `mines/next`, `mines/cashout` …), the REST twins of its GraphQL mutations; Flip only exists as GraphQL. The app does the same through the Stake bridge, with your API token. Payout tables for Keno, Wheel and Plinko come from `info { kenoPayouts wheelPayouts plinkoPayouts }` (a copy ships in `assets/stake-originals.json`); the other boards' tables were taken from the site's code. The casino settles every round; the boards only show what it answered. Baccarat and Roulette can't be tried with a 0 stake (Stake refuses an empty table), so they were built from the site's code and not yet played for real.
 
 ## Limbo settings
 
 | Section | What's in it |
 |---|---|
-| General | Bet size with ½ and ×2, COIN/USD unit, target with quick buttons. Shows win chance and profit on a win. The currency is picked in the balance pill on top (**Site** follows the currency selected on chips.gg). |
+| General | Bet size with ½ and ×2, COIN/USD unit, target with quick buttons. On Stake a bet of 0 is placed too: a real round that pays nothing. Shows win chance and profit on a win. The currency is picked in the balance pill on top (**Site** follows the currency selected on chips.gg). |
 | Increase on win / loss | *Reset to base*, or *Change by %* (+100% after a loss doubles the bet, i.e. martingale). Automatic mode only. |
 | No. of bets, delay & async | Number of bets (0 = no limit), a delay in ms between bets, and **Async mode**: how many bets may be in flight at once (1–8). Automatic mode only. |
 
@@ -88,6 +126,7 @@ Every bet is one round trip to the chips.gg origin, which is ~185 ms from Europe
 - Seed changes wait until the pipeline has drained, then run alone, so nonces stay in order.
 - If the server starts answering "Please wait and try again later", the **Busy retries** counter in Session climbs: lower the number.
 | Stop on profit / loss / hit | Stop profit, stop loss, max bet, **Stop on hit ≥** (stops the first time a result reaches the multiplier; leave it empty to use your target). Automatic mode only. |
+| Force restart betting | **Force restart betting always**: when a run ends by itself (stop profit or loss, a hit, the number of bets, max bet, an error), it starts again at once from the base bet with its counters at zero. When the restarted run fails before a single bet settles (the casino is down, the balance is empty), it waits 1, 2, 4, then 8 s between tries. **Force restart on errors**: an error doesn't end the run; the failed bet is placed again at once with the same bet size and counters (a martingale keeps its step), and errors in a row wait 1, 2, 4, then 8 s. With both on, errors go this way. **Stop**, `Esc` and **Stop on next win** always end the run, and Stop also ends a wait. A round an original leaves open on the board isn't restarted: it needs you. The header shows *Restarted ×N* and *Errors ×N* (hover for the last reason). Both can be switched while a run is going. Automatic mode only. |
 | Auto seed changes | Rotate the client seed every N bets (a new random client seed, nonce back to 0). *change seed now* does it immediately. Shows the current client seed and nonce. |
 | Sound & hotkeys | Sound on hit; `Space` places one bet, `P` pauses / resumes, `Esc` stops. Ignored while you type in a text field. `Ctrl+R` always works: it resets the whole session (stops a run, clears history and stats, changes the client seed). |
 
@@ -104,11 +143,13 @@ src/
   casino/
     mod.rs           the Casino trait + shared types (Market, BetReply, ProvableState …)
     chipsgg.rs       chips.gg websocket client
-    stake.rs         Stake GraphQL client (through the browser bridge) + the mirror list
+    stake.rs         Stake GraphQL client (through the browser bridge) + the mirror list, Stake Engine catalog + launch, Stake Originals over REST
+  originals/         the originals: games, rounds, payout math and tables
   cloudflare.rs      cf_clearance cookie + User Agent pasted from the user's browser, IP check
   bridge.rs          hidden WebView2 that runs fetch() on a site's origin for us
   engine/mod.rs      bet lane, busy retries, seed rotation, autobet loop
   ui/                screens (accounts, lobby, limbo), controls, stats, theme, widgets, sound
+  ui/original.rs     an original's page; ui/originals/ holds one board per game
 ```
 
 - The **engine** runs on its own tokio runtime thread. The UI sends it `Command`s and receives `Event`s; nothing in the UI ever blocks on the network.
@@ -141,7 +182,7 @@ For UI work: `FASTBET_UPDATE=1` runs the check at start, `FASTBET_PRETEND_VERSIO
 
 ## Settings file
 
-`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, the chosen Stake mirror, a Cloudflare cookie if you set one, and the login tokens, so keep it private: a Stake API token works like a password for your account.
+`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, the chosen Stake mirror, your browser's User Agent and cookies if you logged in with your browser, and the login tokens, so keep it private: a Stake API token, like the `session` cookie, works like a password for your account.
 
 For UI work, `FASTBET_MIRRORS=<search>` opens the account settings with the mirror list already open (`1` for no search), and `FASTBET_CLOUDFLARE=1` opens them on the Cloudflare cookie section.
 
@@ -151,4 +192,4 @@ For UI work, `FASTBET_MIRRORS=<search>` opens the account settings with the mirr
 cargo test
 ```
 
-covers the money math and the autobet engine against a scripted mock casino (martingale, stop profit/loss, hit stop, max bet, bet limit, seed rotation, busy retries, pause/resume).
+covers the money math and the autobet engine against a scripted mock casino (martingale, stop profit/loss, hit stop, max bet, bet limit, seed rotation, busy retries, pause/resume, force restart).

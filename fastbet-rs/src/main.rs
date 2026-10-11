@@ -7,6 +7,7 @@ mod cloudflare;
 mod engine;
 mod login;
 mod money;
+mod originals;
 mod settings;
 mod slots;
 mod ui;

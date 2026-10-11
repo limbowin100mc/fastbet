@@ -81,6 +81,7 @@ fn header(app: &mut App, ui: &mut Ui) {
             widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
                 .on_hover_text("Bets in flight at once. Set it under No. of bets, delay & async.");
         }
+        controls::restarts_chip(app, ui);
 
         // right: start / running controls
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -117,7 +118,7 @@ fn stage(app: &mut App, ui: &mut Ui) {
     let p = ui.painter_at(rect);
     p.rect(rect, CornerRadius::same(14), STAGE, Stroke::new(1.0, LINE), StrokeKind::Inside);
 
-    let latest = app.history.latest_bet().map(|(n, r)| (n, r.clone()));
+    let latest = app.history.latest_for(None).map(|(n, r)| (n, r.clone()));
     let paused = app.auto.paused;
 
     let mut scale = 1.0;
@@ -194,7 +195,7 @@ fn stage(app: &mut App, ui: &mut Ui) {
         clip.galley(pos2(br.left() + 24.0, br.center().y - g.size().y / 2.0), g, c);
     }
     // recent results along the bottom, newest first, fading out to the right
-    let recent: Vec<BetRecord> = app.history.recent_bets(60).cloned().collect();
+    let recent: Vec<BetRecord> = app.history.recent_for(None, 60).cloned().collect();
     if !recent.is_empty() {
         let y = rect.bottom() - 24.0;
         let x_end = rect.right() - 18.0;
@@ -277,7 +278,15 @@ fn table(app: &mut App, ui: &mut Ui) {
     }
     p.hline(card.x_range(), hr.bottom(), Stroke::new(1.0, LINE));
 
-    let entries: Vec<HistEntry> = app.history.entries.iter().take(TABLE_ROWS).cloned().collect();
+    // the originals have their own pages; seed changes show everywhere
+    let entries: Vec<HistEntry> = app
+        .history
+        .entries
+        .iter()
+        .filter(|e| !matches!(e, HistEntry::Bet { rec, .. } if rec.game.is_some()))
+        .take(TABLE_ROWS)
+        .cloned()
+        .collect();
     if entries.is_empty() {
         let (r, _) = ui.allocate_exact_size(vec2(width, 90.0), Sense::hover());
         ui.painter().text(pos2(r.center().x, r.center().y - 8.0), Align2::CENTER_CENTER, "No bets yet", theme::font_semi(13.0), MUTED);

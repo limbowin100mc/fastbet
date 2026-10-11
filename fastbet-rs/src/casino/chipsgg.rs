@@ -399,6 +399,7 @@ impl Casino for ChipsGg {
                         .get("supplier_identifier")
                         .and_then(|s| s.get("game_id"))
                         .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string))),
+                    studio: None,
                 })
             })
             .collect())

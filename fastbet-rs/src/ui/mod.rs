@@ -7,6 +7,8 @@ pub mod images;
 pub mod limbo;
 pub mod lobby;
 pub mod logos;
+pub mod original;
+pub mod originals;
 pub mod slot;
 pub mod slots_lobby;
 pub mod sound;
@@ -47,6 +49,8 @@ pub enum Screen {
     Limbo,
     Slots,
     Slot,
+    /// An original besides Limbo.
+    Original(crate::originals::Game),
 }
 
 /// Where the account screen is in the connect flow.
@@ -121,6 +125,9 @@ pub struct App {
     pub slot_stats: Stats,
     pub slot_pop: Option<Instant>,
 
+    // originals
+    pub orig: originals::State,
+
     dirty: bool,
     last_save: Instant,
     title: String,
@@ -141,6 +148,8 @@ impl App {
             Ok("limbo") => Screen::Limbo,
             Ok("slots") => Screen::Slots,
             Ok("account") => Screen::Account,
+            // FASTBET_SCREEN=orig:<slug> opens an original's page (UI work)
+            Ok(v) if v.starts_with("orig:") => crate::originals::Game::from_slug(&v[5..]).map(Screen::Original).unwrap_or(Screen::Lobby),
             _ => Screen::Accounts,
         };
         let preview: Option<usize> = std::env::var("FASTBET_PREVIEW").ok().map(|v| v.parse().unwrap_or(400));
@@ -149,6 +158,7 @@ impl App {
         }
         engine.send(Command::SeedPolicy { every: settings.seed_every() });
         engine.send(Command::SetConcurrency(settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
+        engine.send(Command::ForceRestart { always: settings.force_restart, on_error: settings.restart_on_error });
 
         // FASTBET_SLOT=<catalog id>:<provider id>:<name>[:<producer>] opens a demo game at startup (UI work).
         let mut screen = screen;
@@ -156,7 +166,7 @@ impl App {
             let mut it = spec.splitn(4, ':');
             let (id, pid, name) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string(), it.next().unwrap_or("Slot").to_string());
             let producer = it.next().unwrap_or("hacksawgaming").to_string();
-            let game = SlotGame { id, name, producer, image: String::new(), demo: true, rtp: 96.3, provider_game_id: Some(pid) };
+            let game = SlotGame { id, name, producer, image: String::new(), demo: true, rtp: 96.3, provider_game_id: Some(pid), studio: None };
             engine.send(Command::OpenSlot { game, mode: PlayMode::Demo, currency: "usdt".into() });
             screen = Screen::Slot;
         }
@@ -207,6 +217,7 @@ impl App {
             spins: VecDeque::new(),
             slot_stats: Stats::fresh("USD", 2),
             slot_pop: None,
+            orig: originals::State::default(),
             dirty: false,
             last_save: Instant::now(),
             title: String::new(),
@@ -270,6 +281,8 @@ impl App {
                 payout,
                 profit: payout - amount,
                 ms: rng.random_range(120.0..220.0),
+                game: None,
+                round: None,
             };
             self.stats.settle(&rec, 6);
             self.history.push_bet(rec);
@@ -330,6 +343,9 @@ impl App {
         }
         if self.usd_mode() {
             let usd = money::num(s)?;
+            if usd == 0.0 {
+                return Some(0);
+            }
             if usd < 0.0 || info.price <= 0.0 {
                 return None;
             }
@@ -440,8 +456,12 @@ impl App {
         if self.info(&cur).is_none() {
             return Err("Currency data not loaded yet".into());
         }
-        let amount = self.to_base(&self.settings.amount, &cur).filter(|a| *a > 0).ok_or("Enter a bet amount")?;
+        let amount = self.to_base(&self.settings.amount, &cur).ok_or("Enter a bet amount")?;
         let id = self.casino();
+        // a 0 bet is still placed where the casino takes it (Stake)
+        if amount == 0 && !id.zero_bets() {
+            return Err(format!("{} doesn't take bets of 0", id.name()));
+        }
         let target = self.target().ok_or_else(|| {
             format!("Target must be {}× to {}×", id.min_target(), money::group_thousands(&format!("{}", id.max_target() as i64)))
         })?;
@@ -466,40 +486,45 @@ impl App {
     }
 
     pub fn start_auto(&mut self) {
-        let s = &self.settings;
         let (cur, amount, target) = match self.bet_setup() {
             Ok(v) => v,
             Err(e) => return self.flash(e),
         };
+        let cfg = match self.auto_config(cur, amount, target) {
+            Ok(c) => c,
+            Err(e) => return self.flash(e),
+        };
+        self.hit_badge_n = None;
+        self.flash = None;
+        self.engine.send(Command::StartAuto(cfg));
+    }
+
+    /// An auto run from the panel's strategy, stops and limits, betting `amount` on Limbo's `target`.
+    fn auto_config(&self, cur: String, amount: Units, target: f64) -> Result<AutoConfig, String> {
+        let s = &self.settings;
         let opt = |v: &str, name: &str| -> Result<Option<Units>, String> {
             if v.trim().is_empty() {
                 return Ok(None);
             }
             self.to_base(v, &cur).map(Some).ok_or_else(|| format!("Invalid {name}"))
         };
-        let parsed = (|| -> Result<_, String> {
-            let stop_profit = opt(&s.stop_profit, "stop profit")?;
-            let stop_loss = opt(&s.stop_loss, "stop loss")?;
-            let max_bet = opt(&s.max_bet, "max bet")?;
-            let hm = s.hit_multi.trim();
-            if s.stop_on_hit && !hm.is_empty() && !money::num(hm).map(|h| h >= self.casino().min_target()).unwrap_or(false) {
-                return Err(format!("Hit multiplier must be at least {}×", self.casino().min_target()));
-            }
-            Ok((stop_profit, stop_loss, max_bet))
-        })();
-        let (stop_profit, stop_loss, max_bet) = match parsed {
-            Ok(v) => v,
-            Err(e) => return self.flash(e),
-        };
+        let stop_profit = opt(&s.stop_profit, "stop profit")?;
+        let stop_loss = opt(&s.stop_loss, "stop loss")?;
+        let max_bet = opt(&s.max_bet, "max bet")?;
+        let hm = s.hit_multi.trim();
+        if s.stop_on_hit && !hm.is_empty() && !money::num(hm).map(|h| h >= self.casino().min_target()).unwrap_or(false) {
+            return Err(format!("Hit multiplier must be at least {}×", self.casino().min_target()));
+        }
         if let Some(m) = max_bet {
             if amount > m {
-                return self.flash("Bet size is above max bet");
+                return Err("Bet size is above max bet".into());
             }
         }
         let pct = |a: Adjust, v: &str| if a == Adjust::Increase { Some(money::num(v).unwrap_or(0.0)) } else { None };
-        let cfg = AutoConfig {
+        Ok(AutoConfig {
             currency: cur,
             target,
+            original: None,
             base: amount,
             limit: s.count.trim().parse().unwrap_or(0),
             delay_ms: money::num(&s.delay).unwrap_or(0.0).max(0.0) as u64,
@@ -509,14 +534,104 @@ impl App {
             stop_loss,
             max_bet,
             hit_line: self.hit_line(target),
-        };
-        self.hit_badge_n = None;
-        self.flash = None;
-        self.engine.send(Command::StartAuto(cfg));
+        })
     }
 
     pub fn stop_auto(&mut self) {
         self.engine.send(Command::StopAuto);
+    }
+
+    // ------------------------------------------------------------ originals
+
+    pub fn go_original(&mut self, game: crate::originals::Game) {
+        self.leave_slot();
+        self.screen = Screen::Original(game);
+    }
+
+    /// Currency and stake for an original's bet. A zero stake is allowed: Stake plays it for free.
+    fn orig_setup(&self) -> Result<(String, Units), String> {
+        if !self.ready() {
+            return Err(self.status.long(&self.status_detail));
+        }
+        let cur = self.active_currency();
+        if cur.is_empty() {
+            return Err("No currency selected yet".into());
+        }
+        if self.info(&cur).is_none() {
+            return Err("Currency data not loaded yet".into());
+        }
+        let amount = self.to_base(&self.settings.amount, &cur).ok_or("Enter a bet amount")?;
+        Ok((cur, amount))
+    }
+
+    /// The stop-on-hit line for originals: only when a multiplier is set.
+    fn orig_hit_line(&self) -> Option<f64> {
+        if !self.settings.stop_on_hit {
+            return None;
+        }
+        money::num(&self.settings.hit_multi).filter(|h| *h > 0.0)
+    }
+
+    /// FASTBET_ORIG_PLAY="next {json}; next {json}; cashout": steps played into the open round
+    /// of the page's original, one after the other (UI work; clicks can't be simulated here).
+    fn orig_dev_play(&mut self) {
+        let Screen::Original(g) = self.screen else { return };
+        if !self.orig.open.contains_key(&g) || self.orig.busy.contains(&g) {
+            return;
+        }
+        let Ok(script) = std::env::var("FASTBET_ORIG_PLAY") else { return };
+        let done = self.orig.dev_steps;
+        let Some(cmd) = script.split(';').map(str::trim).filter(|c| !c.is_empty()).nth(done) else { return };
+        self.orig.dev_steps += 1;
+        let (step, json) = cmd.split_once(' ').unwrap_or((cmd, "{}"));
+        let params = serde_json::from_str(json).unwrap_or(serde_json::json!({}));
+        let step = if step == "cashout" { crate::originals::Step::Cashout } else { crate::originals::Step::Next };
+        self.orig_step(g, step, params);
+    }
+
+    /// One manual round: settles at once, or opens a round the board carries on.
+    pub fn orig_bet(&mut self, game: crate::originals::Game) {
+        if self.auto.running || self.orig.busy.contains(&game) || self.orig.open.contains_key(&game) {
+            return;
+        }
+        let res = self.orig_setup().and_then(|(cur, amount)| originals::bet_params(self, game, false).map(|params| (cur, amount, params)));
+        let (currency, amount, params) = match res {
+            Ok(v) => v,
+            Err(e) => return self.flash(e),
+        };
+        if game.has_steps() {
+            self.orig.busy.insert(game);
+        } else if self.queued >= engine::MAX_QUEUE {
+            return self.flash(format!("{} bets already queued", engine::MAX_QUEUE));
+        }
+        let hit_line = self.orig_hit_line();
+        self.engine.send(Command::Original { bet: engine::OriginalBet { game, currency, amount, params, auto: false }, hit_line });
+    }
+
+    /// Reveal, guess or cash out in the open round.
+    pub fn orig_step(&mut self, game: crate::originals::Game, step: crate::originals::Step, params: serde_json::Value) {
+        if self.orig.busy.contains(&game) || !self.orig.open.contains_key(&game) {
+            return;
+        }
+        self.orig.busy.insert(game);
+        self.engine.send(Command::OriginalStep { game, step, params });
+    }
+
+    pub fn orig_start_auto(&mut self, game: crate::originals::Game) {
+        let res = self.orig_setup().and_then(|(cur, amount)| originals::bet_params(self, game, true).map(|params| (cur, amount, params)));
+        let (cur, amount, params) = match res {
+            Ok(v) => v,
+            Err(e) => return self.flash(e),
+        };
+        let mut cfg = match self.auto_config(cur, amount, 0.0) {
+            Ok(c) => c,
+            Err(e) => return self.flash(e),
+        };
+        cfg.original = Some((game, params));
+        cfg.hit_line = self.orig_hit_line();
+        self.hit_badge_n = None;
+        self.flash = None;
+        self.engine.send(Command::StartAuto(cfg));
     }
 
     pub fn stop_on_next_win(&mut self) {
@@ -569,6 +684,14 @@ impl App {
         self.engine.send(Command::SeedPolicy { every: self.settings.seed_every() });
     }
 
+    /// Force restart betting (always / on errors) on or off; it applies to a run already going too.
+    pub fn set_force_restart(&mut self, always: bool, on_error: bool) {
+        self.settings.force_restart = always;
+        self.settings.restart_on_error = on_error;
+        self.mark_dirty();
+        self.engine.send(Command::ForceRestart { always, on_error });
+    }
+
     pub fn sync_concurrency(&mut self) {
         self.engine.send(Command::SetConcurrency(self.settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
     }
@@ -579,6 +702,9 @@ impl App {
         }
         self.settings.casino = id;
         self.market = Market::default();
+        // every casino has its own slot catalog and originals
+        self.catalog = slots_lobby::Catalog::default();
+        self.orig = originals::State::default();
         self.provable = ProvableState::default();
         self.status = ConnStatus::Connecting;
         self.status_detail.clear();
@@ -673,30 +799,43 @@ impl App {
         self.onboard_error = None;
     }
 
-    /// Settings card: Save pressed. Stores the key (and mirror) and runs the connection check.
-    pub fn save_key(&mut self) {
-        let key = self.key_input.trim().to_string();
-        if key.is_empty() {
-            self.onboard_error = Some(format!("Paste your {} first.", self.casino().key_label()));
-            return;
+    /// The browser values typed in the settings card, checked (casinos behind Cloudflare).
+    pub fn typed_clearance(&self) -> Result<Option<Clearance>, String> {
+        if !self.casino().behind_cloudflare() {
+            return Ok(None);
         }
-        self.mirror_open = false;
         let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
-        let clearance = if self.casino().behind_cloudflare() {
-            let on = if mirror.is_empty() { self.settings.mirror().unwrap_or_default() } else { mirror.clone() };
-            match Clearance::from_input(&on, &self.cf_agent_input, &self.cf_cookie_input) {
-                // untouched values stay with the mirror they came from
-                Ok(Some(c)) => Some(self.settings.clearance().filter(|s| s.user_agent == c.user_agent && s.cookie == c.cookie).unwrap_or(c)),
-                Ok(None) => None,
-                Err(e) => {
-                    self.cf_open = true;
-                    self.onboard_error = Some(e);
-                    return;
-                }
+        let on = if mirror.is_empty() { self.settings.mirror().unwrap_or_default() } else { mirror };
+        Clearance::from_input(&on, &self.cf_agent_input, &self.cf_cookie_input)
+    }
+
+    /// The login the settings card would save: the API token typed, or else the session of a
+    /// logged-in browser's cookies. A token that is an older pasted session gives way to a newer one.
+    pub fn typed_login(&self, clearance: Option<&Clearance>) -> Option<String> {
+        crate::cloudflare::pick_login(self.key_input.trim(), clearance.and_then(Clearance::session), self.settings.clearance().and_then(|c| c.session()))
+    }
+
+    /// Settings card: Save pressed. Stores the login, mirror and browser values and runs the connection check.
+    pub fn save_key(&mut self) {
+        self.mirror_open = false;
+        // the browser values belong to the mirror picked above them
+        let clearance = match self.typed_clearance() {
+            Ok(c) => c,
+            Err(e) => {
+                self.cf_open = true;
+                self.onboard_error = Some(e);
+                return;
             }
-        } else {
-            None
         };
+        let Some(key) = self.typed_login(clearance.as_ref()) else {
+            self.onboard_error = Some(if self.casino().behind_cloudflare() {
+                format!("Paste your {}, or the cookies of a browser where you're logged in.", self.casino().key_label())
+            } else {
+                format!("Paste your {} first.", self.casino().key_label())
+            });
+            return;
+        };
+        let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
         if self.settings.mirror().is_some() && !mirror.is_empty() && self.settings.mirror().as_deref() != Some(mirror.as_str()) {
             self.settings.mirrors.insert(self.casino().key().to_string(), mirror.clone());
             self.engine.send(Command::SetMirror(mirror));
@@ -710,6 +849,7 @@ impl App {
             }
             self.store_clearance(clearance);
         }
+        self.key_input = key.clone();
         *self.settings.token_mut() = key;
         self.settings.save();
         self.onboard_error = None;
@@ -774,11 +914,15 @@ impl App {
     pub fn request_slots_initial(&mut self) {
         self.catalog.error = None;
         self.catalog.featured.clear();
-        self.catalog.loading = Provider::SUPPORTED.len() as u8 + 1;
-        for p in Provider::SUPPORTED {
-            self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: 100, ..Default::default() } });
+        self.catalog.loading = 1;
+        // a curated catalog is all playable: no separate list of the supported producers
+        if !self.casino().slots_curated() {
+            for p in self.casino().slot_producers() {
+                self.catalog.loading += 1;
+                self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: 100, ..Default::default() } });
+            }
         }
-        self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { limit: 60, ..Default::default() } });
+        self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { limit: slots_lobby::PAGE, ..Default::default() } });
     }
 
     pub fn search_slots(&mut self) {
@@ -789,7 +933,7 @@ impl App {
             return;
         }
         self.catalog.loading += 1;
-        self.engine.send(Command::ListSlots { kind: SlotListKind::Search, filter: SlotFilter { query: Some(q), limit: 60, ..Default::default() } });
+        self.engine.send(Command::ListSlots { kind: SlotListKind::Search, filter: SlotFilter { query: Some(q), limit: slots_lobby::PAGE, ..Default::default() } });
     }
 
     pub fn load_more_slots(&mut self) {
@@ -797,7 +941,7 @@ impl App {
             return;
         }
         self.catalog.loading += 1;
-        self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { skip: self.catalog.all.len(), limit: 60, ..Default::default() } });
+        self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { skip: self.catalog.all.len(), limit: slots_lobby::PAGE, ..Default::default() } });
     }
 
     fn slot_play_mode(&self) -> PlayMode {
@@ -910,8 +1054,10 @@ impl App {
             payout: rec.win as Units,
             profit: (rec.win - rec.cost) as Units,
             ms: rec.ms,
+            game: None,
+            round: None,
         };
-        if self.slot_stats.cur != rec.currency {
+        if self.slot_stats.cur != rec.currency || self.slot_stats.decimals != rec.decimals {
             self.slot_stats = Stats::fresh(&rec.currency, rec.decimals);
         }
         self.slot_stats.settle(&bet, rec.decimals);
@@ -1050,7 +1196,7 @@ impl App {
                         }
                         SlotListKind::Search => self.catalog.results = games,
                         SlotListKind::All => {
-                            if games.len() < 60 {
+                            if games.len() < slots_lobby::PAGE {
                                 self.catalog.all_done = true;
                             }
                             if skip == 0 {
@@ -1071,6 +1217,22 @@ impl App {
                     }
                 }
                 Event::Spin(rec) => self.on_spin(rec),
+                Event::Round(r) => {
+                    let g = r.game;
+                    self.orig.busy.remove(&g);
+                    if r.active {
+                        self.orig.open.insert(g, r.clone());
+                    } else {
+                        self.orig.open.remove(&g);
+                    }
+                    self.orig.last.insert(g, r);
+                    self.orig.landed = Some((g, Instant::now()));
+                }
+                Event::RoundFailed { game, .. } => {
+                    self.orig.busy.remove(&game);
+                }
+                Event::OriginalTables(t) => self.orig.tables = t,
+                Event::Originals(list) => self.orig.catalog = list,
             }
         }
     }
@@ -1104,7 +1266,14 @@ impl App {
             return;
         }
         if space {
-            self.manual_bet();
+            match self.screen {
+                Screen::Original(g) => {
+                    if self.settings.mode == crate::settings::Mode::Manual || !g.auto() {
+                        self.orig_bet(g);
+                    }
+                }
+                _ => self.manual_bet(),
+            }
         }
         if esc && self.auto.running {
             self.engine.send(Command::StopAuto);
@@ -1129,6 +1298,7 @@ impl App {
                 let who = self.username_for(self.casino()).unwrap_or_default();
                 let page = match self.screen {
                     Screen::Limbo => " – Limbo".to_string(),
+                    Screen::Original(g) => format!(" – {}", g.name()),
                     Screen::Slots => " – Slots".to_string(),
                     Screen::Slot => {
                         let g = self.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Slot".into());
@@ -1318,6 +1488,27 @@ impl eframe::App for App {
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
             self.go_lobby();
         }
+        if let Screen::Original(g) = self.screen {
+            if !self.casino().originals().contains(&g) {
+                self.go_lobby();
+            } else if self.ready() && g.has_steps() && self.orig.resumed.insert(g) {
+                self.engine.send(Command::OriginalResume(g));
+            }
+        }
+        self.orig_dev_play();
+        if self.ready() && !self.orig.info_requested && !self.casino().originals().is_empty() {
+            self.orig.info_requested = true;
+            self.engine.send(Command::OriginalInfo);
+            // FASTBET_ORIG_BET=1: one manual bet on the open original (or Limbo) once connected
+            // (UI work; FASTBET_ORIG_BET=auto starts an auto run instead)
+            match (self.screen, std::env::var("FASTBET_ORIG_BET").as_deref()) {
+                (Screen::Original(g), Ok("auto")) => self.orig_start_auto(g),
+                (Screen::Original(g), Ok(_)) => self.orig_bet(g),
+                (Screen::Limbo, Ok("auto")) => self.start_auto(),
+                (Screen::Limbo, Ok(_)) => self.manual_bet(),
+                _ => {}
+            }
+        }
         match self.screen {
             Screen::Accounts | Screen::Account => self.onboarding_logic(),
             _ => self.hotkeys(ctx),
@@ -1344,7 +1535,7 @@ impl eframe::App for App {
             Screen::Account => {
                 egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| accounts::account(self, ui));
             }
-            Screen::Lobby | Screen::Limbo | Screen::Slots | Screen::Slot => {
+            Screen::Lobby | Screen::Limbo | Screen::Slots | Screen::Slot | Screen::Original(_) => {
                 egui::Panel::left("rail")
                     .exact_size(60.0)
                     .resizable(false)
@@ -1384,6 +1575,7 @@ impl eframe::App for App {
                         Screen::Limbo => limbo::show(self, ui),
                         Screen::Slots => slots_lobby::show(self, ui),
                         Screen::Slot => slot::show(self, ui),
+                        Screen::Original(g) => original::show(self, ui, g),
                         _ => lobby::show(self, ui),
                     }
                     self.toast(ui, area);

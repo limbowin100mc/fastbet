@@ -217,6 +217,13 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                 let masked = !app.key_input.is_empty() && !app.token_visible;
                 let r = widgets::text_box(ui, &mut app.key_input, &format!("paste your {}", id.key_label()), None, true, masked);
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                // a logged-in browser's cookies log in by themselves
+                let typed = app.typed_clearance().ok().flatten();
+                let browser_login = typed.as_ref().and_then(|c| c.session()).is_some();
+                if browser_login && app.typed_login(typed.as_ref()) != Some(app.key_input.trim().to_string()) {
+                    ui.label(widgets::semi("Not needed: the login from your browser's cookies is used", 11.0, G2));
+                }
+                let can_save = app.typed_login(typed.as_ref()).is_some();
                 if !id.mirrors().is_empty() {
                     ui.add_space(2.0);
                     widgets::caption(ui, "Mirror");
@@ -228,7 +235,7 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                     ui.add_space(2.0);
                 }
                 ui.horizontal(|ui| {
-                    if button(ui, "Save", Btn::Primary, !app.key_input.trim().is_empty(), Some(90.0)).clicked() || enter {
+                    if button(ui, "Save", Btn::Primary, can_save, Some(90.0)).clicked() || enter {
                         save = true;
                     }
                     if pill_button(ui, if app.token_visible { "hide" } else { "show" }, MUTED, app.token_visible).clicked() {
@@ -362,8 +369,9 @@ fn picked_mirror(app: &App) -> String {
     }
 }
 
-/// For a Cloudflare check that never passes in the app: the User Agent and
-/// `cf_clearance` cookie from the user's own browser (same PC, same IP).
+/// "Log in with your browser": the User Agent and cookies of the user's own browser on the
+/// picked mirror (same PC, same IP). The app then connects as that browser, and a logged-in
+/// browser's `session` cookie logs the account in without an API token.
 /// The settings card's Save stores them with the token and mirror.
 fn cloudflare_section(app: &mut App, ui: &mut Ui) {
     let mirror = picked_mirror(app);
@@ -389,8 +397,9 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
         let dy = if app.cf_open { -2.0 } else { 2.0 };
         let chevron = vec![c + vec2(-4.0, -dy), c + vec2(0.0, dy), c + vec2(4.0, -dy)];
         p.add(egui::Shape::line(chevron, Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
-        p.text(pos2(rect.left() + 32.0, rect.center().y), Align2::LEFT_CENTER, "Set Cloudflare cookie manually", theme::font_semi(13.0), if app.cf_open { TEXT } else { TEXT2 });
+        p.text(pos2(rect.left() + 32.0, rect.center().y), Align2::LEFT_CENTER, "Log in with your browser", theme::font_semi(13.0), if app.cf_open { TEXT } else { TEXT2 });
         let (tag, tag_color) = match &saved {
+            Some(s) if s.mirror == mirror && s.session().is_some() => ("saved · logged in", G2),
             Some(s) if s.mirror == mirror => ("saved", G2),
             Some(_) => ("other mirror", GOLD),
             None => ("optional", DIM),
@@ -409,18 +418,15 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
             ui.add(
                 egui::Label::new(
                     RichText::new(format!(
-                        "Use this when the Cloudflare check never passes in the app, but {mirror} opens fine in a browser on this computer. \
-                         Copy that browser's User Agent and its cf_clearance cookie here. They only work from the same IP address and on the same mirror."
+                        "For when {mirror} opens in a browser on this computer but the app can't get past Cloudflare. Copy that browser's \
+                         User Agent and its cookies for {mirror} here: FastBet then connects as that browser. If you're logged in there, \
+                         your login comes with the cookies and no API token is needed."
                     ))
                     .size(11.5)
                     .color(TEXT2),
                 )
                 .wrap(),
             );
-            let engine = cloudflare::edge_engine();
-            if let Some(v) = engine {
-                note(ui, format!("Best taken from Microsoft Edge: FastBet runs on Edge's engine (version {v}), so Cloudflare sees the same browser."), TEXT2);
-            }
             ip_row(app, ui, &mirror);
 
             ui.add_space(2.0);
@@ -436,18 +442,44 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
             widgets::text_box(ui, &mut app.cf_agent_input, "Mozilla/5.0 (Windows NT…", None, true, false);
             note(
                 ui,
-                format!("Get User Agent opens {mirror}/cdn-cgi/trace in your default browser. Open it in the browser you take the cookie from, and copy everything after uag="),
+                format!("Open {mirror}/cdn-cgi/trace in the browser you take the cookies from (Get User Agent does that in your default browser) and copy everything after uag="),
                 MUTED,
             );
-            let other = cloudflare::browser_of(&app.cf_agent_input).filter(|b| engine.is_some_and(|v| *b != ("Edge", v)));
-            if let (Some((name, major)), Some(v)) = (other, engine) {
-                note(ui, format!("That's {name} {major}, FastBet is Edge {v}. If Cloudflare refuses the cookie, copy both values from Microsoft Edge."), GOLD);
-            }
 
             ui.add_space(2.0);
-            widgets::caption(ui, "Cloudflare clearance cookie");
-            widgets::text_box(ui, &mut app.cf_cookie_input, "Paste the cf_clearance value", None, true, false);
-            note(ui, format!("In that browser, on {mirror}: press F12 → Application → Cookies → https://{mirror} and copy the value of cf_clearance."), MUTED);
+            widgets::caption(ui, "Cookies");
+            widgets::text_box(ui, &mut app.cf_cookie_input, "Paste the cookie line", None, true, false);
+            note(
+                ui,
+                format!(
+                    "In that browser, on {mirror}: press F12 → Network, reload the page, click the first request and copy the value of \
+                     cookie under Request Headers. Only the cf_clearance value works too."
+                ),
+                MUTED,
+            );
+            // what the pasted line holds
+            if !app.cf_cookie_input.trim().is_empty() {
+                let found = cloudflare::parse_cookies(&app.cf_cookie_input);
+                let has = |name: &str| found.iter().any(|(k, _)| k == name);
+                let mut parts = Vec::new();
+                if has(cloudflare::SESSION_COOKIE) {
+                    parts.push("your Stake login");
+                }
+                if has(cloudflare::COOKIE) {
+                    parts.push("cf_clearance");
+                }
+                if has(cloudflare::BOT_COOKIE) {
+                    parts.push("__cf_bm");
+                }
+                let (txt, color) = if parts.is_empty() {
+                    ("No Stake login or Cloudflare cookie in that line".to_string(), GOLD)
+                } else if !has(cloudflare::COOKIE) && !has(cloudflare::BOT_COOKIE) {
+                    (format!("Found {}, but no Cloudflare cookie: the app passes Cloudflare by itself", parts.join(", ")), GOLD)
+                } else {
+                    (format!("Found {}", parts.join(" · ")), G2)
+                };
+                note(ui, txt, color);
+            }
 
             let typed = (app.cf_agent_input.trim(), app.cf_cookie_input.trim());
             let changed = match &saved {
@@ -460,12 +492,12 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
                     match &saved {
                         _ if changed => ui.label(widgets::semi("Press Save to use these values", 11.5, MUTED)),
                         Some(s) if s.mirror == mirror => ui.label(widgets::semi(format!("Saved for {}", s.mirror), 11.5, G2)),
-                        Some(s) => ui.label(widgets::semi(format!("Saved for {}, not used on {mirror}", s.mirror), 11.5, GOLD)),
+                        Some(s) => ui.label(widgets::semi(format!("Saved for {}; Save again to use them on {mirror}", s.mirror), 11.5, GOLD)),
                         None => ui.label(""),
                     };
                     if saved.is_some() {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if pill_button(ui, "Remove", RED, false).on_hover_text("Forget the saved cookie and User Agent").clicked() {
+                            if pill_button(ui, "Remove", RED, false).on_hover_text("Forget the saved cookies and User Agent").clicked() {
                                 remove = true;
                             }
                         });
@@ -596,13 +628,13 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
                 if button(ui, "Open settings", Btn::Ghost, true, None).clicked() {
                     open_settings = true;
                 }
-                if cloudflare && reach == 2 && button(ui, "Set Cloudflare cookie", Btn::Ghost, true, None).clicked() {
+                if cloudflare && reach == 2 && button(ui, "Log in with your browser", Btn::Ghost, true, None).clicked() {
                     set_cookie = true;
                 }
             });
         } else if stuck {
             ui.add_space(2.0);
-            ui.add(egui::Label::new(widgets::semi("Stuck on Cloudflare? If the casino website opens in your browser, you can copy its Cloudflare cookie into the app.", 11.5, TEXT2)).wrap());
+            ui.add(egui::Label::new(widgets::semi("Stuck on Cloudflare? If the casino website opens in your browser, copy that browser's User Agent and cookies into the app: it then connects as your browser.", 11.5, TEXT2)).wrap());
             ui.horizontal(|ui| {
                 if button(ui, "Set cookie manually", Btn::Ghost, true, None).clicked() {
                     set_cookie = true;

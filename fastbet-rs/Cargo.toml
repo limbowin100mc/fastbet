@@ -1,6 +1,6 @@
 [package]
 name = "fastbet"
-version = "3.2.1"
+version = "3.3.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false
@@ -31,7 +31,7 @@ parking_lot = "0.12"
 thiserror = "2"
 
 # http + images (slot providers, game tiles)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking", "cookies"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # casino logos (bundled SVGs, rasterised at the size they're drawn)
 resvg = { version = "0.48", default-features = false }

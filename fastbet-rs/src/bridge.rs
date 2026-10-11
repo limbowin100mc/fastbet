@@ -75,6 +75,7 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
         Out(String),
         Eval(String),
         Show(bool),
+        Cookies(String),
     }
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -132,6 +133,10 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
                     }
                 } else if line.trim() == "QUIT" {
                     std::process::exit(0);
+                } else if let Some(url) = line.strip_prefix("COOKIES ") {
+                    if proxy.send_event(UserEvent::Cookies(url.trim().to_string())).is_err() {
+                        break;
+                    }
                 } else if matches!(line.trim(), "SHOW" | "HIDE") {
                     if proxy.send_event(UserEvent::Show(line.trim() == "SHOW")).is_err() {
                         break;
@@ -148,6 +153,16 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::Out(line)) => {
                 println!("{line}");
+                let _ = std::io::stdout().flush();
+            }
+            Event::UserEvent(UserEvent::Cookies(url)) => {
+                // `COOKIES <url>`: the cookies the browser holds for it, HttpOnly ones included
+                // (not used by the app: a way to get real cookies when testing the browser login)
+                let list: Vec<BridgeCookie> = webview
+                    .cookies_for_url(&url)
+                    .map(|cs| cs.iter().map(|c| BridgeCookie { name: c.name().to_string(), value: c.value().to_string(), domain: c.domain().unwrap_or("").to_string() }).collect())
+                    .unwrap_or_default();
+                println!("COOKIES {}", serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()));
                 let _ = std::io::stdout().flush();
             }
             Event::UserEvent(UserEvent::Eval(js)) => {

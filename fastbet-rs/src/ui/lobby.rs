@@ -6,6 +6,7 @@ use super::theme::{self, alpha, mix, G1, MUTED, TEXT, TEXT2};
 use super::widgets;
 use super::App;
 use crate::money;
+use crate::originals::Game as Original;
 use crate::slots::Provider;
 
 const CARD_W: f32 = 264.0;
@@ -30,6 +31,15 @@ struct Game {
 pub fn show(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     widgets::dot_grid(ui, full);
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let top = ui.max_rect().top();
+        let used = content(app, ui, Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), top + 10_000.0)));
+        ui.allocate_space(vec2(full.width(), used));
+    });
+}
+
+/// Draws the lobby from the top of `full`; returns the height used.
+fn content(app: &mut App, ui: &mut Ui, full: Rect) -> f32 {
     let p = ui.painter_at(full);
     widgets::glow(&p, pos2(full.left() + 160.0, full.top() - 60.0), 560.0, alpha(G1, 22));
 
@@ -41,7 +51,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     y += 52.0;
 
     let id = app.casino();
-    let providers: Vec<&str> = Provider::SUPPORTED.iter().map(|p| Provider::display_producer(p)).collect();
+    let providers: Vec<&str> = id.slot_producers().iter().map(|p| Provider::display_producer(p)).collect();
     let mut games = vec![
         Game {
             key: "limbo",
@@ -63,8 +73,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             key: "slots",
             name: "Slots",
             tag: "Autoplay",
-            badge: format!("{} providers", providers.len()),
-            line: providers.join(" · "),
+            badge: if providers.len() == 1 { providers[0].to_string() } else { format!("{} providers", providers.len()) },
+            line: if id.slots_curated() { format!("Every {} game, real or demo", providers.join(" · ")) } else { providers.join(" · ") },
             colors: [
                 Color32::from_rgb(0xa8, 0x6b, 0xff),
                 Color32::from_rgb(0x7f, 0x45, 0xf0),
@@ -93,6 +103,70 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             }
         }
     }
+    let rows = games.len().div_ceil(cols) as f32;
+    y += rows * (CARD_H + GAP) - GAP + 36.0;
+    if !id.originals().is_empty() {
+        y = originals(app, ui, x0, y, avail);
+    }
+    y - full.top() + 30.0
+}
+
+const TILE_W: f32 = 132.0;
+const TILE_H: f32 = 172.0;
+const TILE_GAP: f32 = 14.0;
+
+/// The casino's originals as artwork tiles, Limbo first. Returns the bottom edge.
+fn originals(app: &mut App, ui: &mut Ui, x0: f32, mut y: f32, avail: f32) -> f32 {
+    let id = app.casino();
+    let p = ui.painter();
+    p.text(pos2(x0, y), Align2::LEFT_CENTER, "Originals", theme::font_semi(14.0), TEXT2);
+    let gw = p.layout_no_wrap("Originals".into(), theme::font_semi(14.0), TEXT2).size().x;
+    let games: Vec<Option<Original>> = std::iter::once(None).chain(id.originals().iter().copied().map(Some)).collect();
+    p.text(pos2(x0 + gw + 8.0, y), Align2::LEFT_CENTER, games.len().to_string(), theme::font_semi(12.0), theme::DIM);
+    y += 22.0;
+    let cols = ((avail + TILE_GAP) / (TILE_W + TILE_GAP)).floor().max(1.0) as usize;
+    let mut open: Option<Option<Original>> = None;
+    for (i, g) in games.iter().enumerate() {
+        let col = (i % cols) as f32;
+        let row = (i / cols) as f32;
+        let rect = Rect::from_min_size(pos2(x0 + col * (TILE_W + TILE_GAP), y + row * (TILE_H + TILE_GAP)), vec2(TILE_W, TILE_H));
+        let slug = g.map(|g| g.slug()).unwrap_or("limbo");
+        let name = g.map(|g| g.name()).unwrap_or("Limbo");
+        let art = app.orig.catalog.iter().find(|c| c.id == slug).map(|c| c.image.clone()).unwrap_or_default();
+        if original_tile(app, ui, rect, slug, name, &art).clicked() {
+            open = Some(*g);
+        }
+    }
+    match open {
+        Some(Some(g)) => app.go_original(g),
+        Some(None) => app.go_limbo(),
+        None => {}
+    }
+    y + games.len().div_ceil(cols) as f32 * (TILE_H + TILE_GAP) - TILE_GAP
+}
+
+/// An original's tile: the casino's artwork, or its name on a gradient while that loads.
+fn original_tile(app: &mut App, ui: &mut Ui, rect: Rect, slug: &str, name: &str, art: &str) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(("orig-tile", slug)), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("lift"), resp.hovered(), 0.12);
+    let r = rect.translate(vec2(0.0, -3.0 * t));
+    let p = ui.painter();
+    widgets::shadow(p, r, 12, 6.0 + 4.0 * t, 14.0 + 8.0 * t, (90.0 + 50.0 * t) as u8);
+    match app.images.get(ui.ctx(), art) {
+        Some(tex) => {
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            p.add(egui::epaint::RectShape::filled(r, CornerRadius::same(12), Color32::WHITE).with_texture(tex.id(), uv));
+        }
+        None => {
+            let base = Color32::from_rgb(0x1e, 0x3a, 0x5f);
+            widgets::gradient_rect(p, r, 12, [mix(base, G1, 0.25), base, mix(base, Color32::BLACK, 0.3), mix(base, Color32::BLACK, 0.45)]);
+            let g = p.layout(name.to_string(), theme::font_bold(17.0), Color32::WHITE, r.width() - 16.0);
+            let size = g.size();
+            p.galley(pos2(r.center().x - size.x / 2.0, r.center().y - size.y / 2.0), g, Color32::WHITE);
+        }
+    }
+    p.rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0, alpha(Color32::WHITE, (20.0 + 70.0 * t) as u8)), StrokeKind::Inside);
+    resp.on_hover_text(name.to_string()).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn trim_pct(v: f64) -> String {

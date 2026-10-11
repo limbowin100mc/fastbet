@@ -5,6 +5,7 @@ use std::time::{Instant, SystemTime};
 
 use crate::engine::BetRecord;
 use crate::money::{to_f64, Units};
+use crate::originals::Game;
 
 pub const HISTORY_MAX: usize = 500;
 const SERIES_MAX: usize = 4000;
@@ -218,13 +219,6 @@ impl History {
         self.version += 1;
     }
 
-    pub fn latest_bet(&self) -> Option<(u64, &BetRecord)> {
-        self.entries.iter().find_map(|e| match e {
-            HistEntry::Bet { n, rec } => Some((*n, rec)),
-            _ => None,
-        })
-    }
-
     pub fn recent_bets(&self, n: usize) -> impl Iterator<Item = &BetRecord> {
         self.entries
             .iter()
@@ -233,6 +227,19 @@ impl History {
                 _ => None,
             })
             .take(n)
+    }
+
+    /// The latest bet on `game` (`None`: Limbo).
+    pub fn latest_for(&self, game: Option<Game>) -> Option<(u64, &BetRecord)> {
+        self.entries.iter().find_map(|e| match e {
+            HistEntry::Bet { n, rec } if rec.game == game => Some((*n, rec)),
+            _ => None,
+        })
+    }
+
+    /// The latest `n` bets on `game` (`None`: Limbo), newest first.
+    pub fn recent_for(&self, game: Option<Game>, n: usize) -> impl Iterator<Item = &BetRecord> {
+        self.recent_bets(usize::MAX).filter(move |r| r.game == game).take(n)
     }
 }
 

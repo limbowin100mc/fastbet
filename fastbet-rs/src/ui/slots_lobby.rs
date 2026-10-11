@@ -12,6 +12,8 @@ use crate::slots::{Provider, SlotGame};
 pub const TILE_W: f32 = 132.0;
 pub const TILE_H: f32 = 164.0;
 const GAP: f32 = 12.0;
+/// Games per catalog request (Stake allows at most 50).
+pub const PAGE: usize = 50;
 
 #[derive(Default)]
 pub struct Catalog {
@@ -36,8 +38,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         app.catalog.retry_at = Some(Instant::now());
         app.request_slots_initial();
     }
-    // the first request can race the socket; retry until the lists are in
-    if app.catalog.loading == 0 && (app.catalog.featured.is_empty() || app.catalog.all.is_empty()) {
+    // the first request can race the socket; retry until the lists are in (a curated catalog has no featured list)
+    let featured_missing = !app.casino().slots_curated() && app.catalog.featured.is_empty();
+    if app.catalog.loading == 0 && (featured_missing || app.catalog.all.is_empty()) {
         if app.catalog.retry_at.map(|t| t.elapsed() > Duration::from_secs(2)).unwrap_or(true) {
             app.catalog.retry_at = Some(Instant::now());
             app.request_slots_initial();
@@ -59,8 +62,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     widgets::glow(&p, pos2(full.left() + 160.0, full.top() - 60.0), 560.0, alpha(Color32::from_rgb(0x8b, 0x5c, 0xf6), 22));
     let x0 = full.left() + 40.0;
     p.text(pos2(x0, full.top() + 40.0), Align2::LEFT_TOP, "Slots", theme::font_bold(28.0), TEXT);
-    let names: Vec<&str> = Provider::SUPPORTED.iter().map(|p| Provider::display_producer(p)).collect();
-    p.text(pos2(x0, full.top() + 82.0), Align2::LEFT_TOP, format!("Autoplay {}. Others show as Untested.", names.join(", ")), theme::font(13.5), MUTED);
+    let casino = app.casino();
+    let names: Vec<&str> = casino.slot_producers().iter().map(|p| Provider::display_producer(p)).collect();
+    let sub = if casino.slots_curated() {
+        format!("Autoplay any {} game on {}. No animations, no delays.", names.join(", "), casino.name())
+    } else {
+        format!("Autoplay {}. Others show as Untested.", names.join(", "))
+    };
+    p.text(pos2(x0, full.top() + 82.0), Align2::LEFT_TOP, sub, theme::font(13.5), MUTED);
     let hero = Rect::from_min_size(full.min, vec2(full.width(), 118.0));
 
     // search, right-aligned on the title row
@@ -81,7 +90,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 p.line_segment([r.center() + vec2(2.0, 2.0), r.center() + vec2(5.5, 5.5)], Stroke::new(1.5, MUTED));
                 let edit = egui::TextEdit::singleline(&mut app.catalog.query)
                     .frame(Frame::NONE)
-                    .hint_text(egui::RichText::new("Search slot games").color(DIM))
+                    .hint_text(egui::RichText::new(if casino.slots_curated() { format!("Search {} games", names.join(", ")) } else { "Search slot games".into() }).color(DIM))
                     .font(theme::font(13.0))
                     .margin(Margin::same(0))
                     .desired_width(ui.available_width());
@@ -106,12 +115,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 let games = app.catalog.results.clone();
                 section(app, ui, &format!("Results for \"{}\"", app.catalog.query.trim()), &games, app.catalog.loading > 0);
             } else {
-                let featured = app.catalog.featured.clone();
-                let names: Vec<&str> = Provider::SUPPORTED.iter().map(|p| Provider::display_producer(p)).collect();
-                section(app, ui, &format!("Tested · {}", names.join(", ")), &featured, app.catalog.loading > 0 && featured.is_empty());
-                ui.add_space(10.0);
+                if !casino.slots_curated() {
+                    let featured = app.catalog.featured.clone();
+                    section(app, ui, &format!("Tested · {}", names.join(", ")), &featured, app.catalog.loading > 0 && featured.is_empty());
+                    ui.add_space(10.0);
+                }
                 let all = app.catalog.all.clone();
-                section(app, ui, "All video slots", &all, app.catalog.loading > 0 && all.is_empty());
+                let title = if casino.slots_curated() { format!("{} · most played this week", names.join(", ")) } else { "All video slots".into() };
+                section(app, ui, &title, &all, app.catalog.loading > 0 && all.is_empty());
                 if !app.catalog.all_done && !all.is_empty() {
                     ui.add_space(8.0);
                     if button(ui, if app.catalog.loading > 0 { "Loading…" } else { "Load more" }, Btn::Ghost, app.catalog.loading == 0, Some(140.0)).clicked() {
@@ -153,6 +164,7 @@ fn section(app: &mut App, ui: &mut Ui, title: &str, games: &[SlotGame], loading:
 
 fn tile(app: &mut App, ui: &mut Ui, rect: Rect, g: &SlotGame) -> egui::Response {
     let supported = Provider::for_producer(&g.producer).is_some();
+    let curated = app.casino().slots_curated();
     let resp = ui.interact(rect, egui::Id::new(("slot-tile", &g.id, rect.min.y as i32)), Sense::click());
     let hovered = resp.hovered();
     let p = ui.painter();
@@ -172,16 +184,18 @@ fn tile(app: &mut App, ui: &mut Ui, rect: Rect, g: &SlotGame) -> egui::Response 
             let size = galley.size();
             p.galley(pos2(rect.center().x - size.x / 2.0, rect.center().y - size.y / 2.0), galley, TEXT);
             if app.images.failed(&g.image) {
-                p.text(pos2(rect.center().x, rect.bottom() - 14.0), Align2::CENTER_CENTER, g.producer.clone(), theme::font(9.5), DIM);
+                p.text(pos2(rect.center().x, rect.bottom() - 14.0), Align2::CENTER_CENTER, g.maker(), theme::font(9.5), DIM);
             }
         }
     }
     p.rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, if hovered { if supported { G1 } else { LINE2 } } else { alpha(Color32::BLACK, 90) }), StrokeKind::Inside);
-    // badges
-    let (bt, bc) = if supported { ("Tested", GREEN) } else { ("Untested", RED) };
-    let b1 = Rect::from_min_size(rect.left_top() + vec2(5.0, 5.0), vec2(50.0, 15.0));
-    p.rect_filled(b1, CornerRadius::same(4), alpha(bc, 200));
-    p.text(b1.center(), Align2::CENTER_CENTER, bt, theme::font_semi(9.0), Color32::WHITE);
+    // badges; in a curated catalog every game is playable, so only the edge shows
+    if !curated {
+        let (bt, bc) = if supported { ("Tested", GREEN) } else { ("Untested", RED) };
+        let b1 = Rect::from_min_size(rect.left_top() + vec2(5.0, 5.0), vec2(50.0, 15.0));
+        p.rect_filled(b1, CornerRadius::same(4), alpha(bc, 200));
+        p.text(b1.center(), Align2::CENTER_CENTER, bt, theme::font_semi(9.0), Color32::WHITE);
+    }
     if g.rtp > 0.0 {
         let txt = format!("Edge: {:.2}%", 100.0 - g.rtp);
         let b2 = Rect::from_min_size(pos2(rect.right() - 63.0, rect.top() + 5.0), vec2(58.0, 15.0));
@@ -189,5 +203,10 @@ fn tile(app: &mut App, ui: &mut Ui, rect: Rect, g: &SlotGame) -> egui::Response 
         p.text(b2.center(), Align2::CENTER_CENTER, txt, theme::font_semi(9.0), Color32::WHITE);
     }
     let _ = (BG3, GOLD, DIM);
-    resp.on_hover_text(if supported { g.name.clone() } else { format!("{} — {} is not supported yet", g.name, g.producer) }).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let tip = match (supported, &g.studio) {
+        (true, Some(studio)) => format!("{} · {studio}", g.name),
+        (true, None) => g.name.clone(),
+        (false, _) => format!("{} — {} is not supported yet", g.name, g.producer),
+    };
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }

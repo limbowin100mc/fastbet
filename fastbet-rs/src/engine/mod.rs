@@ -12,9 +12,12 @@ use tokio::task::JoinHandle;
 
 use crate::casino::{self, BetRequest, Casino, CasinoError, CasinoEvent, CasinoId, ConnStatus, Market, ProvableState};
 use crate::money::{fmt_multi, mul_f, scale_pct, Units};
+use crate::originals::{Game, Round, Step, Tables};
 
 const BUSY_RETRIES: u32 = 8;
 pub const MAX_QUEUE: usize = 10;
+/// Longest wait before force restart tries again after passes that settled nothing.
+const RESTART_WAIT_MAX: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub enum Command {
@@ -25,8 +28,19 @@ pub enum Command {
     /// Cloudflare cookie from the user's browser, or none.
     SetClearance(Option<crate::cloudflare::Clearance>),
     Bet { req: BetRequest, hit_line: Option<f64> },
+    /// A round of an original: settles at once, or opens one that `OriginalStep`s carry on.
+    Original { bet: OriginalBet, hit_line: Option<f64> },
+    /// Next move in the open round of an original, or its cash out.
+    OriginalStep { game: Game, step: Step, params: serde_json::Value },
+    /// Picks up a round of `game` left open (answered with `Event::Round` when there is one).
+    OriginalResume(Game),
+    /// Payout tables and the casino's list of originals.
+    OriginalInfo,
     StartAuto(AutoConfig),
     StopAuto,
+    /// Force restart betting. `always`: a run that ends by itself starts again from the base bet.
+    /// `on_error`: an error doesn't end the run, it bets on with the same bet size and counters.
+    ForceRestart { always: bool, on_error: bool },
     /// Finish the run after the next winning bet.
     StopOnNextWin,
     TogglePause,
@@ -70,6 +84,31 @@ pub enum Event {
     Slots { kind: SlotListKind, skip: usize, games: Vec<crate::slots::SlotGame>, error: Option<String> },
     Slot(slots::SlotState),
     Spin(slots::SpinRecord),
+    /// Every answer about an original's round, open or settled (settled ones also come as `Bet`).
+    Round(Round),
+    /// A bet or step of an original failed (the engine flashes why); the board stops waiting.
+    RoundFailed { game: Game },
+    OriginalTables(Tables),
+    Originals(Vec<crate::slots::SlotGame>),
+}
+
+/// A bet on an original, before the casino adds its own fields.
+#[derive(Clone, Debug)]
+pub struct OriginalBet {
+    pub game: Game,
+    pub currency: String,
+    pub amount: Units,
+    /// The game's own fields (tiles, risk, target …).
+    pub params: serde_json::Value,
+    /// Part of an auto run.
+    pub auto: bool,
+}
+
+/// What a bet is placed on.
+#[derive(Clone, Debug)]
+enum Wager {
+    Limbo(BetRequest),
+    Original(OriginalBet),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,12 +131,41 @@ pub struct BetRecord {
     pub payout: Units,
     pub profit: Units,
     pub ms: f64,
+    /// The original it was placed on; `None` for Limbo.
+    pub game: Option<Game>,
+    /// The original's settled round, for its board and history.
+    pub round: Option<Arc<Round>>,
+}
+
+impl BetRecord {
+    /// A settled round of an original. A round wins when it pays back at least the stake.
+    pub fn from_round(r: &Round, ms: f64, hit_line: Option<f64>) -> Self {
+        let stake = r.stake();
+        Self {
+            at: SystemTime::now(),
+            nonce: None,
+            currency: r.currency.clone(),
+            target: r.multiplier,
+            outcome: r.multiplier,
+            win: r.multiplier >= 1.0,
+            hit: hit_line.is_some_and(|l| r.multiplier >= l),
+            amount: stake,
+            payout: r.payout,
+            profit: r.payout - stake,
+            ms,
+            game: Some(r.game),
+            round: Some(Arc::new(r.clone())),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct AutoConfig {
     pub currency: String,
+    /// Limbo's target; unused when `original` is set.
     pub target: f64,
+    /// Auto bets on an original instead of Limbo: the game and its fields for every bet.
+    pub original: Option<(Game, serde_json::Value)>,
     pub base: Units,
     /// 0 = no limit
     pub limit: u32,
@@ -124,6 +192,10 @@ pub struct AutoState {
     pub last_hit: Option<f64>,
     /// Armed by "Stop on next win".
     pub stop_on_win: bool,
+    /// Times force restart started the run again.
+    pub restarts: u32,
+    /// Errors the run bet on through (force restart on errors).
+    pub errors: u32,
 }
 
 #[derive(Debug)]
@@ -152,6 +224,17 @@ impl EngineHandle {
 
 type Repaint = Arc<dyn Fn() + Send + Sync>;
 type KeepGoing = Arc<dyn Fn() -> bool + Send + Sync>;
+type BetSet = tokio::task::JoinSet<Result<Option<BetRecord>, BetError>>;
+
+/// How one pass of an auto run ended.
+enum Ending {
+    /// Stop, Stop on next win, or another run took over: nothing more to do.
+    Stopped,
+    /// The run ended by itself (a stop, its number of bets, an error): force restart starts it again.
+    Over(String),
+    /// The casino kept a round open: only the user can finish it, on the board.
+    Stuck(String),
+}
 
 struct Engine {
     casino: Mutex<Option<Arc<dyn Casino>>>,
@@ -176,6 +259,8 @@ struct Engine {
     auto_cfg: Mutex<Option<AutoConfig>>,
     auto_run: AtomicU64,
     auto_wake: Notify,
+    force_restart: AtomicBool,
+    restart_on_error: AtomicBool,
 
     slot: Mutex<slots::SlotState>,
     slot_session: tokio::sync::Mutex<Option<Arc<dyn crate::slots::SlotSession>>>,
@@ -207,6 +292,8 @@ impl Engine {
             auto_cfg: Mutex::new(None),
             auto_run: AtomicU64::new(0),
             auto_wake: Notify::new(),
+            force_restart: AtomicBool::new(false),
+            restart_on_error: AtomicBool::new(false),
             slot: Mutex::new(slots::SlotState::default()),
             slot_session: tokio::sync::Mutex::new(None),
             slot_run: AtomicU64::new(0),
@@ -281,7 +368,7 @@ impl Engine {
                     let me = self.clone();
                     tokio::spawn(async move {
                         let keep: KeepGoing = Arc::new(|| true);
-                        match me.place_bet(req, hit_line, keep).await {
+                        match me.place_bet(Wager::Limbo(req), hit_line, keep).await {
                             Ok(_) | Err(BetError::Cancelled) => {}
                             Err(BetError::Other(e)) => {
                                 tracing::warn!("bet failed: {e}");
@@ -290,8 +377,60 @@ impl Engine {
                         }
                     });
                 }
+                Command::Original { bet, hit_line } => {
+                    if self.auto.lock().running {
+                        continue;
+                    }
+                    if self.queued.load(Ordering::SeqCst) >= MAX_QUEUE {
+                        self.flash(format!("{MAX_QUEUE} bets already queued"));
+                        continue;
+                    }
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let game = bet.game;
+                        let keep: KeepGoing = Arc::new(|| true);
+                        match me.place_bet(Wager::Original(bet), hit_line, keep).await {
+                            Ok(_) => {}
+                            Err(BetError::Cancelled) => me.emit(Event::RoundFailed { game }),
+                            Err(BetError::Other(e)) => me.original_failed(game, e).await,
+                        }
+                    });
+                }
+                Command::OriginalStep { game, step, params } => {
+                    tokio::spawn(self.clone().original_step(game, step, params));
+                }
+                Command::OriginalResume(game) => {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let Ok(casino) = me.casino() else { return };
+                        match casino.original_active(game).await {
+                            Ok(Some(round)) => me.emit(Event::Round(round)),
+                            Ok(None) => {}
+                            Err(e) => tracing::info!("no open {} round: {e}", game.name()),
+                        }
+                    });
+                }
+                Command::OriginalInfo => {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let Ok(casino) = me.casino() else { return };
+                        match casino.original_tables().await {
+                            Ok(t) => me.emit(Event::OriginalTables(t)),
+                            Err(e) => tracing::info!("payout tables: {e}"),
+                        }
+                        match casino.list_originals().await {
+                            Ok(list) if !list.is_empty() => me.emit(Event::Originals(list)),
+                            Ok(_) => {}
+                            Err(e) => tracing::info!("originals list: {e}"),
+                        }
+                    });
+                }
                 Command::StartAuto(cfg) => self.start_auto(cfg),
                 Command::StopAuto => self.stop_auto("Stopped"),
+                Command::ForceRestart { always, on_error } => {
+                    self.force_restart.store(always, Ordering::SeqCst);
+                    self.restart_on_error.store(on_error, Ordering::SeqCst);
+                }
                 Command::StopOnNextWin => {
                     let mut a = self.auto.lock();
                     if a.running {
@@ -433,7 +572,8 @@ impl Engine {
 
     // ------------------------------------------------------------- bets
 
-    async fn place_bet(&self, req: BetRequest, hit_line: Option<f64>, keep_going: KeepGoing) -> Result<BetRecord, BetError> {
+    /// Places one bet through the lane. `Ok(None)`: an original's round opened and waits for steps.
+    async fn place_bet(&self, wager: Wager, hit_line: Option<f64>, keep_going: KeepGoing) -> Result<Option<BetRecord>, BetError> {
         /// Counts the bet out even when the future is dropped mid-flight
         /// (a stopped auto run aborts its JoinSet), so the queue never sticks.
         struct Queued<'a>(&'a Engine);
@@ -446,10 +586,10 @@ impl Engine {
         let n = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
         self.emit(Event::Queue(n));
         let _queued = Queued(self);
-        self.place_bet_inner(req, hit_line, keep_going).await
+        self.place_bet_inner(wager, hit_line, keep_going).await
     }
 
-    async fn place_bet_inner(&self, req: BetRequest, hit_line: Option<f64>, keep_going: KeepGoing) -> Result<BetRecord, BetError> {
+    async fn place_bet_inner(&self, wager: Wager, hit_line: Option<f64>, keep_going: KeepGoing) -> Result<Option<BetRecord>, BetError> {
         if !keep_going() {
             return Err(BetError::Cancelled);
         }
@@ -475,7 +615,11 @@ impl Engine {
         let mut attempt = 0u32;
         let (reply, ms) = loop {
             let t0 = Instant::now();
-            match casino.bet_limbo(&req).await {
+            let res = match &wager {
+                Wager::Limbo(req) => casino.bet_limbo(req).await.map(Reply::Limbo),
+                Wager::Original(b) => casino.original_bet(b.game, &b.currency, b.amount, b.params.clone(), b.auto).await.map(Reply::Original),
+            };
+            match res {
                 Ok(r) => break (r, t0.elapsed().as_secs_f64() * 1000.0),
                 Err(e) if e.is_busy() && attempt < BUSY_RETRIES => {
                     self.emit(Event::Retry);
@@ -494,6 +638,26 @@ impl Engine {
             }
         };
 
+        let (req, reply) = match (wager, reply) {
+            (Wager::Limbo(req), Reply::Limbo(reply)) => (req, reply),
+            (_, Reply::Original(mut round)) => {
+                self.emit(Event::Round(round.clone()));
+                // bonus spins need no decisions: play them out
+                let mut spins = 0;
+                while round.active && round.game.plays_itself() && spins < 500 {
+                    spins += 1;
+                    round = casino.original_step(round.game, Step::Next, serde_json::json!({})).await.map_err(BetError::from)?;
+                    self.emit(Event::Round(round.clone()));
+                }
+                if round.active {
+                    return Ok(None);
+                }
+                let record = BetRecord::from_round(&round, ms, hit_line);
+                self.emit(Event::Bet(record.clone()));
+                return Ok(Some(record));
+            }
+            (Wager::Original(_), Reply::Limbo(_)) => unreachable!("a Limbo reply to an original's bet"),
+        };
         // The reply's `multiplier` is the payout multiplier (0 on a loss), so the
         // target is always the autoCashout we sent.
         let amount = reply.amount.unwrap_or(req.amount);
@@ -514,9 +678,63 @@ impl Engine {
             payout,
             profit: payout - amount,
             ms,
+            game: None,
+            round: None,
         };
         self.emit(Event::Bet(record.clone()));
-        Ok(record)
+        Ok(Some(record))
+    }
+
+    /// A manual bet on an original failed. An open round is the usual cause: show it so it can be finished.
+    async fn original_failed(&self, game: Game, error: String) {
+        tracing::warn!("{} bet failed: {error}", game.name());
+        self.emit(Event::RoundFailed { game });
+        if error == CasinoError::RoundOpen.to_string() {
+            if let Ok(casino) = self.casino() {
+                if let Ok(Some(r)) = casino.original_active(game).await {
+                    self.emit(Event::Round(r));
+                }
+            }
+            self.flash("Finish the open round first");
+        } else {
+            self.flash(error);
+        }
+    }
+
+    /// Reveal, guess or cash out in the open round of an original. Goes through the lane so a
+    /// seed change never lands in the middle of it.
+    async fn original_step(self: Arc<Self>, game: Game, step: Step, params: serde_json::Value) {
+        let _lane = self.lane.read().await;
+        let res = async {
+            let casino = self.casino().map_err(|_| "No casino connected".to_string())?;
+            let mut attempt = 0u32;
+            loop {
+                let t0 = Instant::now();
+                match casino.original_step(game, step, params.clone()).await {
+                    Ok(r) => return Ok((r, t0.elapsed().as_secs_f64() * 1000.0)),
+                    Err(e) if e.is_busy() && attempt < BUSY_RETRIES => {
+                        self.emit(Event::Retry);
+                        tokio::time::sleep(Duration::from_millis((50u64 << attempt).min(1000))).await;
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        .await;
+        match res {
+            Ok((round, ms)) => {
+                self.emit(Event::Round(round.clone()));
+                if !round.active {
+                    self.emit(Event::Bet(BetRecord::from_round(&round, ms, None)));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("{} step failed: {e}", game.name());
+                self.emit(Event::RoundFailed { game });
+                self.flash(e);
+            }
+        }
     }
 
     // ------------------------------------------------------------- autobet
@@ -543,6 +761,8 @@ impl Engine {
                 hits: 0,
                 last_hit: None,
                 stop_on_win: false,
+                restarts: 0,
+                errors: 0,
             };
         }
         *self.auto_cfg.lock() = Some(cfg.clone());
@@ -582,38 +802,99 @@ impl Engine {
         self.auto_run.load(Ordering::SeqCst) == run && self.auto.lock().running
     }
 
-    async fn worker(self: Arc<Self>, run: u64, cfg: AutoConfig) {
+    /// Runs `cfg` until it ends; with force restart on, starts it again each time it ends by itself.
+    async fn worker(self: Arc<Self>, mut run: u64, cfg: AutoConfig) {
+        // passes in a row that settled nothing (the casino may be down): wait longer before each try
+        let mut idle: u32 = 0;
+        loop {
+            let mut set = BetSet::new();
+            let (ending, settled) = self.auto_pass(run, &cfg, &mut set).await;
+            let msg = match ending {
+                Ending::Stopped => return,
+                Ending::Stuck(m) => return self.stop_auto(m),
+                Ending::Over(m) => m,
+            };
+            if !self.force_restart.load(Ordering::SeqCst) || !self.auto_live(run) {
+                return self.stop_auto(msg);
+            }
+            // a new run id cancels this pass's bets not sent yet; the ones sent still settle
+            run = self.auto_run.fetch_add(1, Ordering::SeqCst) + 1;
+            while set.join_next().await.is_some() {}
+            idle = if settled == 0 { idle + 1 } else { 0 };
+            // the run's own delay between bets, longer after passes that settled nothing
+            let wait = if idle > 0 {
+                let wait = Duration::from_secs(1 << (idle - 1).min(3)).min(RESTART_WAIT_MAX);
+                self.auto.lock().msg = format!("{msg} · next try in {}s", wait.as_secs());
+                self.emit_auto();
+                wait
+            } else {
+                Duration::from_millis(cfg.delay_ms)
+            };
+            if !wait.is_zero() {
+                // Stop wakes it
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = self.auto_wake.notified() => {}
+                }
+            }
+            if !self.auto_live(run) {
+                return;
+            }
+            tracing::info!("auto: force restart after \"{msg}\"");
+            {
+                let mut a = self.auto.lock();
+                a.done = 0;
+                a.profit = 0;
+                a.stake = cfg.base;
+                a.hits = 0;
+                a.restarts += 1;
+                a.msg = format!("Restarted: {msg}");
+            }
+            self.emit_auto();
+        }
+    }
+
+    /// One pass of an auto run: from the base bet until something ends it. Returns how it
+    /// ended and how many bets it settled.
+    async fn auto_pass(self: &Arc<Self>, run: u64, cfg: &AutoConfig, set: &mut BetSet) -> (Ending, u32) {
         let keep: KeepGoing = {
             let me = self.clone();
             Arc::new(move || me.auto_live(run))
         };
-        // A progressive stake depends on the previous result, so it stays sequential.
-        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some();
-        let mut set: tokio::task::JoinSet<Result<BetRecord, BetError>> = tokio::task::JoinSet::new();
+        // A progressive stake depends on the previous result, so it stays sequential. So does an
+        // original with steps: the casino holds one round of it at a time.
+        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some() || cfg.original.as_ref().is_some_and(|(g, _)| g.has_steps());
         let mut inflight: u32 = 0;
         let mut launched: u32 = 0;
-        loop {
+        let mut settled: u32 = 0;
+        // errors since the last settled bet (force restart on errors)
+        let mut errors_in_row: u32 = 0;
+        let ending = loop {
             if !self.auto_live(run) {
-                return;
+                break Ending::Stopped;
             }
             let paused = self.auto.lock().paused;
             let width = if progressive { 1 } else { self.concurrency.load(Ordering::SeqCst).max(1) };
             let under_limit = cfg.limit == 0 || launched < cfg.limit;
             if !paused && inflight < width && under_limit {
                 let amount = self.auto.lock().stake;
-                if amount <= 0 {
-                    return self.stop_auto("Bet size hit 0");
+                // a run that starts at 0 plays for free on purpose; one that shrank to 0 is over
+                if amount <= 0 && cfg.base > 0 {
+                    break Ending::Over("Bet size hit 0".into());
                 }
                 if let Some(max) = cfg.max_bet {
                     if amount > max {
-                        return self.stop_auto("Next bet over max bet");
+                        break Ending::Over("Next bet over max bet".into());
                     }
                 }
-                let req = BetRequest { currency: cfg.currency.clone(), amount, target: cfg.target };
+                let wager = match &cfg.original {
+                    Some((game, params)) => Wager::Original(OriginalBet { game: *game, currency: cfg.currency.clone(), amount, params: params.clone(), auto: true }),
+                    None => Wager::Limbo(BetRequest { currency: cfg.currency.clone(), amount, target: cfg.target }),
+                };
                 let me = self.clone();
                 let k = keep.clone();
                 let hit_line = cfg.hit_line;
-                set.spawn(async move { me.place_bet(req, hit_line, k).await });
+                set.spawn(async move { me.place_bet(wager, hit_line, k).await });
                 inflight += 1;
                 launched += 1;
                 continue;
@@ -624,7 +905,7 @@ impl Engine {
                     continue;
                 }
                 // nothing left to launch and nothing in flight
-                return self.stop_auto("Done");
+                break Ending::Over("Done".into());
             }
             let res = match set.join_next().await {
                 Some(Ok(r)) => r,
@@ -635,19 +916,48 @@ impl Engine {
             };
             inflight -= 1;
             let r = match res {
-                Ok(r) => r,
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    // the casino kept the round open (it wanted more picks than were given)
+                    if self.auto_live(run) {
+                        break Ending::Stuck("The round stayed open; finish it on the board".into());
+                    }
+                    break Ending::Stopped;
+                }
                 Err(BetError::Cancelled) => continue,
                 Err(BetError::Other(e)) => {
                     tracing::warn!("auto bet failed: {e}");
-                    if self.auto_live(run) {
-                        let msg = if e.starts_with("Seed") { e } else { format!("Error: {e}") };
-                        self.stop_auto(msg);
+                    if !self.auto_live(run) {
+                        break Ending::Stopped;
                     }
-                    return;
+                    let msg = if e.starts_with("Seed") { e } else { format!("Error: {e}") };
+                    if !self.restart_on_error.load(Ordering::SeqCst) {
+                        break Ending::Over(msg);
+                    }
+                    // bet on through it: the failed bet is placed again, with the same bet size and
+                    // counters; errors in a row wait longer each time (Stop ends the wait)
+                    launched = launched.saturating_sub(1);
+                    errors_in_row += 1;
+                    let wait = if errors_in_row > 1 { Duration::from_secs(1 << (errors_in_row - 2).min(3)).min(RESTART_WAIT_MAX) } else { Duration::ZERO };
+                    {
+                        let mut a = self.auto.lock();
+                        a.errors += 1;
+                        a.msg = if wait.is_zero() { format!("{msg} · betting on") } else { format!("{msg} · next try in {}s", wait.as_secs()) };
+                    }
+                    self.emit_auto();
+                    if !wait.is_zero() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = self.auto_wake.notified() => {}
+                        }
+                    }
+                    continue;
                 }
             };
+            settled += 1;
+            errors_in_row = 0;
             if self.auto_run.load(Ordering::SeqCst) != run {
-                return;
+                break Ending::Stopped;
             }
             let (profit, done, hit, stop_on_win) = {
                 let mut a = self.auto.lock();
@@ -665,33 +975,42 @@ impl Engine {
             };
             if hit && self.auto_live(run) {
                 self.auto.lock().last_hit = Some(r.outcome);
-                return self.stop_auto(format!("HIT {}", fmt_multi(r.outcome)));
+                break Ending::Over(format!("HIT {}", fmt_multi(r.outcome)));
             }
+            // asked for, like Stop: force restart leaves it stopped
             if stop_on_win && r.win && self.auto_live(run) {
-                return self.stop_auto("Stopped on win");
+                self.stop_auto("Stopped on win");
+                break Ending::Stopped;
             }
             if !self.auto_live(run) {
-                return;
+                break Ending::Stopped;
             }
             if let Some(sp) = cfg.stop_profit {
                 if profit >= sp {
-                    return self.stop_auto("Stop profit reached");
+                    break Ending::Over("Stop profit reached".into());
                 }
             }
             if let Some(sl) = cfg.stop_loss {
                 if -profit >= sl {
-                    return self.stop_auto("Stop loss reached");
+                    break Ending::Over("Stop loss reached".into());
                 }
             }
             if cfg.limit > 0 && done >= cfg.limit {
-                return self.stop_auto("Done");
+                break Ending::Over("Done".into());
             }
             self.emit_auto();
             if cfg.delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(cfg.delay_ms)).await;
             }
-        }
+        };
+        (ending, settled)
     }
+}
+
+/// The casino's answer to a bet.
+enum Reply {
+    Limbo(casino::BetReply),
+    Original(Round),
 }
 
 fn random_seed() -> String {

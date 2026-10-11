@@ -38,11 +38,12 @@ pub struct Sections {
     pub seed: bool,
     pub keys: bool,
     pub account: bool,
+    pub restart: bool,
 }
 
 impl Default for Sections {
     fn default() -> Self {
-        Self { general: true, strategy: false, count: false, stops: false, seed: false, keys: false, account: false }
+        Self { general: true, strategy: false, count: false, stops: false, seed: false, keys: false, account: false, restart: false }
     }
 }
 
@@ -85,6 +86,10 @@ pub struct Settings {
     pub hide_empty: bool,
     /// Async mode: how many bets may be in flight at once (1 = sequential).
     pub async_bets: u32,
+    /// Force restart betting: an auto run that ends by itself (not by Stop) starts again.
+    pub force_restart: bool,
+    /// Force restart on errors: an error doesn't end an auto run, it bets on.
+    pub restart_on_error: bool,
 
     // slots
     pub slot_demo: bool,
@@ -95,6 +100,109 @@ pub struct Settings {
     pub slot_stop_loss: String,
     /// Per game: last bet level and feature, keyed by catalog id.
     pub slot_prefs: BTreeMap<String, SlotPrefs>,
+
+    /// The originals' own settings (risk, rows, picked tiles …).
+    pub orig: OriginalPrefs,
+}
+
+/// What each original's board was last set to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OriginalPrefs {
+    pub dice_target: String,
+    pub dice_over: bool,
+    pub keno_risk: String,
+    /// Picked numbers, 0-based (the casino's numbering; the board shows 1–40).
+    pub keno_picks: Vec<u8>,
+    /// Auto: new random numbers for every bet.
+    pub keno_random: bool,
+    pub mines_count: u8,
+    /// Auto: tiles revealed by every bet.
+    pub mines_picks: Vec<u8>,
+    pub plinko_risk: String,
+    pub plinko_rows: u8,
+    pub wheel_risk: String,
+    pub wheel_segments: u8,
+    pub dragon_difficulty: String,
+    /// Auto: the egg picked on each row, bottom first.
+    pub dragon_path: Vec<u8>,
+    pub pump_difficulty: String,
+    /// Auto: pumps before cashing out.
+    pub pump_pumps: u8,
+    /// Auto: the calls for each flip ("heads" / "tails").
+    pub flip_calls: Vec<String>,
+    pub cases_difficulty: String,
+    pub darts_difficulty: String,
+    pub tarot_difficulty: String,
+    pub bars_difficulty: String,
+    /// Bars: picked tiles, 0-based.
+    pub bars_tiles: Vec<u8>,
+    /// Drill: the drill picked (1–3) and the depth it has to reach.
+    pub drill_pick: u8,
+    pub drill_target: String,
+    pub primedice_condition: String,
+    /// Primedice: range edges, two or four used.
+    pub primedice_targets: Vec<String>,
+    pub chicken_difficulty: String,
+    /// Auto: lanes to cross before cashing out.
+    pub chicken_lanes: u8,
+    pub snakes_difficulty: String,
+    /// Auto: rolls before cashing out.
+    pub snakes_rolls: u8,
+    pub moles_count: u8,
+    /// Auto: the hole hit each round.
+    pub moles_picks: Vec<u8>,
+    /// Auto: the hands thrown, in order.
+    pub rps_calls: Vec<String>,
+    /// Baccarat: the sides the stake goes on.
+    pub baccarat_sides: Vec<String>,
+    /// Roulette: chips per bet spot, in units of the bet size.
+    pub roulette_chips: BTreeMap<String, u32>,
+    pub scarab_lines: u8,
+    pub tome_lines: u8,
+}
+
+impl Default for OriginalPrefs {
+    fn default() -> Self {
+        Self {
+            dice_target: "50.50".into(),
+            dice_over: true,
+            keno_risk: "classic".into(),
+            keno_picks: vec![],
+            keno_random: false,
+            mines_count: 3,
+            mines_picks: vec![],
+            plinko_risk: "medium".into(),
+            plinko_rows: 16,
+            wheel_risk: "medium".into(),
+            wheel_segments: 30,
+            dragon_difficulty: "easy".into(),
+            dragon_path: vec![],
+            pump_difficulty: "easy".into(),
+            pump_pumps: 3,
+            flip_calls: vec!["heads".into()],
+            cases_difficulty: "easy".into(),
+            darts_difficulty: "easy".into(),
+            tarot_difficulty: "easy".into(),
+            bars_difficulty: "easy".into(),
+            bars_tiles: vec![],
+            drill_pick: 2,
+            drill_target: "2".into(),
+            primedice_condition: "rollBetween".into(),
+            primedice_targets: vec!["25".into(), "75".into(), "".into(), "".into()],
+            chicken_difficulty: "easy".into(),
+            chicken_lanes: 3,
+            snakes_difficulty: "easy".into(),
+            snakes_rolls: 3,
+            moles_count: 3,
+            moles_picks: vec![],
+            rps_calls: vec!["rock".into()],
+            baccarat_sides: vec!["banker".into()],
+            roulette_chips: BTreeMap::new(),
+            scarab_lines: 20,
+            tome_lines: 20,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -135,6 +243,8 @@ impl Default for Settings {
             open: Sections::default(),
             hide_empty: false,
             async_bets: 1,
+            force_restart: false,
+            restart_on_error: false,
             slot_demo: true,
             slot_stop_mult_on: false,
             slot_stop_mult: "100".into(),
@@ -142,6 +252,7 @@ impl Default for Settings {
             slot_stop_profit: String::new(),
             slot_stop_loss: String::new(),
             slot_prefs: Default::default(),
+            orig: OriginalPrefs::default(),
         }
     }
 }

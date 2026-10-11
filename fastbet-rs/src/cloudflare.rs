@@ -1,9 +1,13 @@
-//! Cloudflare clearance copied by hand from the user's own browser, for when
-//! a casino's Cloudflare check never passes inside the app's bridge.
+//! The user's own browser, copied by hand: its User Agent and its cookies for a
+//! casino mirror, for when the casino's Cloudflare check doesn't let the app's
+//! bridge through.
 //!
-//! Cloudflare ties the `cf_clearance` cookie to the browser's User Agent, the
-//! IP address that passed the check and the domain it was issued on, so the
-//! bridge presents the same User Agent and only sends the cookie to that domain.
+//! Cloudflare ties its cookies (`cf_clearance` after a solved check, `__cf_bm`
+//! from its bot detection) to the browser's User Agent, the IP address and the
+//! domain they were issued on. With the same User Agent, from the same IP, on
+//! the same mirror, a plain HTTPS client carrying them is let through the way
+//! that browser is. When the browser was logged in, its cookie line also holds
+//! the casino's own login (Stake: `session`), which then works as the token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +16,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub const COOKIE: &str = "cf_clearance";
+/// Cloudflare's bot-detection cookie; with the matching User Agent it lets requests through too.
+pub const BOT_COOKIE: &str = "__cf_bm";
+/// Stake keeps the website login in this cookie; the site sends it as `x-access-token`.
+pub const SESSION_COOKIE: &str = "session";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,7 +27,8 @@ pub struct Clearance {
     /// Domain the cookie was issued on (a casino mirror).
     pub mirror: String,
     pub user_agent: String,
-    /// Value of the `cf_clearance` cookie.
+    /// The browser's cookies for the mirror as a cookie line (`a=1; b=2`). Older
+    /// versions saved the bare `cf_clearance` value here.
     pub cookie: String,
 }
 
@@ -31,30 +40,91 @@ impl Clearance {
 
     /// Checks and cleans what the user pasted. `Ok(None)` when both fields are empty.
     pub fn from_input(mirror: &str, user_agent: &str, cookie: &str) -> Result<Option<Self>, String> {
-        let (user_agent, cookie) = (clean_user_agent(user_agent), clean_cookie(cookie));
-        match (user_agent.is_empty(), cookie.is_empty()) {
+        let user_agent = clean_user_agent(user_agent);
+        let pairs = parse_cookies(cookie);
+        match (user_agent.is_empty(), cookie.trim().is_empty()) {
             (true, true) => return Ok(None),
-            (true, false) => return Err("Paste the User Agent too, the cookie only works with it.".into()),
-            (false, true) => return Err(format!("Paste the {COOKIE} cookie too.")),
+            (true, false) => return Err("Paste the User Agent too, the cookies only work with it.".into()),
+            (false, true) => return Err("Paste the cookies too.".into()),
             _ => {}
         }
         if !user_agent.starts_with("Mozilla/") {
             return Err("That isn't a browser User Agent (it starts with Mozilla/5.0).".into());
         }
-        if !cookie.chars().all(|c| c.is_ascii_graphic() && !matches!(c, ';' | ',' | '"' | '\\')) {
-            return Err(format!("That isn't a {COOKIE} value."));
+        if pairs.is_empty() {
+            return Err(format!("That isn't a cookie line or a {COOKIE} value."));
         }
+        if !pairs.iter().any(|(k, _)| k == COOKIE || k == BOT_COOKIE || k == SESSION_COOKIE) {
+            return Err(format!("Those cookies have no {COOKIE}, {BOT_COOKIE} or {SESSION_COOKIE} in them. Copy the cookie line of a request to the casino."));
+        }
+        let cookie = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ");
         Ok(Some(Self { mirror: mirror.to_string(), user_agent, cookie }))
+    }
+
+    /// The cookies to send, as name and value.
+    pub fn cookies(&self) -> Vec<(String, String)> {
+        parse_cookies(&self.cookie)
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.cookies().into_iter().find(|(k, _)| k == name).map(|(_, v)| v).filter(|v| !v.is_empty())
+    }
+
+    /// The casino login the browser was in, when its cookie line came with it.
+    pub fn session(&self) -> Option<String> {
+        self.get(SESSION_COOKIE)
+    }
+
+    /// A Cloudflare cookie is among them (without one, Cloudflare won't let a plain client through).
+    pub fn has_cloudflare(&self) -> bool {
+        self.get(COOKIE).is_some() || self.get(BOT_COOKIE).is_some()
     }
 }
 
-/// A bare value, `cf_clearance=<value>`, or a whole Cookie header -> the value.
-fn clean_cookie(s: &str) -> String {
+/// What logs the account in: the token typed, or else the session of a logged-in browser's
+/// cookies. A typed token that is just the session pasted last time gives way to the new one.
+pub fn pick_login(typed: &str, session: Option<String>, old_session: Option<String>) -> Option<String> {
+    match session {
+        Some(s) if typed.is_empty() || old_session.as_deref() == Some(typed) => Some(s),
+        _ => (!typed.is_empty()).then(|| typed.to_string()),
+    }
+}
+
+/// What the user pasted as cookies -> name/value pairs. Takes a cookie line
+/// (`a=1; b=2`, with or without `Cookie:` in front), rows of DevTools' cookie
+/// table (name, tab, value …), or a bare value, which is taken as `cf_clearance`.
+pub fn parse_cookies(s: &str) -> Vec<(String, String)> {
     let s = s.trim();
     let s = strip_prefix_ci(s, "cookie:").unwrap_or(s);
-    let prefix = format!("{COOKIE}=");
-    let value = s.split(';').map(str::trim).find_map(|kv| kv.strip_prefix(prefix.as_str())).unwrap_or(s);
-    value.trim().trim_matches('"').chars().filter(|c| !c.is_whitespace()).collect()
+    let valid_name = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '$'));
+    let valid_value = |v: &str| v.chars().all(|c| c.is_ascii_graphic() && !matches!(c, ';' | ',' | '"' | '\\'));
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |k: &str, v: &str| {
+        let (k, v) = (k.trim(), v.trim().trim_matches('"'));
+        if valid_name(k) && valid_value(v) && !v.is_empty() {
+            out.retain(|(name, _)| name != k);
+            out.push((k.to_string(), v.to_string()));
+        }
+    };
+    if s.contains('=') {
+        for part in s.split([';', '\n']) {
+            if let Some((k, v)) = part.split_once('=') {
+                push(k, v);
+            }
+        }
+    } else if s.contains('\t') {
+        // rows copied from DevTools' cookie table: name, value, domain …
+        for row in s.lines() {
+            let cells: Vec<&str> = row.split('\t').collect();
+            if cells.len() >= 2 {
+                push(cells[0], cells[1]);
+            }
+        }
+    } else {
+        let v: String = s.trim_matches('"').chars().filter(|c| !c.is_whitespace()).collect();
+        push(COOKIE, &v);
+    }
+    out
 }
 
 /// Accepts the value as a header (`User-Agent: ...`) or Cloudflare's trace line (`uag=...`) too.
@@ -68,28 +138,6 @@ fn clean_user_agent(s: &str) -> String {
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then(|| s[prefix.len()..].trim_start())
-}
-
-/// The browser a User Agent names, with its major version: `("Chrome", 141)`.
-pub fn browser_of(user_agent: &str) -> Option<(&'static str, u32)> {
-    // Edge and Opera also say Chrome, so they're looked for first
-    const NAMES: &[(&str, &str)] = &[("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"), ("Version/", "Safari")];
-    NAMES.iter().find_map(|(token, name)| {
-        let rest = &user_agent[user_agent.find(token)? + token.len()..];
-        let major = rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
-        Some((*name, major))
-    })
-}
-
-/// Major version of the Edge engine (WebView2) the bridge runs on, on Windows.
-pub fn edge_engine() -> Option<u32> {
-    static VERSION: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *VERSION.get_or_init(|| {
-        if !cfg!(windows) {
-            return None;
-        }
-        wry::webview_version().ok()?.split('.').next()?.parse().ok()
-    })
 }
 
 /// Cloudflare's info page on a domain: the visitor's IP (`ip=`) and User Agent (`uag=`).
@@ -145,9 +193,14 @@ mod tests {
             assert_eq!(clean_user_agent(&pasted), ua, "{pasted:?}");
         }
         let v = "Ab3_x.Yz-1760000000-1.2.1.1-QWE.rty_123";
+        let clearance = |c: &[(String, String)]| c.iter().find(|(k, _)| k == COOKIE).map(|(_, v)| v.clone());
         for pasted in [v.to_string(), format!("cf_clearance={v}"), format!("Cookie: __cf_bm=zzz; cf_clearance={v}; _ga=1"), format!(" {v}\n")] {
-            assert_eq!(clean_cookie(&pasted), v, "{pasted:?}");
+            assert_eq!(clearance(&parse_cookies(&pasted)).as_deref(), Some(v), "{pasted:?}");
         }
+        let line = parse_cookies("cookie: session=abc123; __cf_bm=b.m-1; currency_currency=usdt; bad cookie; x=");
+        assert_eq!(line, vec![("session".into(), "abc123".into()), ("__cf_bm".into(), "b.m-1".into()), ("currency_currency".into(), "usdt".into())]);
+        let table = parse_cookies("__cf_bm\tb.m-1\t.stake.bet\t/\nsession\tabc\tstake.bet\t/");
+        assert_eq!(table, vec![("__cf_bm".into(), "b.m-1".into()), ("session".into(), "abc".into())]);
     }
 
     #[test]
@@ -159,8 +212,26 @@ mod tests {
         assert!(Clearance::from_input("stake.com", "curl/8", "abc").is_err());
         assert!(Clearance::from_input("stake.com", ua, "a,b").is_err());
         let c = Clearance::from_input("stake.com", ua, "cf_clearance=abc").unwrap().unwrap();
-        assert_eq!((c.mirror.as_str(), c.user_agent.as_str(), c.cookie.as_str()), ("stake.com", ua, "abc"));
-        assert!(c.is_complete());
+        assert_eq!((c.mirror.as_str(), c.user_agent.as_str(), c.cookie.as_str()), ("stake.com", ua, "cf_clearance=abc"));
+        assert!(c.is_complete() && c.has_cloudflare() && c.session().is_none());
+        // an older save holds the bare value
+        let old = Clearance { mirror: "stake.com".into(), user_agent: ua.into(), cookie: "abc".into() };
+        assert_eq!(old.cookies(), vec![(COOKIE.to_string(), "abc".to_string())]);
+        // a logged-in browser's cookie line carries the login
+        let logged = Clearance::from_input("stake.bet", ua, "session=s3ss; __cf_bm=bm; _ga=x").unwrap().unwrap();
+        assert_eq!(logged.session().as_deref(), Some("s3ss"));
+        assert!(logged.has_cloudflare());
+        assert!(Clearance::from_input("stake.bet", ua, "_ga=1; _gid=2").is_err(), "nothing that helps in it");
+    }
+
+    #[test]
+    fn login_choice() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(pick_login("api", None, None), s("api"));
+        assert_eq!(pick_login("", s("sess"), None), s("sess"), "the browser login stands in for a token");
+        assert_eq!(pick_login("api", s("sess"), None), s("api"), "a token typed wins");
+        assert_eq!(pick_login("old", s("new"), s("old")), s("new"), "a newer browser login replaces the last one");
+        assert_eq!(pick_login("", None, None), None);
     }
 
     #[test]
@@ -169,19 +240,5 @@ mod tests {
         assert_eq!(trace_field(body, "ip").as_deref(), Some("185.125.177.122"));
         assert_eq!(trace_field(body, "uag").as_deref(), Some("Mozilla/5.0 (X)"));
         assert_eq!(trace_field(body, "loc"), None);
-    }
-
-    #[test]
-    fn names_browsers() {
-        let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
-        assert_eq!(browser_of(chrome), Some(("Chrome", 141)));
-        assert_eq!(browser_of(&format!("{chrome} Edg/141.0.0.0")), Some(("Edge", 141)));
-        assert_eq!(browser_of(&format!("{chrome} OPR/124.0.0.0")), Some(("Opera", 124)));
-        assert_eq!(browser_of("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"), Some(("Firefox", 143)));
-        assert_eq!(
-            browser_of("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"),
-            Some(("Safari", 18))
-        );
-        assert_eq!(browser_of("Mozilla/5.0 (X11; Linux x86_64)"), None);
     }
 }
