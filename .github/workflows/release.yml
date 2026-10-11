@@ -78,9 +78,13 @@ jobs:
 
       # Ubuntu 22.04's libxkbcommon can't read the keymaps of newer Wayland
       # desktops (KDE on CachyOS), which made the app crash on the first key press.
-      - name: Use the system's keyboard library in the AppImage
+      # Its libwayland is too old for the Mesa of Arch-based distros, which then
+      # can't load: the login window stayed blank there.
+      - name: Use the system's keyboard and Wayland libraries in the AppImage
         if: runner.os == 'Linux'
-        run: bash packaging/appimage-drop-libs.sh "$(find target/release -maxdepth 3 -type f -name '*.AppImage' | head -1)" libxkbcommon.so.0
+        run: >-
+          bash packaging/appimage-drop-libs.sh "$(find target/release -maxdepth 3 -type f -name '*.AppImage' | head -1)"
+          libxkbcommon.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1 libwayland-server.so.0
 
       - name: Collect files
         run: |

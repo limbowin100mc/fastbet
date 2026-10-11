@@ -7,6 +7,12 @@
 # desktops send (KDE Plasma on Arch / CachyOS). winit then has no keymap and
 # panics on the first key press. Every desktop that runs GTK has its own copy.
 #
+# libwayland-*: the bundled 1.20 lacks functions (wl_display_create_queue_with_name,
+# 1.23) that Arch / CachyOS Mesa needs and binds at load (-z now), so the
+# system's EGL and Vulkan drivers fail to load next to it: the login window's
+# web process aborts ("Could not create default EGL display") and stays blank.
+# GTK depends on these on every distro, so the system always has them.
+#
 # usage: appimage-drop-libs.sh <file.AppImage> <library>...
 set -euo pipefail
 

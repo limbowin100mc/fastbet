@@ -7,10 +7,11 @@
 //! stdout. The parent verifies each token against the casino API and kills
 //! the child as soon as one logs in.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::casino::CasinoId;
 
@@ -47,6 +48,19 @@ pub(crate) fn attach<'a>(builder: wry::WebViewBuilder<'a>, window: &'a tao::wind
     }
     #[cfg(not(target_os = "linux"))]
     builder.build(window)
+}
+
+/// The AppImage's GTK hook forces `GDK_BACKEND=x11`, and GTK can't start at all on a Wayland
+/// desktop without XWayland (niri, some Hyprland setups): the login window never appeared. There
+/// GTK goes back to Wayland. Runs before any thread or GTK window exists; children inherit it.
+pub fn pick_gtk_backend() {
+    #[cfg(target_os = "linux")]
+    {
+        let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+        if std::env::var("GDK_BACKEND").as_deref() == Ok("x11") && !set("DISPLAY") && set("WAYLAND_DISPLAY") {
+            std::env::set_var("GDK_BACKEND", "wayland");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- child side
@@ -348,6 +362,8 @@ pub struct LoginReport {
 pub struct LoginSession {
     child: Child,
     rx: mpsc::Receiver<LoginReport>,
+    /// The window's last stderr lines, to say why it closed if it crashed.
+    errors: Arc<Mutex<VecDeque<String>>>,
     /// The last token we handed to the engine for verification.
     pub tried: Option<String>,
     /// Latest report from the window.
@@ -359,7 +375,7 @@ impl LoginSession {
     pub fn spawn(id: CasinoId, url: &str, profile: &str, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
-        cmd.arg("--login").arg(id.key()).arg(url).arg(profile).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        cmd.arg("--login").arg(id.key()).arg(url).arg(profile).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -381,7 +397,22 @@ impl LoginSession {
                 repaint();
             }
         });
-        Ok(Self { child, rx, tried: None, last: LoginReport::default() })
+        // passed on to our stderr (seen when the app runs from a terminal), the tail kept
+        let errors = Arc::new(Mutex::new(VecDeque::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let errors = errors.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let _ = writeln!(std::io::stderr(), "[login window] {line}");
+                    let mut e = errors.lock().unwrap();
+                    if e.len() == 40 {
+                        e.pop_front();
+                    }
+                    e.push_back(line);
+                }
+            });
+        }
+        Ok(Self { child, rx, errors, tried: None, last: LoginReport::default() })
     }
 
     /// Reports the login window sent since the last poll (latest last).
@@ -396,6 +427,28 @@ impl LoginSession {
     /// True once the user closed the login window.
     pub fn finished(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Once the window is gone: why, if it crashed or never opened (closing it by hand exits
+    /// cleanly). The last thing it printed, e.g. a GTK or WebKit error.
+    pub fn crash(&mut self) -> Option<String> {
+        let status = self.child.try_wait().ok().flatten()?;
+        if status.success() {
+            return None;
+        }
+        // the reader thread may still be draining the pipe
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let errors = self.errors.lock().unwrap();
+        let line = errors
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with("note: run with") && !l.starts_with("stack backtrace"))
+            .map(|l| l.trim_start_matches("login window failed: ").to_string());
+        Some(match line {
+            Some(l) => l.chars().take(300).collect(),
+            None => format!("it exited with {status}"),
+        })
     }
 
     pub fn close(&mut self) {

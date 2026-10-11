@@ -1197,7 +1197,10 @@ impl App {
                     self.key_input = self.settings.token().unwrap_or_default();
                     self.go_lobby();
                 } else if finished {
-                    self.cancel_login("The login window was closed before you logged in.");
+                    match session.crash() {
+                        Some(why) => self.cancel_login(&format!("The login window failed: {why}")),
+                        None => self.cancel_login("The login window was closed before you logged in."),
+                    }
                 }
             }
         }
