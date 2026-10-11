@@ -18,8 +18,10 @@ pub const MAX_QUEUE: usize = 10;
 
 #[derive(Debug)]
 pub enum Command {
-    SetCasino { id: CasinoId, token: Option<String> },
+    SetCasino { id: CasinoId, token: Option<String>, mirror: Option<String> },
     SetToken(Option<String>),
+    /// Reconnect through another of the casino's domains.
+    SetMirror(String),
     Bet { req: BetRequest, hit_line: Option<f64> },
     StartAuto(AutoConfig),
     StopAuto,
@@ -113,15 +115,11 @@ pub struct AutoState {
     pub paused: bool,
     pub msg: String,
     pub done: u32,
-    pub limit: u32,
     pub profit: Units,
     pub stake: Units,
-    pub currency: String,
     pub hits: u32,
     /// Outcome of the hit that ended the last run.
     pub last_hit: Option<f64>,
-    /// True when on-win / on-loss changes the stake (so "next bet" is worth showing).
-    pub progressive: bool,
     /// Armed by "Stop on next win".
     pub stop_on_win: bool,
 }
@@ -254,10 +252,15 @@ impl Engine {
     async fn command_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::SetCasino { id, token } => self.set_casino(id, token),
+                Command::SetCasino { id, token, mirror } => self.set_casino(id, token, mirror),
                 Command::SetToken(token) => {
                     if let Some(c) = self.casino.lock().clone() {
                         c.set_token(token);
+                    }
+                }
+                Command::SetMirror(mirror) => {
+                    if let Some(c) = self.casino.lock().clone() {
+                        c.set_mirror(&mirror);
                     }
                 }
                 Command::Bet { req, hit_line } => {
@@ -356,7 +359,7 @@ impl Engine {
         }
     }
 
-    fn set_casino(self: &Arc<Self>, id: CasinoId, token: Option<String>) {
+    fn set_casino(self: &Arc<Self>, id: CasinoId, token: Option<String>, mirror: Option<String>) {
         if let Some(old) = self.casino.lock().take() {
             old.shutdown();
         }
@@ -369,7 +372,7 @@ impl Engine {
         self.emit_seed();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<CasinoEvent>();
-        let casino = casino::connect(id, token, tx);
+        let casino = casino::connect(id, token, mirror, tx);
         tracing::info!("connecting to {}", casino.id().name());
         *self.casino.lock() = Some(casino);
 
@@ -528,13 +531,10 @@ impl Engine {
                 paused: false,
                 msg: "Running".into(),
                 done: 0,
-                limit: cfg.limit,
                 profit: 0,
                 stake: cfg.base,
-                currency: cfg.currency.clone(),
                 hits: 0,
                 last_hit: None,
-                progressive: cfg.on_win.is_some() || cfg.on_loss.is_some(),
                 stop_on_win: false,
             };
         }

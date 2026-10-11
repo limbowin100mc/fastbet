@@ -53,6 +53,8 @@ pub struct Settings {
     pub tokens: BTreeMap<String, String>,
     /// Last seen username per casino, for the account list.
     pub usernames: BTreeMap<String, String>,
+    /// Chosen domain per casino that has mirrors (Stake).
+    pub mirrors: BTreeMap<String, String>,
 
     pub mode: Mode,
     /// Empty = follow the currency selected on the site.
@@ -105,6 +107,7 @@ impl Default for Settings {
             casino: CasinoId::ChipsGg,
             tokens: Default::default(),
             usernames: Default::default(),
+            mirrors: Default::default(),
             mode: Mode::Manual,
             currency: String::new(),
             unit: Unit::Coin,
@@ -181,6 +184,13 @@ impl Settings {
 
     pub fn token_mut(&mut self) -> &mut String {
         self.tokens.entry(self.casino.key().to_string()).or_default()
+    }
+
+    /// Domain to reach the current casino on, for casinos with mirrors.
+    pub fn mirror(&self) -> Option<String> {
+        let default = self.casino.default_mirror()?;
+        let saved = self.mirrors.get(self.casino.key()).map(|m| crate::casino::stake::normalize_mirror(m)).filter(|m| !m.is_empty());
+        Some(saved.unwrap_or_else(|| default.to_string()))
     }
 
     /// Bets between automatic seed changes, 0 = off.

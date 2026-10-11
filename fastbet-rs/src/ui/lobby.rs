@@ -42,7 +42,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     let id = app.casino();
     let providers: Vec<&str> = Provider::SUPPORTED.iter().map(|p| Provider::display_producer(p)).collect();
-    let games = [
+    let mut games = vec![
         Game {
             key: "limbo",
             name: "Limbo",
@@ -57,7 +57,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ],
             art: Art::Limbo,
         },
-        Game {
+    ];
+    if id.has_slots() {
+        games.push(Game {
             key: "slots",
             name: "Slots",
             tag: "Autoplay",
@@ -70,8 +72,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 Color32::from_rgb(0x2a, 0x12, 0x78),
             ],
             art: Art::Slots,
-        },
-    ];
+        });
+    }
 
     p.text(pos2(x0, y), Align2::LEFT_CENTER, "Games", theme::font_semi(14.0), TEXT2);
     let gw = p.layout_no_wrap("Games".into(), theme::font_semi(14.0), TEXT2).size().x;

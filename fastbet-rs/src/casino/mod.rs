@@ -3,9 +3,11 @@
 //! here and one variant to [`CasinoId`].
 
 pub mod chipsgg;
+pub mod stake;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -17,20 +19,23 @@ use crate::money::Units;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CasinoId {
     ChipsGg,
+    Stake,
 }
 
 impl CasinoId {
-    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg];
+    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake];
 
     pub fn key(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "chipsgg",
+            CasinoId::Stake => "stake",
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            CasinoId::ChipsGg => "chips.gg",
+            CasinoId::ChipsGg => "Chips.gg",
+            CasinoId::Stake => "Stake.com",
         }
     }
 
@@ -38,17 +43,48 @@ impl CasinoId {
         Self::ALL.iter().copied().find(|id| id.key() == key)
     }
 
+    /// Domains the casino can be reached on; empty when there is only one.
+    pub fn mirrors(self) -> &'static [&'static str] {
+        match self {
+            CasinoId::ChipsGg => &[],
+            CasinoId::Stake => stake::MIRRORS,
+        }
+    }
+
+    pub fn default_mirror(self) -> Option<&'static str> {
+        self.mirrors().first().copied()
+    }
+
+    /// Whether the account can also be linked through the embedded login window.
+    pub fn window_login(self) -> bool {
+        matches!(self, CasinoId::ChipsGg)
+    }
+
+    pub fn has_slots(self) -> bool {
+        matches!(self, CasinoId::ChipsGg)
+    }
+
+    /// What the casino calls the credential the user pastes.
+    pub fn key_label(self) -> &'static str {
+        match self {
+            CasinoId::ChipsGg => "API key",
+            CasinoId::Stake => "API token",
+        }
+    }
+
     /// Page the embedded login window opens.
     pub fn login_url(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "https://chips.gg/",
+            CasinoId::Stake => "https://stake.com/",
         }
     }
 
-    /// Where the user creates an API key.
-    pub fn api_key_url(self) -> &'static str {
+    /// Where the user creates an API key, on the given mirror.
+    pub fn api_key_url(self, mirror: Option<&str>) -> String {
         match self {
-            CasinoId::ChipsGg => "https://chips.gg/settings/api-keys",
+            CasinoId::ChipsGg => "https://chips.gg/settings/api-keys".into(),
+            CasinoId::Stake => format!("https://{}/settings/security", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
         }
     }
 
@@ -140,6 +176,8 @@ impl CasinoId {
   }, 400);
 })();"#
             }
+            // Stake links with an API token only
+            CasinoId::Stake => "",
         }
     }
 
@@ -147,25 +185,26 @@ impl CasinoId {
     pub fn token_hint(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "On chips.gg open Settings → API Keys → Create API Key, copy the key (it is shown only once) and paste it here.",
+            CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. It is stored on this PC only.",
         }
     }
 
     pub fn min_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg => 1.01,
+            CasinoId::ChipsGg | CasinoId::Stake => 1.01,
         }
     }
 
     pub fn max_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg => 1_000_000.0,
+            CasinoId::ChipsGg | CasinoId::Stake => 1_000_000.0,
         }
     }
 
     /// Payout multiplier at which the house edge is already deducted (99% RTP).
     pub fn win_chance(self, target: f64) -> f64 {
         match self {
-            CasinoId::ChipsGg => 99.0 / target,
+            CasinoId::ChipsGg | CasinoId::Stake => 99.0 / target,
         }
     }
 }
@@ -282,6 +321,9 @@ pub enum CasinoEvent {
 pub enum CasinoError {
     #[error("{0}")]
     Server(String),
+    /// The casino asked us to slow down; the bet is worth retrying.
+    #[error("{0}")]
+    Busy(String),
     #[error("Not connected")]
     NotConnected,
     #[error("Server timeout")]
@@ -302,6 +344,7 @@ impl CasinoError {
                     .iter()
                     .any(|k| m.contains(k))
             }
+            CasinoError::Busy(_) => true,
             _ => false,
         }
     }
@@ -321,6 +364,8 @@ pub trait Casino: Send + Sync {
     fn id(&self) -> CasinoId;
     /// Swap the login token; the client re-authenticates on its own.
     fn set_token(&self, token: Option<String>);
+    /// Switch to another of the casino's domains (see [`CasinoId::mirrors`]).
+    fn set_mirror(&self, _mirror: &str) {}
     /// Close the socket for good.
     fn shutdown(&self);
     async fn bet_limbo(&self, req: &BetRequest) -> Result<BetReply, CasinoError>;
@@ -333,8 +378,16 @@ pub trait Casino: Send + Sync {
 }
 
 /// Spawns the casino's connection tasks on the current tokio runtime.
-pub fn connect(id: CasinoId, token: Option<String>, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
+pub fn connect(id: CasinoId, token: Option<String>, mirror: Option<String>, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
     match id {
         CasinoId::ChipsGg => chipsgg::ChipsGg::spawn(token, events),
+        CasinoId::Stake => stake::Stake::spawn(token, mirror, events),
     }
+}
+
+/// Reconnect delay: 0.3 s doubling up to 5 s.
+fn backoff(retries: &mut u32) -> Duration {
+    let ms = (300u64 << (*retries).min(5)).min(5000);
+    *retries += 1;
+    Duration::from_millis(ms)
 }

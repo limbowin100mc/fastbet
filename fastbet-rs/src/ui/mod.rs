@@ -6,12 +6,14 @@ pub mod controls;
 pub mod images;
 pub mod limbo;
 pub mod lobby;
+pub mod logos;
 pub mod slot;
 pub mod slots_lobby;
 pub mod sound;
 pub mod stats;
 pub mod stats_pane;
 pub mod theme;
+pub mod update;
 pub mod wallet;
 pub mod widgets;
 
@@ -30,11 +32,11 @@ use egui::{pos2, Align, Frame, Key, Layout, Margin, RichText, Stroke};
 use crate::casino::{BetRequest, CasinoId, ConnStatus, CurrencyInfo, Market, ProvableState};
 use crate::engine::{self, AutoConfig, AutoState, Command, EngineHandle, Event, SeedInfo};
 use crate::login::LoginSession;
-use crate::money::{self, fmt_int, format_units, parse_units, to_f64, Units};
+use crate::money::{self, format_units, parse_units, to_f64, Units};
 use crate::settings::{Adjust, Settings, Unit};
 use crate::ui::stats::{History, Stats};
 use theme::{BG, BG1, GREEN, LINE, RED, TEXT2};
-use widgets::{semi, status_dot};
+use widgets::status_dot;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -67,6 +69,10 @@ pub struct App {
     pub onboard_error: Option<String>,
     /// API key being typed on the account screen.
     pub key_input: String,
+    /// Mirror picked on the account screen (casinos with mirrors), and the picker's search.
+    pub mirror_input: String,
+    pub mirror_search: String,
+    pub mirror_open: bool,
 
     pub status: ConnStatus,
     pub status_detail: String,
@@ -87,8 +93,18 @@ pub struct App {
     pub pop_at: Option<Instant>,
     pub token_visible: bool,
     pub wallet_open: bool,
+    /// The account menu above the rail's logo button.
+    pub account_menu_open: bool,
+    /// The gear menu on the welcome screen.
+    pub welcome_menu_open: bool,
+    pub updater: crate::update::Updater,
+    pub update_open: bool,
+    /// When the installer started; the app closes shortly after.
+    pub update_close_at: Option<Instant>,
     pub wallet_search: String,
     pub wallet_search_focused: bool,
+
+    pub logos: logos::Logos,
 
     // slots
     pub images: images::ImageCache,
@@ -122,7 +138,7 @@ impl App {
         };
         let preview: Option<usize> = std::env::var("FASTBET_PREVIEW").ok().map(|v| v.parse().unwrap_or(400));
         if preview.is_none() {
-            engine.send(Command::SetCasino { id: settings.casino, token: settings.token() });
+            engine.send(Command::SetCasino { id: settings.casino, token: settings.token(), mirror: settings.mirror() });
         }
         engine.send(Command::SeedPolicy { every: settings.seed_every() });
         engine.send(Command::SetConcurrency(settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
@@ -138,6 +154,7 @@ impl App {
             screen = Screen::Slot;
         }
 
+        let updater = crate::update::Updater::new(repaint.clone());
         let mut app = Self {
             settings,
             engine,
@@ -146,6 +163,9 @@ impl App {
             stage: Stage::Idle,
             onboard_error: None,
             key_input: String::new(),
+            mirror_input: String::new(),
+            mirror_search: String::new(),
+            mirror_open: false,
             status: ConnStatus::Connecting,
             status_detail: String::new(),
             market: Market::default(),
@@ -162,8 +182,14 @@ impl App {
             pop_at: None,
             token_visible: false,
             wallet_open: std::env::var("FASTBET_WALLET").is_ok(),
+            account_menu_open: std::env::var("FASTBET_ACCOUNT_MENU").is_ok(),
+            welcome_menu_open: std::env::var("FASTBET_WELCOME_MENU").is_ok(),
+            updater,
+            update_open: false,
+            update_close_at: None,
             wallet_search: String::new(),
             wallet_search_focused: false,
+            logos: logos::Logos::default(),
             images: images::ImageCache::new(),
             catalog: slots_lobby::Catalog::default(),
             slot: SlotState::default(),
@@ -176,6 +202,16 @@ impl App {
         };
         if let Some(n) = preview {
             app.load_preview(n);
+        }
+        // FASTBET_MIRRORS=<search>: account settings open with the mirror picker (UI work)
+        if let Ok(q) = std::env::var("FASTBET_MIRRORS") {
+            app.open_settings();
+            app.mirror_open = true;
+            app.mirror_search = if q == "1" { String::new() } else { q };
+        }
+        // FASTBET_UPDATE=1: run "Check for updates" at start (UI work)
+        if std::env::var("FASTBET_UPDATE").is_ok() {
+            app.check_updates();
         }
         app
     }
@@ -233,6 +269,15 @@ impl App {
         self.settings.casino
     }
 
+    /// The casino as the user reaches it: its name, or the mirror's domain when that isn't the main site.
+    pub fn casino_site(&self) -> String {
+        let id = self.casino();
+        match self.settings.mirror() {
+            Some(m) if Some(m.as_str()) != id.default_mirror() => m,
+            _ => id.name().to_string(),
+        }
+    }
+
     pub fn username_for(&self, id: CasinoId) -> Option<String> {
         if id == self.settings.casino {
             if let Some(u) = &self.market.username {
@@ -243,8 +288,11 @@ impl App {
     }
 
     pub fn active_currency(&self) -> String {
-        if !self.settings.currency.is_empty() {
-            self.settings.currency.clone()
+        let picked = &self.settings.currency;
+        // a coin picked on another casino that this one doesn't have
+        let known = self.market.currencies.is_empty() || self.market.currencies.contains_key(picked);
+        if !picked.is_empty() && known {
+            picked.clone()
         } else {
             self.market.site_currency.clone().unwrap_or_default()
         }
@@ -517,18 +565,29 @@ impl App {
         self.market = Market::default();
         self.provable = ProvableState::default();
         self.status = ConnStatus::Connecting;
-        self.engine.send(Command::SetCasino { id, token: self.settings.token() });
+        self.status_detail.clear();
+        self.engine.send(Command::SetCasino { id, token: self.settings.token(), mirror: self.settings.mirror() });
         self.engine.send(Command::SeedPolicy { every: self.settings.seed_every() });
         self.mark_dirty();
     }
 
     // ------------------------------------------------------------ account flow
 
+    /// Opens the update dialog and asks GitHub for the latest release.
+    pub fn check_updates(&mut self) {
+        self.account_menu_open = false;
+        self.welcome_menu_open = false;
+        self.update_open = true;
+        self.updater.check();
+    }
+
     pub fn go_accounts(&mut self) {
         if self.auto.running {
             self.stop_auto();
         }
         self.leave_slot();
+        self.account_menu_open = false;
+        self.wallet_open = false;
         self.stage = Stage::Idle;
         self.onboard_error = None;
         self.screen = Screen::Accounts;
@@ -544,6 +603,9 @@ impl App {
 
     pub fn open_settings(&mut self) {
         self.key_input = self.settings.token().unwrap_or_default();
+        self.mirror_input = self.settings.mirror().unwrap_or_default();
+        self.mirror_search.clear();
+        self.mirror_open = false;
         self.onboard_error = None;
         self.stage = Stage::Settings;
     }
@@ -553,12 +615,20 @@ impl App {
         self.onboard_error = None;
     }
 
-    /// Settings card: Save pressed. Stores the key and runs the connection check.
+    /// Settings card: Save pressed. Stores the key (and mirror) and runs the connection check.
     pub fn save_key(&mut self) {
         let key = self.key_input.trim().to_string();
         if key.is_empty() {
-            self.onboard_error = Some("Paste your API key first.".into());
+            self.onboard_error = Some(format!("Paste your {} first.", self.casino().key_label()));
             return;
+        }
+        self.mirror_open = false;
+        let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
+        if self.settings.mirror().is_some() && !mirror.is_empty() && self.settings.mirror().as_deref() != Some(mirror.as_str()) {
+            self.settings.mirrors.insert(self.casino().key().to_string(), mirror.clone());
+            self.engine.send(Command::SetMirror(mirror));
+            self.status = ConnStatus::Connecting;
+            self.status_detail.clear();
         }
         *self.settings.token_mut() = key;
         self.settings.save();
@@ -1014,13 +1084,17 @@ impl App {
             if widgets::rail_button(ui, self.screen == Screen::Limbo, "Limbo", |p, r, c| widgets::icon(p, r, "trend", c)).clicked() {
                 self.go_limbo();
             }
-            let on_slots = matches!(self.screen, Screen::Slots | Screen::Slot);
-            if widgets::rail_button(ui, on_slots, "Slots", |p, r, c| widgets::icon(p, r, "slots", c)).clicked() {
-                self.go_slots();
+            if self.casino().has_slots() {
+                let on_slots = matches!(self.screen, Screen::Slots | Screen::Slot);
+                if widgets::rail_button(ui, on_slots, "Slots", |p, r, c| widgets::icon(p, r, "slots", c)).clicked() {
+                    self.go_slots();
+                }
             }
             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(9.5).color(theme::DIM));
+                ui.add_space(6.0);
+                self.account_button(ui);
             });
         });
     }
@@ -1043,13 +1117,7 @@ impl App {
                 widgets::pill(ui, format!("{} queued", self.queued), theme::BLUE);
             }
 
-            // right: account
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(u) = self.username_for(self.casino()) {
-                    if self.account_chip(ui, &u).clicked() {
-                        self.go_accounts();
-                    }
-                }
                 // centre: the wallet pill
                 let hr = ui.max_rect();
                 let pill_rect = egui::Rect::from_center_size(pos2(hr.center().x, hr.center().y), egui::vec2(260.0, 34.0));
@@ -1062,100 +1130,114 @@ impl App {
         }
     }
 
-    /// Avatar, username and casino; opens the account list.
-    fn account_chip(&self, ui: &mut egui::Ui, name: &str) -> egui::Response {
-        let casino = self.casino().name();
-        let nw = ui.painter().layout_no_wrap(name.to_string(), theme::font_semi(12.5), TEXT2).size().x;
-        let cw = ui.painter().layout_no_wrap(casino.to_string(), theme::font(10.5), theme::DIM).size().x;
-        let w = 6.0 + 26.0 + 9.0 + nw.max(cw) + 26.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), egui::Sense::click());
+    /// The casino's logo in a circle at the bottom of the rail; opens the account menu.
+    fn account_button(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+        let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered() || self.account_menu_open, 0.1);
         let p = ui.painter();
-        if resp.hovered() {
-            p.rect_filled(rect, egui::CornerRadius::same(10), theme::alpha(egui::Color32::WHITE, 8));
+        let c = rect.center();
+        p.circle_filled(c, 17.0, theme::mix(theme::BG2, theme::BG3, t));
+        let edge = if self.account_menu_open { theme::alpha(GREEN, 170) } else { theme::mix(theme::LINE2, theme::MUTED, t) };
+        p.circle_stroke(c, 17.0, Stroke::new(1.5, edge));
+        self.logos.paint(p, egui::Rect::from_center_size(c, egui::vec2(18.0, 18.0)), self.casino(), theme::TEXT);
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = if self.account_menu_open { resp } else { resp.on_hover_text("Account") };
+        if resp.clicked() {
+            self.account_menu_open = !self.account_menu_open;
         }
-        let av = egui::Rect::from_center_size(pos2(rect.left() + 6.0 + 13.0, rect.center().y), egui::vec2(26.0, 26.0));
-        widgets::paint_avatar(p, av, name);
-        let x = av.right() + 9.0;
-        p.text(pos2(x, rect.center().y - 7.0), egui::Align2::LEFT_CENTER, name, theme::font_semi(12.5), theme::TEXT);
-        p.text(pos2(x, rect.center().y + 8.0), egui::Align2::LEFT_CENTER, casino, theme::font(10.5), theme::DIM);
-        let c = pos2(rect.right() - 12.0, rect.center().y);
-        p.add(egui::Shape::line(vec![c + egui::vec2(-3.5, -1.8), c + egui::vec2(0.0, 1.8), c + egui::vec2(3.5, -1.8)], Stroke::new(1.5, theme::MUTED)));
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Switch account")
+        if self.account_menu_open {
+            self.account_menu(ui, rect);
+        }
     }
 
-    fn status_line(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 7.0;
-            let flash = self.flash.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(6)).map(|(m, _)| m.clone());
-            let notice = self.notice.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(3)).map(|(m, _)| m.clone());
-            let (txt, color) = if let Some(m) = flash {
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
-                (m, RED)
-            } else if let Some(m) = notice {
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
-                (m, GREEN)
-            } else if self.screen == Screen::Slot {
-                let s = &self.slot;
-                if let Some(e) = &s.error {
-                    (e.clone(), RED)
-                } else if s.running || s.done > 0 {
-                    let cur = s.info.as_ref().map(|i| (i.currency.clone(), i.decimals)).unwrap_or(("USD".into(), 2));
-                    (format!("{}  ·  {} spins  ·  {}", s.msg, s.done, crate::slots::fmt_money(s.profit, &cur.0, cur.1)), if s.paused { theme::GOLD } else if s.running { GREEN } else { TEXT2 })
-                } else {
-                    (if s.msg.is_empty() { self.status.long(&self.status_detail) } else { s.msg.clone() }, theme::MUTED)
-                }
-            } else if self.auto.running || (!self.auto.msg.is_empty() && self.auto.done > 0) {
-                let a = &self.auto;
-                let mut s = a.msg.clone();
-                if !a.currency.is_empty() {
-                    s += &format!(
-                        "  ·  {}{} bets  ·  {}",
-                        fmt_int(a.done as i128),
-                        if a.limit > 0 { format!("/{}", fmt_int(a.limit as i128)) } else { String::new() },
-                        self.prim(a.profit, &a.currency, true)
-                    );
-                    if a.running && a.progressive {
-                        s += &format!("  ·  next {}", self.prim(a.stake, &a.currency, false));
-                    }
-                }
-                let color = if a.msg.starts_with("HIT") {
-                    theme::GOLD
-                } else if a.running {
-                    GREEN
-                } else if a.msg.starts_with("Error") {
-                    RED
-                } else {
-                    TEXT2
-                };
-                (s, color)
-            } else {
-                (self.status.long(&self.status_detail), theme::MUTED)
-            };
-            let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-            ui.painter().circle_filled(r.center(), 3.0, color);
-            ui.add(egui::Label::new(semi(txt, 11.5, if color == theme::MUTED { theme::MUTED } else { theme::mix(color, TEXT2, 0.25) })).truncate());
-
-            if self.screen == Screen::Limbo && self.settings.hotkeys {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    for (i, (k, what)) in [("Ctrl+R", "reset"), ("Esc", "stop"), ("P", "pause"), ("Space", "bet")].iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(8.0);
+    /// Pops up beside the rail button: who and where you are, and Switch account.
+    fn account_menu(&mut self, ui: &egui::Ui, anchor: egui::Rect) {
+        let id = self.casino();
+        let name = self.username_for(id).unwrap_or_else(|| "Account".into());
+        let site = self.casino_site();
+        let width = 230.0;
+        let mut switch = false;
+        let mut updates = false;
+        let logos = &mut self.logos;
+        let area = egui::Area::new(egui::Id::new("account-menu"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(pos2(anchor.right() + 14.0, anchor.bottom()))
+            .show(ui.ctx(), |ui| {
+                Frame::new()
+                    .fill(BG1)
+                    .stroke(Stroke::new(1.0, theme::LINE2))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(Margin::same(6))
+                    .shadow(egui::epaint::Shadow { offset: [0, 10], blur: 30, spread: 0, color: egui::Color32::from_black_alpha(170) })
+                    .show(ui, |ui| {
+                        let w = width - 12.0;
+                        ui.set_width(w);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        let (hr, _) = ui.allocate_exact_size(egui::vec2(w, 50.0), egui::Sense::hover());
+                        let p = ui.painter();
+                        let lc = pos2(hr.left() + 24.0, hr.center().y);
+                        p.circle_filled(lc, 16.0, theme::BG2);
+                        p.circle_stroke(lc, 16.0, Stroke::new(1.0, theme::LINE2));
+                        logos.paint(p, egui::Rect::from_center_size(lc, egui::vec2(16.0, 16.0)), id, theme::TEXT);
+                        let x = hr.left() + 50.0;
+                        widgets::fit_text(p, pos2(x, hr.center().y - 8.0), egui::Align2::LEFT_CENTER, &name, theme::font_semi(13.0), theme::TEXT, hr.right() - x - 8.0);
+                        p.text(pos2(x, hr.center().y + 9.0), egui::Align2::LEFT_CENTER, &site, theme::font(11.0), theme::MUTED);
+                        widgets::hsep(ui);
+                        if widgets::menu_item(ui, "swap", "Switch account").clicked() {
+                            switch = true;
                         }
-                        ui.label(RichText::new(*what).size(10.5).color(theme::DIM));
-                        let kw = ui.painter().layout_no_wrap(k.to_string(), theme::font_semi(10.0), theme::MUTED).size().x + 10.0;
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(kw.max(20.0), 17.0), egui::Sense::hover());
-                        widgets::keycap(ui.painter(), r, k, theme::MUTED);
-                    }
-                });
-            }
-        });
+                        if widgets::menu_item(ui, "download", "Check for updates").clicked() {
+                            updates = true;
+                        }
+                    });
+            });
+        // a click anywhere else, or Esc, closes it
+        let rect = area.response.rect;
+        let outside = ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !anchor.contains(p)));
+        if outside || ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.account_menu_open = false;
+        }
+        if switch {
+            self.go_accounts();
+        }
+        if updates {
+            self.check_updates();
+        }
+    }
+
+    /// A short message (a bet error, "Session reset") floating above the bottom of `area`, fading out.
+    fn toast(&self, ui: &egui::Ui, area: egui::Rect) {
+        let flash = self.flash.as_ref().map(|(m, t)| (m, *t, RED, 6.0));
+        let notice = self.notice.as_ref().map(|(m, t)| (m, *t, GREEN, 3.0));
+        let live = |x: &(&String, Instant, egui::Color32, f32)| x.1.elapsed().as_secs_f32() < x.3;
+        let Some((msg, at, color, life)) = flash.filter(live).or(notice.filter(live)) else { return };
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        let age = at.elapsed().as_secs_f32();
+        let fade = ((life - age) / 0.4).clamp(0.0, 1.0) * (age / 0.15).clamp(0.0, 1.0);
+
+        let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("toast")));
+        let g = p.layout_no_wrap(msg.clone(), theme::font_semi(12.0), theme::mix(color, TEXT2, 0.25).gamma_multiply(fade));
+        let w = (g.size().x + 40.0).min(area.width() - 48.0);
+        let r = egui::Rect::from_center_size(pos2(area.center().x, area.bottom() - 36.0), egui::vec2(w, 32.0));
+        p.rect(
+            r,
+            egui::CornerRadius::same(16),
+            BG1.gamma_multiply(fade),
+            Stroke::new(1.0, theme::alpha(color, 90).gamma_multiply(fade)),
+            egui::StrokeKind::Inside,
+        );
+        p.circle_filled(pos2(r.left() + 16.0, r.center().y), 3.5, color.gamma_multiply(fade));
+        p.with_clip_rect(r.shrink(2.0)).galley(pos2(r.left() + 28.0, r.center().y - g.size().y / 2.0), g, TEXT2);
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
+            self.go_lobby();
+        }
         match self.screen {
             Screen::Accounts | Screen::Account => self.onboarding_logic(),
             _ => self.hotkeys(ctx),
@@ -1204,16 +1286,6 @@ impl eframe::App for App {
                         self.top_bar(ui);
                     });
 
-                egui::Panel::bottom("status")
-                    .exact_size(28.0)
-                    .frame(Frame::new().fill(BG1).inner_margin(Margin::symmetric(16, 5)))
-                    .show_separator_line(false)
-                    .show(ui, |ui| {
-                        let r = ui.max_rect();
-                        ui.painter().hline(r.x_range().expand(16.0), r.top() - 5.0, Stroke::new(1.0, LINE));
-                        self.status_line(ui);
-                    });
-
                 egui::Panel::right("stats")
                     .resizable(true)
                     .default_size(280.0)
@@ -1226,14 +1298,19 @@ impl eframe::App for App {
                         stats_pane::show(self, ui)
                     });
 
-                egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| match self.screen {
-                    Screen::Limbo => limbo::show(self, ui),
-                    Screen::Slots => slots_lobby::show(self, ui),
-                    Screen::Slot => slot::show(self, ui),
-                    _ => lobby::show(self, ui),
+                egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| {
+                    let area = ui.max_rect();
+                    match self.screen {
+                        Screen::Limbo => limbo::show(self, ui),
+                        Screen::Slots => slots_lobby::show(self, ui),
+                        Screen::Slot => slot::show(self, ui),
+                        _ => lobby::show(self, ui),
+                    }
+                    self.toast(ui, area);
                 });
             }
         }
+        update::show(self, ui.ctx());
     }
 }
 

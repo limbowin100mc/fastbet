@@ -148,15 +148,6 @@ pub fn wordmark(ui: &mut Ui, size: f32) {
     });
 }
 
-/// Round avatar with initials.
-pub fn paint_avatar(p: &Painter, rect: Rect, name: &str) {
-    let size = rect.height();
-    p.circle_filled(rect.center(), size / 2.0, mix(BG3, G1, 0.18));
-    p.circle_stroke(rect.center(), size / 2.0 - 0.5, Stroke::new(1.0, alpha(G1, 70)));
-    let initials: String = name.chars().take(2).collect::<String>().to_uppercase();
-    p.text(rect.center(), Align2::CENTER_CENTER, initials, theme::font_bold(size * 0.38), G2);
-}
-
 // ----------------------------------------------------------------- pills
 
 pub fn pill(ui: &mut Ui, text: impl Into<String>, color: Color32) -> Response {
@@ -332,6 +323,22 @@ pub fn icon_button(ui: &mut Ui, text: &str, color: Color32, enabled: bool, tip: 
 }
 
 /// Square button with a painted icon (see [`icon`]).
+/// Round button with an icon, lit while `on` (its menu is open).
+pub fn round_icon_button(ui: &mut Ui, icon_name: &str, on: bool, tip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered() || on, 0.1);
+    let p = ui.painter();
+    p.circle_filled(rect.center(), 17.0, mix(BG1, BG2, t));
+    p.circle_stroke(rect.center(), 17.0, Stroke::new(1.0, if on { alpha(G1, 170) } else { mix(LINE, LINE2, t) }));
+    icon(p, Rect::from_center_size(rect.center(), vec2(15.0, 15.0)), icon_name, mix(MUTED, TEXT, t));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if on {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
+}
+
 pub fn glyph_button(ui: &mut Ui, icon_name: &str, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
     let p = ui.painter();
@@ -627,16 +634,20 @@ pub fn hsep(ui: &mut Ui) {
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, LINE));
 }
 
-/// Clickable list row: left icon letter, name, value on the right, chevron.
-pub fn list_row(ui: &mut Ui, mark: &str, mark_color: Color32, name: &str, value: &str, enabled: bool) -> Response {
+/// Letter in a tinted rounded square, for list rows without a logo.
+pub fn letter_mark(p: &egui::Painter, r: Rect, letter: &str, color: Color32) {
+    p.rect_filled(r, CornerRadius::same(6), alpha(color, 40));
+    p.text(r.center(), Align2::CENTER_CENTER, letter, theme::font_bold(12.0), color);
+}
+
+/// Clickable list row: an icon on the left (`mark` draws it into a 22×22 square), name, value on the right, chevron.
+pub fn list_row(ui: &mut Ui, mark: impl FnOnce(&egui::Painter, Rect), name: &str, value: &str, enabled: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     if resp.hovered() && enabled {
         p.rect_filled(rect, CornerRadius::ZERO, alpha(Color32::WHITE, 6));
     }
-    let mr = Rect::from_center_size(pos2(rect.left() + 26.0, rect.center().y), vec2(22.0, 22.0));
-    p.rect_filled(mr, CornerRadius::same(6), alpha(mark_color, 40));
-    p.text(mr.center(), Align2::CENTER_CENTER, mark, theme::font_bold(12.0), mark_color);
+    mark(p, Rect::from_center_size(pos2(rect.left() + 26.0, rect.center().y), vec2(22.0, 22.0)));
     p.text(pos2(rect.left() + 46.0, rect.center().y), Align2::LEFT_CENTER, name, theme::font(12.5), MUTED);
     p.text(pos2(rect.left() + 160.0, rect.center().y), Align2::LEFT_CENTER, value, theme::font_semi(12.5), if enabled { TEXT } else { DIM });
     let c = pos2(rect.right() - 18.0, rect.center().y);
@@ -648,6 +659,20 @@ pub fn list_row(ui: &mut Ui, mark: &str, mark_color: Color32, name: &str, value:
     } else {
         resp
     }
+}
+
+/// One entry of a popup menu: icon and label, highlighted on hover.
+pub fn menu_item(ui: &mut Ui, icon_name: &str, text: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let p = ui.painter();
+    let hot = resp.hovered();
+    if hot {
+        p.rect_filled(rect, CornerRadius::same(8), alpha(Color32::WHITE, 8));
+    }
+    let color = if hot { TEXT } else { TEXT2 };
+    icon(p, Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(14.0, 14.0)), icon_name, color);
+    p.text(pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, text, theme::font_semi(12.5), color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Paints a tiny icon by name into `r`.
@@ -700,8 +725,16 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.add(egui::Shape::line(vec![at(0.0, 1.0), at(0.33, 0.45), at(0.66, 0.7), at(1.0, 0.0)], s));
         }
         "gear" => {
-            p.circle_stroke(r.center(), r.width() * 0.42, s);
-            p.circle_stroke(r.center(), r.width() * 0.16, s);
+            // a cog: eight teeth around a ring, with the axle hole
+            let c = r.center();
+            let (body, tip) = (r.width() * 0.34, r.width() * 0.5);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([c + d * (body - 1.0), c + d * tip], Stroke::new(s.width * 1.9, color));
+            }
+            p.circle_stroke(c, body, s);
+            p.circle_stroke(c, r.width() * 0.13, s);
         }
         "user" => {
             p.circle_stroke(pos2(r.center().x, r.top() + r.height() * 0.32), r.width() * 0.22, s);
@@ -770,6 +803,19 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             let tip = pos2(c.x + (-0.6f32).cos() * rad, c.y + (-0.6f32).sin() * rad);
             p.line_segment([tip, tip + vec2(-3.5, -1.0)], s);
             p.line_segment([tip, tip + vec2(0.0, 3.5)], s);
+        }
+        "download" => {
+            // arrow down into a tray
+            p.line_segment([at(0.5, 0.04), at(0.5, 0.66)], s);
+            p.add(egui::Shape::line(vec![at(0.24, 0.42), at(0.5, 0.68), at(0.76, 0.42)], s));
+            p.add(egui::Shape::line(vec![at(0.06, 0.66), at(0.06, 0.94), at(0.94, 0.94), at(0.94, 0.66)], s));
+        }
+        "swap" => {
+            // two arrows passing each other: right on top, left below
+            p.line_segment([at(0.08, 0.3), at(0.92, 0.3)], s);
+            p.add(egui::Shape::line(vec![at(0.7, 0.08), at(0.92, 0.3), at(0.7, 0.52)], s));
+            p.line_segment([at(0.92, 0.7), at(0.08, 0.7)], s);
+            p.add(egui::Shape::line(vec![at(0.3, 0.48), at(0.08, 0.7), at(0.3, 0.92)], s));
         }
         "trash" => {
             p.line_segment([at(0.05, 0.2), at(0.95, 0.2)], s);

@@ -9,6 +9,7 @@ mod money;
 mod settings;
 mod slots;
 mod ui;
+mod update;
 
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ fn main() -> eframe::Result<()> {
     // `fastbet --login <casino>`: we are the login window child process.
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--bridge" {
-        if let Err(e) = bridge::run_child(&args[2]) {
+        if let Err(e) = bridge::run_child(&args[2], args.get(3).map(String::as_str)) {
             eprintln!("bridge failed: {e}");
             std::process::exit(1);
         }

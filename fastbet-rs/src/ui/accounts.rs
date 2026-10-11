@@ -19,16 +19,8 @@ fn header(ui: &mut Ui, full: Rect) {
     });
 }
 
-fn footer(app: &App, ui: &Ui, full: Rect) {
-    let p = ui.painter();
-    p.text(pos2(full.left() + 20.0, full.bottom() - 16.0), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(10.5), DIM);
-    let (c, txt) = match app.status {
-        ConnStatus::Ready => (GREEN, "connected"),
-        ConnStatus::Offline => (RED, "offline"),
-        _ => (MUTED, "idle"),
-    };
-    p.circle_filled(pos2(full.right() - 70.0, full.bottom() - 16.0), 3.0, c);
-    p.text(pos2(full.right() - 62.0, full.bottom() - 16.0), Align2::LEFT_CENTER, txt, theme::font(10.5), DIM);
+fn footer(ui: &Ui, full: Rect) {
+    ui.painter().text(pos2(full.left() + 20.0, full.bottom() - 16.0), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(10.5), DIM);
 }
 
 /// "Pick your account": one row per casino.
@@ -53,23 +45,68 @@ pub fn accounts(app: &mut App, ui: &mut Ui) {
                 for id in CasinoId::ALL {
                     let name = app.username_for(*id);
                     let value = name.clone().unwrap_or_else(|| "Add account".to_string());
-                    let (mark, color) = casino_mark(*id);
-                    if list_row(ui, mark, color, id.name(), &value, true).clicked() {
+                    let logos = &mut app.logos;
+                    let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), *id, TEXT);
+                    if list_row(ui, mark, id.name(), &value, true).clicked() {
                         picked = Some(*id);
                     }
                 }
-                list_row(ui, "?", DIM, "More casinos", "Coming soon", false);
+                list_row(ui, |p, r| widgets::letter_mark(p, r, "?", DIM), "More casinos", "Coming soon", false);
             });
         if let Some(id) = picked {
             app.open_account(id);
         }
     });
-    footer(app, ui, full);
+    footer(ui, full);
+    gear_menu(app, ui, full);
 }
 
-pub fn casino_mark(id: CasinoId) -> (&'static str, egui::Color32) {
-    match id {
-        CasinoId::ChipsGg => ("C", G2),
+/// The gear in the top-right corner of the welcome screen and its menu (version, Check for updates).
+fn gear_menu(app: &mut App, ui: &mut Ui, full: Rect) {
+    let slot = Rect::from_min_size(pos2(full.right() - 20.0 - 36.0, full.top() + 18.0), vec2(36.0, 36.0));
+    let anchor = ui.scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
+        if widgets::round_icon_button(ui, "gear", app.welcome_menu_open, "Settings").clicked() {
+            app.welcome_menu_open = !app.welcome_menu_open;
+        }
+    });
+    let anchor = anchor.response.rect;
+    if !app.welcome_menu_open {
+        return;
+    }
+    let mut updates = false;
+    let area = egui::Area::new(egui::Id::new("welcome-menu"))
+        .order(egui::Order::Foreground)
+        .pivot(Align2::RIGHT_TOP)
+        .fixed_pos(pos2(anchor.right(), anchor.bottom() + 8.0))
+        .show(ui.ctx(), |ui| {
+            Frame::new()
+                .fill(BG1)
+                .stroke(Stroke::new(1.0, theme::LINE2))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::same(6))
+                .shadow(egui::epaint::Shadow { offset: [0, 10], blur: 30, spread: 0, color: egui::Color32::from_black_alpha(170) })
+                .show(ui, |ui| {
+                    let w = 210.0;
+                    ui.set_width(w);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    let (hr, _) = ui.allocate_exact_size(vec2(w, 40.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.text(pos2(hr.left() + 12.0, hr.center().y), Align2::LEFT_CENTER, "FastBet", theme::font_bold(13.0), TEXT);
+                    p.text(pos2(hr.right() - 12.0, hr.center().y), Align2::RIGHT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(11.5), MUTED);
+                    widgets::hsep(ui);
+                    if widgets::menu_item(ui, "download", "Check for updates").clicked() {
+                        updates = true;
+                    }
+                });
+        });
+    // a click anywhere else, or Esc, closes it
+    let rect = area.response.rect;
+    let outside = ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !anchor.contains(p)));
+    if outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.welcome_menu_open = false;
+    }
+    if updates {
+        app.check_updates();
     }
 }
 
@@ -88,11 +125,10 @@ pub fn account(app: &mut App, ui: &mut Ui) {
         let p = ui.painter();
         p.circle_filled(rect.center(), 38.0, BG2);
         p.circle_stroke(rect.center(), 38.0, Stroke::new(1.5, alpha(TEXT, 180)));
-        let initials: String = name.as_deref().unwrap_or("?").chars().take(2).collect::<String>().to_uppercase();
-        p.text(rect.center(), Align2::CENTER_CENTER, initials, theme::font_bold(26.0), TEXT);
+        app.logos.paint(p, Rect::from_center_size(rect.center(), vec2(38.0, 38.0)), id, TEXT);
         ui.add_space(8.0);
         ui.label(widgets::bold(name.clone().unwrap_or_else(|| "New account".into()), 16.0, TEXT));
-        ui.label(widgets::semi(id.name(), 12.0, MUTED));
+        ui.label(widgets::semi(app.casino_site(), 12.0, MUTED));
         ui.add_space(22.0);
 
         let mut open_settings = false;
@@ -110,7 +146,7 @@ pub fn account(app: &mut App, ui: &mut Ui) {
         });
         if app.settings.token().is_none() && !matches!(app.stage, Stage::Settings) {
             ui.add_space(8.0);
-            ui.label(widgets::semi("No API key yet. Open Settings to add one.", 11.5, MUTED));
+            ui.label(widgets::semi(format!("No {} yet. Open Settings to add one.", id.key_label()), 11.5, MUTED));
         }
         if open_settings {
             app.open_settings();
@@ -129,7 +165,7 @@ pub fn account(app: &mut App, ui: &mut Ui) {
             app.go_accounts();
         }
     });
-    footer(app, ui, full);
+    footer(ui, full);
 
     match &app.stage {
         Stage::Checking(since) => {
@@ -165,14 +201,24 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                     });
                 });
                 ui.add(egui::Label::new(RichText::new(id.token_hint()).size(11.5).color(TEXT2)).wrap());
-                if pill_button(ui, "open API Keys page ↗", G2, true).clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(id.api_key_url()));
-                }
                 ui.add_space(2.0);
-                widgets::caption(ui, "API key");
+                let mirror = (!app.mirror_input.is_empty()).then(|| app.mirror_input.clone());
+                ui.horizontal(|ui| {
+                    widgets::caption(ui, id.key_label());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, format!("Get {} ↗", id.key_label()), G2, true).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(id.api_key_url(mirror.as_deref())));
+                        }
+                    });
+                });
                 let masked = !app.key_input.is_empty() && !app.token_visible;
-                let r = widgets::text_box(ui, &mut app.key_input, "paste your API key", None, true, masked);
+                let r = widgets::text_box(ui, &mut app.key_input, &format!("paste your {}", id.key_label()), None, true, masked);
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if !id.mirrors().is_empty() {
+                    ui.add_space(2.0);
+                    widgets::caption(ui, "Mirror");
+                    mirror_picker(app, ui);
+                }
                 ui.horizontal(|ui| {
                     if button(ui, "Save", Btn::Primary, !app.key_input.trim().is_empty(), Some(90.0)).clicked() || enter {
                         save = true;
@@ -181,8 +227,14 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                         app.token_visible = !app.token_visible;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if pill_button(ui, "log in in a window instead", MUTED, false).clicked() {
-                            window = true;
+                        if id.window_login() {
+                            if pill_button(ui, "log in in a window instead", MUTED, false).clicked() {
+                                window = true;
+                            }
+                        } else if let Some(m) = &mirror {
+                            if pill_button(ui, "Casino website ↗", MUTED, false).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://{m}/")));
+                            }
                         }
                     });
                 });
@@ -199,6 +251,96 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
     }
     if window {
         app.start_login();
+    }
+}
+
+/// The casino's mirrors: a field showing the pick, opening into a searchable list (Stake has over a hundred).
+fn mirror_picker(app: &mut App, ui: &mut Ui) {
+    let id = app.casino();
+    let current = if app.mirror_input.is_empty() { id.default_mirror().unwrap_or_default().to_string() } else { app.mirror_input.clone() };
+    let w = ui.available_width();
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, widgets::FIELD_H), egui::Sense::click());
+    let p = ui.painter();
+    let edge = if app.mirror_open { alpha(G1, 170) } else if resp.hovered() { theme::LINE2 } else { LINE };
+    p.rect(rect, CornerRadius::same(theme::RADIUS), theme::BG, Stroke::new(1.0, edge), StrokeKind::Inside);
+    p.text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, &current, theme::font_semi(13.5), TEXT);
+    let c = pos2(rect.right() - 16.0, rect.center().y);
+    let dy = if app.mirror_open { -1.8 } else { 1.8 };
+    p.add(egui::Shape::line(vec![c + vec2(-4.0, -dy), c + vec2(0.0, dy), c + vec2(4.0, -dy)], Stroke::new(1.6, MUTED)));
+    let opened_now = resp.clicked() && !app.mirror_open;
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        app.mirror_open = !app.mirror_open;
+        app.mirror_search.clear();
+    }
+    if !app.mirror_open {
+        return;
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.mirror_open = false;
+        return;
+    }
+
+    let q = app.mirror_search.trim().to_ascii_lowercase();
+    let list: Vec<&str> = id.mirrors().iter().copied().filter(|m| m.contains(q.as_str())).collect();
+    let mut picked = None;
+    // floats over the page like a dropdown, so the card below doesn't move
+    let frame = Frame::new()
+        .fill(BG1)
+        .stroke(Stroke::new(1.0, theme::LINE2))
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(Margin::same(6))
+        .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: egui::Color32::from_black_alpha(150) });
+    // opens upward when the window has no room for it below the field
+    let screen = ui.ctx().content_rect();
+    let (below, above) = (screen.bottom() - rect.bottom() - 12.0, rect.top() - screen.top() - 12.0);
+    let up = below < 220.0 && above > below;
+    let list_h = ((if up { above } else { below }) - widgets::FIELD_H - 20.0).clamp(84.0, 240.0);
+    let area = egui::Area::new(ui.id().with("mirror-list")).order(egui::Order::Foreground);
+    let area = if up { area.pivot(Align2::LEFT_BOTTOM).fixed_pos(rect.left_top() - vec2(0.0, 4.0)) } else { area.fixed_pos(rect.left_bottom() + vec2(0.0, 4.0)) };
+    let area = area.show(ui.ctx(), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(w - 12.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let count = format!("{} of {}", list.len(), id.mirrors().len());
+                let search = widgets::text_box(ui, &mut app.mirror_search, "Search mirrors", Some(&count), true, false);
+                if opened_now || ui.memory(|m| m.focused().is_none()) {
+                    search.request_focus();
+                }
+                egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for m in &list {
+                        let (r, row) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), egui::Sense::click());
+                        let on = *m == current;
+                        let p = ui.painter();
+                        if row.hovered() {
+                            p.rect_filled(r, CornerRadius::same(5), alpha(egui::Color32::WHITE, 8));
+                        }
+                        p.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *m, theme::font_semi(12.5), if on { G2 } else { TEXT2 });
+                        if on {
+                            icon(p, egui::Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(12.0, 12.0)), "check", G2);
+                        }
+                        if row.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            picked = Some(m.to_string());
+                        }
+                    }
+                    if list.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(widgets::semi("No mirror matches", 12.0, MUTED));
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        });
+    // a click anywhere else closes it
+    let outside = ui.input(|i| i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|pos| !area.response.rect.contains(pos) && !rect.contains(pos)));
+    if outside {
+        app.mirror_open = false;
+    }
+    if let Some(m) = picked {
+        app.mirror_input = m;
+        app.mirror_search.clear();
+        app.mirror_open = false;
     }
 }
 
@@ -272,7 +414,11 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
     };
     let mut open_settings = false;
     let close = modal_frame(ui, "Account connection check", |ui| {
-        step(ui, reach, &format!("Reaching {}", app.casino().name()));
+        step(ui, reach, &format!("Reaching {}", app.casino_site()));
+        // e.g. Stake's Cloudflare check, which can take a few seconds
+        if reach == 0 && !app.status_detail.is_empty() {
+            ui.label(widgets::semi(app.status_detail.clone(), 11.5, MUTED));
+        }
         step(ui, if reach == 1 { cred } else { 0 }, "Checking account credentials");
         if cred == 2 || reach == 2 {
             ui.add_space(2.0);

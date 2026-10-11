@@ -417,12 +417,6 @@ impl Casino for ChipsGg {
     }
 }
 
-fn backoff(retries: &mut u32) -> Duration {
-    let ms = (300u64 << (*retries).min(5)).min(5000);
-    *retries += 1;
-    Duration::from_millis(ms)
-}
-
 fn value_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),

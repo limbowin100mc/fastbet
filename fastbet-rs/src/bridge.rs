@@ -3,8 +3,9 @@
 //! Cloudflare bot checks that reject plain HTTP clients but accept a real
 //! browser engine, so every provider call goes through here.
 //!
-//! Child: `fastbet --bridge <page-url>`. Reads `REQ <id> <json>` lines on
-//! stdin, runs `fetch` in the page, prints `RES <id> <json>` on stdout.
+//! Child: `fastbet --bridge <page-url> [profile]`. Reads `REQ <id> <json>`
+//! lines on stdin, runs `fetch` in the page, prints `RES <id> <json>` on
+//! stdout. `SHOW` / `HIDE` toggle the window, for a check that wants a click.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -39,7 +40,7 @@ pub struct BridgeResponse {
 
 // ---------------------------------------------------------------- child side
 
-pub fn run_child(url: &str) -> Result<(), String> {
+pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -49,6 +50,7 @@ pub fn run_child(url: &str) -> Result<(), String> {
     enum UserEvent {
         Out(String),
         Eval(String),
+        Show(bool),
     }
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -59,7 +61,7 @@ pub fn run_child(url: &str) -> Result<(), String> {
         .build(&event_loop)
         .map_err(|e| e.to_string())?;
 
-    let data_dir = directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.data_local_dir().join("webview").join("bridge"));
+    let data_dir = directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.data_local_dir().join("webview").join(profile.unwrap_or("bridge")));
     let mut ctx = WebContext::new(data_dir);
     let builder = WebViewBuilder::new_with_web_context(&mut ctx)
         .with_url(url)
@@ -88,6 +90,10 @@ pub fn run_child(url: &str) -> Result<(), String> {
                     }
                 } else if line.trim() == "QUIT" {
                     std::process::exit(0);
+                } else if matches!(line.trim(), "SHOW" | "HIDE") {
+                    if proxy.send_event(UserEvent::Show(line.trim() == "SHOW")).is_err() {
+                        break;
+                    }
                 }
             }
             std::process::exit(0);
@@ -104,6 +110,16 @@ pub fn run_child(url: &str) -> Result<(), String> {
             }
             Event::UserEvent(UserEvent::Eval(js)) => {
                 let _ = webview.evaluate_script(&js);
+            }
+            Event::UserEvent(UserEvent::Show(on)) => {
+                if on {
+                    window.set_title("FastBet – security check");
+                    window.set_inner_size(LogicalSize::new(480.0, 640.0));
+                    window.set_visible(true);
+                    window.set_focus();
+                } else {
+                    window.set_visible(false);
+                }
             }
             _ => {}
         }
@@ -150,9 +166,18 @@ struct Inner {
 impl Bridge {
     /// Spawns the child and waits until the page has loaded.
     pub async fn open(page_url: &str) -> Result<Self, String> {
+        Self::open_profile(page_url, None).await
+    }
+
+    /// Like [`Bridge::open`], with its own browser profile (cookies, cache).
+    pub async fn open_profile(page_url: &str, profile: Option<&str>) -> Result<Self, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
-        cmd.arg("--bridge").arg(page_url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.arg("--bridge").arg(page_url);
+        if let Some(p) = profile {
+            cmd.arg(p);
+        }
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -201,6 +226,10 @@ impl Bridge {
     }
 
     pub async fn request(&self, req: BridgeRequest) -> Result<BridgeResponse, String> {
+        self.request_within(req, Duration::from_secs(30)).await
+    }
+
+    pub async fn request_within(&self, req: BridgeRequest, timeout: Duration) -> Result<BridgeResponse, String> {
         let id = self.inner.seq.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().unwrap().insert(id, tx);
@@ -209,7 +238,7 @@ impl Bridge {
             let mut stdin = self.inner.stdin.lock().unwrap();
             stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).map_err(|e| format!("bridge write: {e}"))?;
         }
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(res)) => match res.error {
                 Some(e) => Err(e),
                 None => Ok(res),
@@ -229,6 +258,14 @@ impl Bridge {
         let res = self.request(BridgeRequest { method: "POST".into(), url: url.into(), headers: h, body: Some(body.to_string()) }).await?;
         let v = serde_json::from_str(&res.body).map_err(|_| format!("HTTP {}: {}", res.status, res.body.chars().take(200).collect::<String>()))?;
         Ok((res.status, v))
+    }
+
+    /// Shows or hides the bridge window (a Cloudflare check that wants a click).
+    pub fn show(&self, on: bool) {
+        if let Ok(mut stdin) = self.inner.stdin.lock() {
+            let _ = stdin.write_all(if on { b"SHOW\n" } else { b"HIDE\n" });
+            let _ = stdin.flush();
+        }
     }
 
     pub fn close(&self) {
