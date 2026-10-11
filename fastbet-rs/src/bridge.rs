@@ -65,7 +65,7 @@ const SETUP_ENV: &str = "FASTBET_BRIDGE_SETUP";
 // ---------------------------------------------------------------- child side
 
 pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
-    use tao::dpi::LogicalSize;
+    use tao::dpi::{LogicalSize, PhysicalPosition};
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tao::window::WindowBuilder;
@@ -114,6 +114,7 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
         webview.set_cookie(&cookie).map_err(|e| format!("cookie {}: {e}", c.name))?;
     }
     webview.load_url(url).map_err(|e| e.to_string())?;
+    let page = url.to_string();
 
     // stdin -> event loop
     {
@@ -155,10 +156,21 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
             Event::UserEvent(UserEvent::Show(on)) => {
                 if on {
                     window.set_title("FastBet – security check");
-                    window.set_inner_size(LogicalSize::new(480.0, 640.0));
+                    window.set_inner_size(LogicalSize::new(520.0, 700.0));
+                    if let Some(m) = window.current_monitor() {
+                        let (at, size, outer) = (m.position(), m.size(), window.outer_size());
+                        let x = at.x + (size.width as i32 - outer.width as i32) / 2;
+                        let y = at.y + (size.height as i32 - outer.height as i32) / 2;
+                        window.set_outer_position(PhysicalPosition::new(x, y.max(at.y)));
+                    }
+                    // Windows doesn't let a background process take the foreground, so keep it above FastBet
+                    window.set_always_on_top(true);
                     window.set_visible(true);
                     window.set_focus();
+                    // start the check over while it can be seen: one that ran in a hidden window may never finish
+                    let _ = webview.load_url(&page);
                 } else {
+                    window.set_always_on_top(false);
                     window.set_visible(false);
                 }
             }

@@ -70,6 +70,28 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     head.eq_ignore_ascii_case(prefix).then(|| s[prefix.len()..].trim_start())
 }
 
+/// The browser a User Agent names, with its major version: `("Chrome", 141)`.
+pub fn browser_of(user_agent: &str) -> Option<(&'static str, u32)> {
+    // Edge and Opera also say Chrome, so they're looked for first
+    const NAMES: &[(&str, &str)] = &[("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"), ("Version/", "Safari")];
+    NAMES.iter().find_map(|(token, name)| {
+        let rest = &user_agent[user_agent.find(token)? + token.len()..];
+        let major = rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
+        Some((*name, major))
+    })
+}
+
+/// Major version of the Edge engine (WebView2) the bridge runs on, on Windows.
+pub fn edge_engine() -> Option<u32> {
+    static VERSION: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        if !cfg!(windows) {
+            return None;
+        }
+        wry::webview_version().ok()?.split('.').next()?.parse().ok()
+    })
+}
+
 /// Cloudflare's info page on a domain: the visitor's IP (`ip=`) and User Agent (`uag=`).
 pub fn trace_url(domain: &str) -> String {
     format!("https://{domain}/cdn-cgi/trace")
@@ -147,5 +169,19 @@ mod tests {
         assert_eq!(trace_field(body, "ip").as_deref(), Some("185.125.177.122"));
         assert_eq!(trace_field(body, "uag").as_deref(), Some("Mozilla/5.0 (X)"));
         assert_eq!(trace_field(body, "loc"), None);
+    }
+
+    #[test]
+    fn names_browsers() {
+        let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+        assert_eq!(browser_of(chrome), Some(("Chrome", 141)));
+        assert_eq!(browser_of(&format!("{chrome} Edg/141.0.0.0")), Some(("Edge", 141)));
+        assert_eq!(browser_of(&format!("{chrome} OPR/124.0.0.0")), Some(("Opera", 124)));
+        assert_eq!(browser_of("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"), Some(("Firefox", 143)));
+        assert_eq!(
+            browser_of("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"),
+            Some(("Safari", 18))
+        );
+        assert_eq!(browser_of("Mozilla/5.0 (X11; Linux x86_64)"), None);
     }
 }

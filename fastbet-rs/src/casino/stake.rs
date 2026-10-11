@@ -7,7 +7,9 @@
 //! the API. A fresh bridge clears the check by itself in about 15 s; if the
 //! check wants a click, the bridge window is shown for the user. When it never
 //! passes, the user can copy the `cf_clearance` cookie and User Agent from
-//! their own browser; the bridge then presents both on that mirror.
+//! their own browser; the bridge then presents both on that mirror. A cookie
+//! Cloudflare refuses is reported, not turned into a check window: that window
+//! would claim to be the user's browser, and such a check doesn't pass.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -237,14 +239,19 @@ impl Stake {
                     return Ok(());
                 }
                 Err(CallError::Cloudflare) => {
-                    if t0.elapsed() > CHECK_TIMEOUT {
-                        return Err(if manual.is_some() {
-                            format!("Cloudflare didn't accept your cookie on {mirror}. Copy a fresh one (same browser, same IP) or remove it.")
-                        } else {
-                            format!("Cloudflare didn't let us through on {mirror}. Try another mirror, or set the Cloudflare cookie in Settings.")
-                        });
+                    if manual.is_some() && t0.elapsed() > SHOW_CHECK_AFTER {
+                        return Err(format!(
+                            "Cloudflare didn't accept your cookie on {mirror}. Copy a fresh cookie and the User Agent from the same browser \
+                             on this computer, or remove the cookie."
+                        ));
                     }
-                    if !shown && t0.elapsed() > SHOW_CHECK_AFTER {
+                    if t0.elapsed() > CHECK_TIMEOUT {
+                        return Err(format!(
+                            "Cloudflare didn't let us through on {mirror}. Try another mirror, or set the Cloudflare cookie in Settings. \
+                             On a server (VPS), Cloudflare may not trust its IP address at all."
+                        ));
+                    }
+                    if manual.is_none() && !shown && t0.elapsed() > SHOW_CHECK_AFTER {
                         link.bridge.show(true);
                         shown = true;
                     }

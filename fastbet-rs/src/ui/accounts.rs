@@ -409,7 +409,7 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
             ui.add(
                 egui::Label::new(
                     RichText::new(format!(
-                        "Use this when the Cloudflare check never passes in the app, but {mirror} opens fine in Chrome or Edge on this PC. \
+                        "Use this when the Cloudflare check never passes in the app, but {mirror} opens fine in a browser on this computer. \
                          Copy that browser's User Agent and its cf_clearance cookie here. They only work from the same IP address and on the same mirror."
                     ))
                     .size(11.5)
@@ -417,6 +417,10 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
                 )
                 .wrap(),
             );
+            let engine = cloudflare::edge_engine();
+            if let Some(v) = engine {
+                note(ui, format!("Best taken from Microsoft Edge: FastBet runs on Edge's engine (version {v}), so Cloudflare sees the same browser."), TEXT2);
+            }
             ip_row(app, ui, &mirror);
 
             ui.add_space(2.0);
@@ -430,7 +434,15 @@ fn cloudflare_section(app: &mut App, ui: &mut Ui) {
                 });
             });
             widgets::text_box(ui, &mut app.cf_agent_input, "Mozilla/5.0 (Windows NT…", None, true, false);
-            note(ui, "Get User Agent opens a page in your browser: copy everything after uag=".into(), MUTED);
+            note(
+                ui,
+                format!("Get User Agent opens {mirror}/cdn-cgi/trace in your default browser. Open it in the browser you take the cookie from, and copy everything after uag="),
+                MUTED,
+            );
+            let other = cloudflare::browser_of(&app.cf_agent_input).filter(|b| engine.is_some_and(|v| *b != ("Edge", v)));
+            if let (Some((name, major)), Some(v)) = (other, engine) {
+                note(ui, format!("That's {name} {major}, FastBet is Edge {v}. If Cloudflare refuses the cookie, copy both values from Microsoft Edge."), GOLD);
+            }
 
             ui.add_space(2.0);
             widgets::caption(ui, "Cloudflare clearance cookie");
