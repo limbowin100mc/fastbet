@@ -5,7 +5,9 @@
 //! away (stake.com answers them with its "blocked" page), so every call runs
 //! through the browser bridge parked on the chosen mirror, same-origin with
 //! the API. A fresh bridge clears the check by itself in about 15 s; if the
-//! check wants a click, the bridge window is shown for the user.
+//! check wants a click, the bridge window is shown for the user. When it never
+//! passes, the user can copy the `cf_clearance` cookie and User Agent from
+//! their own browser; the bridge then presents both on that mirror.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,7 +19,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
 use super::*;
-use crate::bridge::{Bridge, BridgeRequest};
+use crate::bridge::{Bridge, BridgeCookie, BridgeRequest, BridgeSetup};
+use crate::cloudflare::{self, Clearance};
 use crate::money::{f64_from_json, parse_units, to_f64};
 
 /// Stake sends every amount as a float with at most 8 decimals.
@@ -31,6 +34,8 @@ const SHOW_CHECK_AFTER: Duration = Duration::from_secs(20);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(150);
 /// Browser profile of the bridge, so Stake's cookies stay apart from the slot providers'.
 const PROFILE: &str = "stake";
+/// Profile used with a cookie from the user's browser, so it never mixes with the bridge's own.
+const PROFILE_MANUAL: &str = "stake-cf";
 
 pub const DEFAULT_MIRROR: &str = "stake.com";
 
@@ -107,7 +112,10 @@ struct Link {
 pub struct Stake {
     token: Mutex<Option<String>>,
     mirror: Mutex<String>,
-    /// Token or mirror changed.
+    clearance: Mutex<Option<Clearance>>,
+    /// Bumped when the mirror or the Cloudflare cookie in use changes: the bridge is rebuilt.
+    setup: AtomicU64,
+    /// Token, mirror or cookie changed.
     wake: Notify,
     /// A call found the bridge dead or challenged; the run loop rebuilds it.
     broken: Notify,
@@ -125,11 +133,13 @@ pub struct Stake {
 }
 
 impl Stake {
-    pub fn spawn(token: Option<String>, mirror: Option<String>, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
-        let mirror = mirror.map(|m| normalize_mirror(&m)).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MIRROR.into());
+    pub fn spawn(setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
+        let mirror = setup.mirror.map(|m| normalize_mirror(&m)).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MIRROR.into());
         let me = Arc::new(Self {
-            token: Mutex::new(clean_token(token)),
+            token: Mutex::new(clean_token(setup.token)),
             mirror: Mutex::new(mirror),
+            clearance: Mutex::new(setup.clearance.filter(Clearance::is_complete)),
+            setup: AtomicU64::new(0),
             wake: Notify::new(),
             broken: Notify::new(),
             broken_flag: AtomicBool::new(false),
@@ -158,24 +168,31 @@ impl Stake {
         self.alive.load(Ordering::SeqCst)
     }
 
-    fn mirror_is(&self, mirror: &str) -> bool {
-        *self.mirror.lock() == mirror
+    /// The mirror and Cloudflare cookie are still the ones the bridge was opened with.
+    fn setup_is(&self, setup: u64) -> bool {
+        self.setup.load(Ordering::SeqCst) == setup
+    }
+
+    /// The user's cookie, when it was issued on `mirror`.
+    fn clearance_for(&self, mirror: &str) -> Option<Clearance> {
+        self.clearance.lock().clone().filter(|c| c.mirror == mirror)
     }
 
     async fn run(self: Arc<Self>) {
         let mut retries: u32 = 0;
         while self.alive() {
+            let setup = self.setup.load(Ordering::SeqCst);
             let mirror = self.mirror.lock().clone();
-            let res = self.connect(&mirror).await;
+            let res = self.connect(&mirror, setup).await;
             if res.is_ok() {
                 retries = 0;
-                self.serve(&mirror).await;
+                self.serve(setup).await;
             }
             self.drop_link();
             if !self.alive() {
                 break;
             }
-            if !self.mirror_is(&mirror) {
+            if !self.setup_is(setup) {
                 continue;
             }
             self.status(ConnStatus::Offline, res.err().unwrap_or_default());
@@ -188,10 +205,19 @@ impl Stake {
     }
 
     /// Opens the bridge on `mirror` and waits until Stake answers through it.
-    async fn connect(&self, mirror: &str) -> Result<(), String> {
+    async fn connect(&self, mirror: &str, setup: u64) -> Result<(), String> {
         self.status(ConnStatus::Connecting, format!("Opening {mirror}"));
         let origin = format!("https://{mirror}");
-        let bridge = Bridge::open_profile(&format!("{origin}/robots.txt"), Some(PROFILE)).await?;
+        let page = format!("{origin}/robots.txt");
+        let manual = self.clearance_for(mirror);
+        let bridge = match &manual {
+            Some(c) => {
+                let cookie = BridgeCookie { name: cloudflare::COOKIE.into(), value: c.cookie.clone(), domain: format!(".{mirror}") };
+                let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies: vec![cookie] };
+                Bridge::open_with(&page, Some(PROFILE_MANUAL), &setup).await?
+            }
+            None => Bridge::open_profile(&page, Some(PROFILE)).await?,
+        };
         let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, bridge, origin };
         self.broken_flag.store(false, Ordering::SeqCst);
         *self.link.lock() = Some(link.clone());
@@ -199,7 +225,7 @@ impl Stake {
         let t0 = Instant::now();
         let mut shown = false;
         loop {
-            if !self.alive() || !self.mirror_is(mirror) {
+            if !self.alive() || !self.setup_is(setup) {
                 return Err(String::new());
             }
             match self.post(&link, RATES, json!({}), false, Duration::from_secs(8)).await {
@@ -212,13 +238,21 @@ impl Stake {
                 }
                 Err(CallError::Cloudflare) => {
                     if t0.elapsed() > CHECK_TIMEOUT {
-                        return Err(format!("Cloudflare didn't let us through on {mirror}. Try another mirror."));
+                        return Err(if manual.is_some() {
+                            format!("Cloudflare didn't accept your cookie on {mirror}. Copy a fresh one (same browser, same IP) or remove it.")
+                        } else {
+                            format!("Cloudflare didn't let us through on {mirror}. Try another mirror, or set the Cloudflare cookie in Settings.")
+                        });
                     }
                     if !shown && t0.elapsed() > SHOW_CHECK_AFTER {
                         link.bridge.show(true);
                         shown = true;
                     }
-                    let msg = if shown { "Finish the Cloudflare check in the window that opened" } else { "Passing the Cloudflare check…" };
+                    let msg = match (shown, manual.is_some()) {
+                        (true, _) => "Finish the Cloudflare check in the window that opened",
+                        (false, true) => "Cloudflare didn't take your cookie, passing the check…",
+                        (false, false) => "Passing the Cloudflare check…",
+                    };
                     self.status(ConnStatus::Connecting, msg);
                 }
                 Err(CallError::Blocked) => return Err(format!("{mirror} is blocked from your location. Pick another mirror.")),
@@ -234,14 +268,14 @@ impl Stake {
         }
     }
 
-    /// Signs in and keeps balances fresh until the bridge breaks or the mirror changes.
-    async fn serve(&self, mirror: &str) {
+    /// Signs in and keeps balances fresh until the bridge breaks or the mirror or cookie changes.
+    async fn serve(&self, setup: u64) {
         self.authenticate().await;
         let mut rates_at = Instant::now();
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {
-                    if !self.alive() || !self.mirror_is(mirror) {
+                    if !self.alive() || !self.setup_is(setup) {
                         return;
                     }
                     self.authenticate().await;
@@ -417,8 +451,26 @@ impl Casino for Stake {
         if m.is_empty() {
             return;
         }
-        *self.mirror.lock() = m;
+        {
+            let mut cur = self.mirror.lock();
+            if *cur == m {
+                return;
+            }
+            *cur = m;
+            self.setup.fetch_add(1, Ordering::SeqCst);
+        }
         self.wake.notify_one();
+    }
+
+    fn set_clearance(&self, clearance: Option<Clearance>) {
+        let mirror = self.mirror.lock().clone();
+        let before = self.clearance_for(&mirror);
+        *self.clearance.lock() = clearance.filter(Clearance::is_complete);
+        // a cookie for another mirror changes nothing about the bridge in use
+        if self.clearance_for(&mirror) != before {
+            self.setup.fetch_add(1, Ordering::SeqCst);
+            self.wake.notify_one();
+        }
     }
 
     fn shutdown(&self) {

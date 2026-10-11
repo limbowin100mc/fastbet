@@ -6,6 +6,7 @@
 //! Child: `fastbet --bridge <page-url> [profile]`. Reads `REQ <id> <json>`
 //! lines on stdin, runs `fetch` in the page, prints `RES <id> <json>` on
 //! stdout. `SHOW` / `HIDE` toggle the window, for a check that wants a click.
+//! A [`BridgeSetup`] (User Agent, cookies) reaches the child in `FASTBET_BRIDGE_SETUP`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -38,6 +39,29 @@ pub struct BridgeResponse {
     pub ms: f64,
 }
 
+/// How the bridge's browser presents itself, applied before the first page loads.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BridgeSetup {
+    pub user_agent: Option<String>,
+    pub cookies: Vec<BridgeCookie>,
+}
+
+/// A secure, HttpOnly cookie for `domain` (".example.com" covers its subdomains too).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BridgeCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+}
+
+impl BridgeSetup {
+    fn is_empty(&self) -> bool {
+        self.user_agent.is_none() && self.cookies.is_empty()
+    }
+}
+
+const SETUP_ENV: &str = "FASTBET_BRIDGE_SETUP";
+
 // ---------------------------------------------------------------- child side
 
 pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
@@ -62,9 +86,9 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let data_dir = directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.data_local_dir().join("webview").join(profile.unwrap_or("bridge")));
+    let setup: BridgeSetup = std::env::var(SETUP_ENV).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let mut ctx = WebContext::new(data_dir);
-    let builder = WebViewBuilder::new_with_web_context(&mut ctx)
-        .with_url(url)
+    let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
         .with_initialization_script(BRIDGE_SCRIPT)
         .with_ipc_handler({
             let proxy = proxy.clone();
@@ -72,7 +96,24 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
                 let _ = proxy.send_event(UserEvent::Out(req.body().clone()));
             }
         });
+    if let Some(ua) = &setup.user_agent {
+        builder = builder.with_user_agent(ua);
+    }
+    // no URL yet: the cookies have to be in place before the first request
     let webview = crate::login::attach(builder, &window).map_err(|e| e.to_string())?;
+    for c in &setup.cookies {
+        use wry::cookie::{time, Cookie, SameSite};
+        let cookie = Cookie::build((c.name.as_str(), c.value.as_str()))
+            .domain(c.domain.as_str())
+            .path("/")
+            .secure(true)
+            .http_only(true)
+            .same_site(SameSite::None)
+            .max_age(time::Duration::days(365))
+            .build();
+        webview.set_cookie(&cookie).map_err(|e| format!("cookie {}: {e}", c.name))?;
+    }
+    webview.load_url(url).map_err(|e| e.to_string())?;
 
     // stdin -> event loop
     {
@@ -171,11 +212,21 @@ impl Bridge {
 
     /// Like [`Bridge::open`], with its own browser profile (cookies, cache).
     pub async fn open_profile(page_url: &str, profile: Option<&str>) -> Result<Self, String> {
+        Self::open_with(page_url, profile, &BridgeSetup::default()).await
+    }
+
+    /// Like [`Bridge::open_profile`], with a User Agent and cookies set before the page loads.
+    pub async fn open_with(page_url: &str, profile: Option<&str>, setup: &BridgeSetup) -> Result<Self, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
         cmd.arg("--bridge").arg(page_url);
         if let Some(p) = profile {
             cmd.arg(p);
+        }
+        if setup.is_empty() {
+            cmd.env_remove(SETUP_ENV);
+        } else {
+            cmd.env(SETUP_ENV, serde_json::to_string(setup).map_err(|e| e.to_string())?);
         }
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         #[cfg(windows)]

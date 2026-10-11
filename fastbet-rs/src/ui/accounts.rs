@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use egui::{pos2, vec2, Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, RichText, Stroke, StrokeKind, Ui};
 
-use super::theme::{self, alpha, BG1, BG2, DIM, G1, G2, GREEN, LINE, MUTED, RED, TEXT, TEXT2};
+use super::theme::{self, alpha, BG1, BG2, DIM, G1, G2, GOLD, GREEN, LINE, MUTED, RED, TEXT, TEXT2};
 use super::widgets::{self, button, icon, list_row, pill_button, Btn};
 use super::{App, Stage};
 use crate::casino::{CasinoId, ConnStatus};
+use crate::cloudflare;
 
 fn header(ui: &mut Ui, full: Rect) {
     ui.add_space(full.height() * 0.11);
@@ -118,7 +119,8 @@ pub fn account(app: &mut App, ui: &mut Ui) {
     let name = app.username_for(id);
     let busy = matches!(app.stage, Stage::Checking(_) | Stage::Login(_));
 
-    ui.vertical_centered(|ui| {
+    // scrolls once the settings card (with the Cloudflare section open) outgrows a small window
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ui.vertical_centered(|ui| {
         header(ui, full);
         ui.add_space(full.height() * 0.1);
         let (rect, _) = ui.allocate_exact_size(vec2(76.0, 76.0), egui::Sense::hover());
@@ -164,7 +166,8 @@ pub fn account(app: &mut App, ui: &mut Ui) {
         if pill_button(ui, "‹  Account selection", MUTED, false).clicked() && !busy {
             app.go_accounts();
         }
-    });
+        ui.add_space(28.0);
+    }));
     footer(ui, full);
 
     match &app.stage {
@@ -218,6 +221,11 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                     ui.add_space(2.0);
                     widgets::caption(ui, "Mirror");
                     mirror_picker(app, ui);
+                }
+                if id.behind_cloudflare() {
+                    ui.add_space(4.0);
+                    cloudflare_section(app, ui);
+                    ui.add_space(2.0);
                 }
                 ui.horizontal(|ui| {
                     if button(ui, "Save", Btn::Primary, !app.key_input.trim().is_empty(), Some(90.0)).clicked() || enter {
@@ -344,6 +352,150 @@ fn mirror_picker(app: &mut App, ui: &mut Ui) {
     }
 }
 
+/// The mirror picked in the settings card.
+fn picked_mirror(app: &App) -> String {
+    let m = crate::casino::stake::normalize_mirror(&app.mirror_input);
+    if m.is_empty() {
+        app.casino().default_mirror().unwrap_or_default().to_string()
+    } else {
+        m
+    }
+}
+
+/// For a Cloudflare check that never passes in the app: the User Agent and
+/// `cf_clearance` cookie from the user's own browser (same PC, same IP).
+/// The settings card's Save stores them with the token and mirror.
+fn cloudflare_section(app: &mut App, ui: &mut Ui) {
+    let mirror = picked_mirror(app);
+    let saved = app.settings.clearance();
+    let w = ui.available_width();
+    let mut remove = false;
+    Frame::new().stroke(Stroke::new(1.0, LINE)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::ZERO).show(ui, |ui| {
+        let inner_w = w - 2.0;
+        ui.set_width(inner_w);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let (rect, resp) = ui.allocate_exact_size(vec2(inner_w, 40.0), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            app.cf_open = !app.cf_open;
+        }
+        let p = ui.painter();
+        if resp.hovered() {
+            let r = if app.cf_open { CornerRadius { nw: 9, ne: 9, sw: 0, se: 0 } } else { CornerRadius::same(9) };
+            p.rect_filled(rect, r, alpha(egui::Color32::WHITE, 6));
+        }
+        // chevron points up while open
+        let c = pos2(rect.left() + 18.0, rect.center().y);
+        let dy = if app.cf_open { -2.0 } else { 2.0 };
+        let chevron = vec![c + vec2(-4.0, -dy), c + vec2(0.0, dy), c + vec2(4.0, -dy)];
+        p.add(egui::Shape::line(chevron, Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
+        p.text(pos2(rect.left() + 32.0, rect.center().y), Align2::LEFT_CENTER, "Set Cloudflare cookie manually", theme::font_semi(13.0), if app.cf_open { TEXT } else { TEXT2 });
+        let (tag, tag_color) = match &saved {
+            Some(s) if s.mirror == mirror => ("saved", G2),
+            Some(_) => ("other mirror", GOLD),
+            None => ("optional", DIM),
+        };
+        p.text(pos2(rect.right() - 14.0, rect.center().y), Align2::RIGHT_CENTER, tag, theme::font_semi(11.0), tag_color);
+        if !app.cf_open {
+            return;
+        }
+
+        Frame::new().inner_margin(Margin { left: 14, right: 14, top: 0, bottom: 14 }).show(ui, |ui| {
+            ui.set_width(inner_w - 28.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let note = |ui: &mut Ui, text: String, color: egui::Color32| {
+                ui.add(egui::Label::new(RichText::new(text).size(11.0).color(color)).wrap());
+            };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Use this when the Cloudflare check never passes in the app, but {mirror} opens fine in Chrome or Edge on this PC. \
+                         Copy that browser's User Agent and its cf_clearance cookie here. They only work from the same IP address and on the same mirror."
+                    ))
+                    .size(11.5)
+                    .color(TEXT2),
+                )
+                .wrap(),
+            );
+            ip_row(app, ui, &mirror);
+
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                widgets::caption(ui, "User Agent");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let get = pill_button(ui, "Get User Agent ↗", G2, true).on_hover_text("Opens Cloudflare's info page for this mirror in your browser");
+                    if get.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(cloudflare::trace_url(&mirror)));
+                    }
+                });
+            });
+            widgets::text_box(ui, &mut app.cf_agent_input, "Mozilla/5.0 (Windows NT…", None, true, false);
+            note(ui, "Get User Agent opens a page in your browser: copy everything after uag=".into(), MUTED);
+
+            ui.add_space(2.0);
+            widgets::caption(ui, "Cloudflare clearance cookie");
+            widgets::text_box(ui, &mut app.cf_cookie_input, "Paste the cf_clearance value", None, true, false);
+            note(ui, format!("In that browser, on {mirror}: press F12 → Application → Cookies → https://{mirror} and copy the value of cf_clearance."), MUTED);
+
+            let typed = (app.cf_agent_input.trim(), app.cf_cookie_input.trim());
+            let changed = match &saved {
+                Some(s) => typed != (s.user_agent.as_str(), s.cookie.as_str()),
+                None => typed != ("", ""),
+            };
+            if changed || saved.is_some() {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    match &saved {
+                        _ if changed => ui.label(widgets::semi("Press Save to use these values", 11.5, MUTED)),
+                        Some(s) if s.mirror == mirror => ui.label(widgets::semi(format!("Saved for {}", s.mirror), 11.5, G2)),
+                        Some(s) => ui.label(widgets::semi(format!("Saved for {}, not used on {mirror}", s.mirror), 11.5, GOLD)),
+                        None => ui.label(""),
+                    };
+                    if saved.is_some() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if pill_button(ui, "Remove", RED, false).on_hover_text("Forget the saved cookie and User Agent").clicked() {
+                                remove = true;
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    });
+    if remove {
+        app.remove_clearance();
+    }
+}
+
+/// "Your IP address": the one Cloudflare sees for the mirror, which the cookie is tied to.
+fn ip_row(app: &mut App, ui: &mut Ui, mirror: &str) {
+    let ip = app.public_ip(mirror);
+    Frame::new()
+        .fill(theme::BG)
+        .stroke(Stroke::new(1.0, LINE))
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
+                icon(ui.painter(), r, "globe", MUTED);
+                ui.label(widgets::semi("Your IP address:", 12.5, TEXT2));
+                match ip {
+                    Some(Ok(ip)) => ui.label(widgets::bold(ip, 12.5, TEXT)),
+                    Some(Err(e)) => ui.label(widgets::semi("couldn't check", 12.5, MUTED)).on_hover_text(e),
+                    None => ui.label(widgets::semi("checking…", 12.5, MUTED)),
+                };
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let compare = pill_button(ui, "Compare in browser ↗", MUTED, false).on_hover_text("Shows the IP your browser uses (the ip= line). It must be the same.");
+                    if compare.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(cloudflare::trace_url(mirror)));
+                    }
+                });
+            });
+        });
+}
+
 fn modal_frame(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) -> bool {
     let mut close = false;
     let full = ui.max_rect();
@@ -412,7 +564,11 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
         ConnStatus::AuthFailed | ConnStatus::NoToken => 2,
         _ => 0,
     };
+    // Cloudflare still hasn't let the app through: offer the manual cookie
+    let cloudflare = app.casino().behind_cloudflare();
+    let stuck = cloudflare && reach == 0 && since.elapsed() > Duration::from_secs(25);
     let mut open_settings = false;
+    let mut set_cookie = false;
     let close = modal_frame(ui, "Account connection check", |ui| {
         step(ui, reach, &format!("Reaching {}", app.casino_site()));
         // e.g. Stake's Cloudflare check, which can take a few seconds
@@ -422,10 +578,25 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
         step(ui, if reach == 1 { cred } else { 0 }, "Checking account credentials");
         if cred == 2 || reach == 2 {
             ui.add_space(2.0);
-            ui.label(widgets::semi(app.status.long(&app.status_detail), 11.5, RED));
+            let msg = if app.status == ConnStatus::Offline && !app.status_detail.is_empty() { app.status_detail.clone() } else { app.status.long(&app.status_detail) };
+            ui.add(egui::Label::new(widgets::semi(msg, 11.5, RED)).wrap());
             ui.horizontal(|ui| {
                 if button(ui, "Open settings", Btn::Ghost, true, None).clicked() {
                     open_settings = true;
+                }
+                if cloudflare && reach == 2 && button(ui, "Set Cloudflare cookie", Btn::Ghost, true, None).clicked() {
+                    set_cookie = true;
+                }
+            });
+        } else if stuck {
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(widgets::semi("Stuck on Cloudflare? If the casino website opens in your browser, you can copy its Cloudflare cookie into the app.", 11.5, TEXT2)).wrap());
+            ui.horizontal(|ui| {
+                if button(ui, "Set cookie manually", Btn::Ghost, true, None).clicked() {
+                    set_cookie = true;
+                }
+                if button(ui, "Casino website ↗", Btn::Ghost, true, None).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://{}/", app.settings.mirror().unwrap_or_default())));
                 }
             });
         }
@@ -436,6 +607,9 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
     if open_settings {
         app.cancel_check();
         app.open_settings();
+    }
+    if set_cookie {
+        app.open_cookie_settings();
     }
     let _ = StrokeKind::Inside;
 }

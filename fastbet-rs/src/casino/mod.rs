@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::cloudflare::Clearance;
 use crate::money::Units;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,6 +54,11 @@ impl CasinoId {
 
     pub fn default_mirror(self) -> Option<&'static str> {
         self.mirrors().first().copied()
+    }
+
+    /// Sits behind Cloudflare checks, so the user can hand over a clearance cookie from their browser.
+    pub fn behind_cloudflare(self) -> bool {
+        matches!(self, CasinoId::Stake)
     }
 
     /// Whether the account can also be linked through the embedded login window.
@@ -366,6 +372,8 @@ pub trait Casino: Send + Sync {
     fn set_token(&self, token: Option<String>);
     /// Switch to another of the casino's domains (see [`CasinoId::mirrors`]).
     fn set_mirror(&self, _mirror: &str) {}
+    /// Cloudflare cookie from the user's browser (see [`CasinoId::behind_cloudflare`]).
+    fn set_clearance(&self, _clearance: Option<Clearance>) {}
     /// Close the socket for good.
     fn shutdown(&self);
     async fn bet_limbo(&self, req: &BetRequest) -> Result<BetReply, CasinoError>;
@@ -378,11 +386,19 @@ pub trait Casino: Send + Sync {
 }
 
 /// Spawns the casino's connection tasks on the current tokio runtime.
-pub fn connect(id: CasinoId, token: Option<String>, mirror: Option<String>, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
+pub fn connect(id: CasinoId, setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
     match id {
-        CasinoId::ChipsGg => chipsgg::ChipsGg::spawn(token, events),
-        CasinoId::Stake => stake::Stake::spawn(token, mirror, events),
+        CasinoId::ChipsGg => chipsgg::ChipsGg::spawn(setup.token, events),
+        CasinoId::Stake => stake::Stake::spawn(setup, events),
     }
+}
+
+/// What a casino connects with: the login token plus, where the casino has them, mirror and Cloudflare cookie.
+#[derive(Clone, Debug, Default)]
+pub struct Setup {
+    pub token: Option<String>,
+    pub mirror: Option<String>,
+    pub clearance: Option<Clearance>,
 }
 
 /// Reconnect delay: 0.3 s doubling up to 5 s.

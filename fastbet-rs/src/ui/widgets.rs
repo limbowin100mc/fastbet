@@ -817,6 +817,12 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.line_segment([at(0.92, 0.7), at(0.08, 0.7)], s);
             p.add(egui::Shape::line(vec![at(0.3, 0.48), at(0.08, 0.7), at(0.3, 0.92)], s));
         }
+        "globe" => {
+            let (c, rad) = (r.center(), r.width() / 2.0);
+            p.circle_stroke(c, rad, s);
+            p.add(egui::Shape::ellipse_stroke(c, vec2(rad * 0.42, rad), s));
+            p.line_segment([c - vec2(rad, 0.0), c + vec2(rad, 0.0)], s);
+        }
         "trash" => {
             p.line_segment([at(0.05, 0.2), at(0.95, 0.2)], s);
             p.add(egui::Shape::line(vec![at(0.35, 0.2), at(0.38, 0.04), at(0.62, 0.04), at(0.65, 0.2)], s));

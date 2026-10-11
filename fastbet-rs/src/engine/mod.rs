@@ -18,10 +18,12 @@ pub const MAX_QUEUE: usize = 10;
 
 #[derive(Debug)]
 pub enum Command {
-    SetCasino { id: CasinoId, token: Option<String>, mirror: Option<String> },
+    SetCasino { id: CasinoId, setup: casino::Setup },
     SetToken(Option<String>),
     /// Reconnect through another of the casino's domains.
     SetMirror(String),
+    /// Cloudflare cookie from the user's browser, or none.
+    SetClearance(Option<crate::cloudflare::Clearance>),
     Bet { req: BetRequest, hit_line: Option<f64> },
     StartAuto(AutoConfig),
     StopAuto,
@@ -252,7 +254,7 @@ impl Engine {
     async fn command_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Command>) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::SetCasino { id, token, mirror } => self.set_casino(id, token, mirror),
+                Command::SetCasino { id, setup } => self.set_casino(id, setup),
                 Command::SetToken(token) => {
                     if let Some(c) = self.casino.lock().clone() {
                         c.set_token(token);
@@ -261,6 +263,11 @@ impl Engine {
                 Command::SetMirror(mirror) => {
                     if let Some(c) = self.casino.lock().clone() {
                         c.set_mirror(&mirror);
+                    }
+                }
+                Command::SetClearance(clearance) => {
+                    if let Some(c) = self.casino.lock().clone() {
+                        c.set_clearance(clearance);
                     }
                 }
                 Command::Bet { req, hit_line } => {
@@ -359,7 +366,7 @@ impl Engine {
         }
     }
 
-    fn set_casino(self: &Arc<Self>, id: CasinoId, token: Option<String>, mirror: Option<String>) {
+    fn set_casino(self: &Arc<Self>, id: CasinoId, setup: casino::Setup) {
         if let Some(old) = self.casino.lock().take() {
             old.shutdown();
         }
@@ -372,7 +379,7 @@ impl Engine {
         self.emit_seed();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<CasinoEvent>();
-        let casino = casino::connect(id, token, mirror, tx);
+        let casino = casino::connect(id, setup, tx);
         tracing::info!("connecting to {}", casino.id().name());
         *self.casino.lock() = Some(casino);
 

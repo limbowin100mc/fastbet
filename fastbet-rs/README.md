@@ -33,6 +33,15 @@ Under the hood the login window is a second `fastbet.exe` process (`fastbet --lo
 
 Stake is reached over its GraphQL API (`/_api/graphql`, the `limboBet` and `rotateSeedPair` mutations), signed in with your API token in the `x-access-token` header. Stake's domains sit behind Cloudflare checks that turn plain HTTP clients away (stake.com answers them with its "blocked" page), so every call runs through the same hidden WebView2 browser bridge the slots use, parked on the chosen mirror (its own browser profile, `webview\stake`). A fresh bridge usually passes the check by itself within a few seconds; if Cloudflare wants a click, the bridge window pops up (*FastBet – security check*) and hides again once you're through. If a mirror stays blocked, pick another one in Settings.
 
+**Cloudflare cookie by hand.** Some connections never get through the check inside the app even though the site opens fine in a normal browser. For those, the Stake settings card has *Set Cloudflare cookie manually* (the connection check offers it too once it has been stuck on Cloudflare for 25 s):
+
+1. In Chrome or Edge on the same PC, open the same mirror the app uses and wait until the site loads.
+2. *Get User Agent ↗* opens Cloudflare's info page on that mirror (`/cdn-cgi/trace`): copy everything after `uag=` into **User Agent**.
+3. Press F12 → *Application* → *Cookies* → `https://<mirror>` and copy the value of `cf_clearance` into **Cloudflare clearance cookie**. A whole `Cookie:` header or `cf_clearance=…` works too; the app picks the value out.
+4. Press **Save**. The app reconnects with that User Agent and cookie (a separate browser profile, `webview\stake-cf`, so the automatic one stays untouched).
+
+Cloudflare ties the cookie to the browser's User Agent, your IP address and the mirror. *Your IP address* in the card is the one Cloudflare sees from the app; *Compare in browser ↗* shows your browser's (the `ip=` line), and they must match. A cookie saved for one mirror is only used on that mirror; after an IP change (new router lease, VPN) copy a fresh one. *Remove* forgets it.
+
 - Balances come from the account and are updated locally after every bet; while no bet is running they are re-read every 10 s. Stake keeps the selected coin in the browser, not the account, so the app starts on your biggest balance; pick another in the balance pill.
 - Bet amounts go out as floats with 8 decimals, like the site sends them. Each bet carries a random 21-character `identifier`, and the reply's nonce is shown in the table.
 - Stake's "slow down" replies (parallel-bet or rate-limit errors, HTTP 429) count as busy and are retried like on chips.gg.
@@ -94,6 +103,7 @@ src/
     mod.rs           the Casino trait + shared types (Market, BetReply, ProvableState …)
     chipsgg.rs       chips.gg websocket client
     stake.rs         Stake GraphQL client (through the browser bridge) + the mirror list
+  cloudflare.rs      cf_clearance cookie + User Agent pasted from the user's browser, IP check
   bridge.rs          hidden WebView2 that runs fetch() on a site's origin for us
   engine/mod.rs      bet lane, busy retries, seed rotation, autobet loop
   ui/                screens (accounts, lobby, limbo), controls, stats, theme, widgets, sound
@@ -108,7 +118,7 @@ src/
 ### Adding a casino
 
 1. Add a variant to `CasinoId` in `src/casino/mod.rs` (name, game/login URL, token-watch script, target limits, mirrors, whether it has slots and a login window).
-2. Add a module that implements the `Casino` trait: `bet_limbo`, `rotate_seed`, `provable_state`, `set_token`, `shutdown` (and `set_mirror` if it has mirrors), and emits `CasinoEvent::{Status, Market, Provable}`.
+2. Add a module that implements the `Casino` trait: `bet_limbo`, `rotate_seed`, `provable_state`, `set_token`, `shutdown` (and `set_mirror` if it has mirrors, `set_clearance` if it sits behind Cloudflare; mark it in `CasinoId::behind_cloudflare`), and emits `CasinoEvent::{Status, Market, Provable}`.
 3. Wire it up in `casino::connect`, and add its logo: a white, single-colour SVG in `assets/casinos/` hooked up in `ui::logos::svg`. Keep these to plain path data (no scripts or external references); they are drawn in the account list and on the account page.
 
 Nothing in the engine or UI needs to change.
@@ -123,13 +133,15 @@ Nothing in the engine or UI needs to change.
 
 The button is disabled while an auto run or slot autoplay is going. To ship an update, push a `v*` tag (see `.github/workflows/release.yml`); the release it creates is what the app finds.
 
+The AppImage is built on Ubuntu 22.04 so it runs on older distros, then repacked by `packaging/appimage-drop-libs.sh` without the bundled `libxkbcommon`: that 2022 copy can't read the keymaps newer Wayland desktops send (KDE on CachyOS/Arch), and winit then crashes on the first key press. The system's own copy is used instead.
+
 For UI work: `FASTBET_UPDATE=1` runs the check at start, `FASTBET_PRETEND_VERSION=2.9.0` makes the app believe it is older, `FASTBET_WELCOME_MENU=1` opens the gear menu. `cargo test -- --ignored` downloads a real release file and checks the digest handling.
 
 ## Settings file
 
-`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, the chosen Stake mirror and the login tokens, so keep it private: a Stake API token works like a password for your account.
+`%APPDATA%\fastbet\FastBet\config\settings.json` on Windows (the platform config dir elsewhere). Contains your settings, the chosen Stake mirror, a Cloudflare cookie if you set one, and the login tokens, so keep it private: a Stake API token works like a password for your account.
 
-For UI work, `FASTBET_MIRRORS=<search>` opens the account settings with the mirror list already open (`1` for no search).
+For UI work, `FASTBET_MIRRORS=<search>` opens the account settings with the mirror list already open (`1` for no search), and `FASTBET_CLOUDFLARE=1` opens them on the Cloudflare cookie section.
 
 ## Tests
 

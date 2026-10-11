@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use egui::{pos2, Align, Frame, Key, Layout, Margin, RichText, Stroke};
 
 use crate::casino::{BetRequest, CasinoId, ConnStatus, CurrencyInfo, Market, ProvableState};
+use crate::cloudflare::{Clearance, IpCheck};
 use crate::engine::{self, AutoConfig, AutoState, Command, EngineHandle, Event, SeedInfo};
 use crate::login::LoginSession;
 use crate::money::{self, format_units, parse_units, to_f64, Units};
@@ -73,6 +74,12 @@ pub struct App {
     pub mirror_input: String,
     pub mirror_search: String,
     pub mirror_open: bool,
+    /// Cloudflare cookie section of the account settings (casinos behind Cloudflare).
+    pub cf_open: bool,
+    pub cf_agent_input: String,
+    pub cf_cookie_input: String,
+    /// The IP address Cloudflare sees, for the picked mirror.
+    cf_ip: Option<IpCheck>,
 
     pub status: ConnStatus,
     pub status_detail: String,
@@ -138,7 +145,7 @@ impl App {
         };
         let preview: Option<usize> = std::env::var("FASTBET_PREVIEW").ok().map(|v| v.parse().unwrap_or(400));
         if preview.is_none() {
-            engine.send(Command::SetCasino { id: settings.casino, token: settings.token(), mirror: settings.mirror() });
+            engine.send(Command::SetCasino { id: settings.casino, setup: settings.setup() });
         }
         engine.send(Command::SeedPolicy { every: settings.seed_every() });
         engine.send(Command::SetConcurrency(settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
@@ -166,6 +173,10 @@ impl App {
             mirror_input: String::new(),
             mirror_search: String::new(),
             mirror_open: false,
+            cf_open: false,
+            cf_agent_input: String::new(),
+            cf_cookie_input: String::new(),
+            cf_ip: None,
             status: ConnStatus::Connecting,
             status_detail: String::new(),
             market: Market::default(),
@@ -208,6 +219,11 @@ impl App {
             app.open_settings();
             app.mirror_open = true;
             app.mirror_search = if q == "1" { String::new() } else { q };
+        }
+        // FASTBET_CLOUDFLARE=1: account settings open on the Cloudflare cookie section (UI work)
+        if std::env::var("FASTBET_CLOUDFLARE").is_ok() {
+            app.open_settings();
+            app.cf_open = true;
         }
         // FASTBET_UPDATE=1: run "Check for updates" at start (UI work)
         if std::env::var("FASTBET_UPDATE").is_ok() {
@@ -566,7 +582,7 @@ impl App {
         self.provable = ProvableState::default();
         self.status = ConnStatus::Connecting;
         self.status_detail.clear();
-        self.engine.send(Command::SetCasino { id, token: self.settings.token(), mirror: self.settings.mirror() });
+        self.engine.send(Command::SetCasino { id, setup: self.settings.setup() });
         self.engine.send(Command::SeedPolicy { every: self.settings.seed_every() });
         self.mark_dirty();
     }
@@ -606,8 +622,50 @@ impl App {
         self.mirror_input = self.settings.mirror().unwrap_or_default();
         self.mirror_search.clear();
         self.mirror_open = false;
+        let saved = self.settings.clearance();
+        self.cf_open = saved.is_some();
+        self.cf_agent_input = saved.as_ref().map(|c| c.user_agent.clone()).unwrap_or_default();
+        self.cf_cookie_input = saved.map(|c| c.cookie).unwrap_or_default();
+        self.cf_ip = None;
         self.onboard_error = None;
         self.stage = Stage::Settings;
+    }
+
+    /// Settings with the Cloudflare cookie section open (the connection check is stuck on Cloudflare).
+    pub fn open_cookie_settings(&mut self) {
+        self.cancel_check();
+        self.open_settings();
+        self.cf_open = true;
+    }
+
+    /// The IP address Cloudflare sees on `domain`, looked up once per domain. `None` while asking.
+    pub fn public_ip(&mut self, domain: &str) -> Option<Result<String, String>> {
+        if self.cf_ip.as_ref().map(|c| c.domain.as_str()) != Some(domain) {
+            self.cf_ip = Some(IpCheck::start(domain, self.repaint.clone()));
+        }
+        self.cf_ip.as_ref().and_then(IpCheck::result)
+    }
+
+    /// Stores (or drops) the Cloudflare cookie and hands it to the casino.
+    fn store_clearance(&mut self, clearance: Option<Clearance>) {
+        if self.settings.clearance() == clearance {
+            return;
+        }
+        let key = self.casino().key().to_string();
+        match &clearance {
+            Some(c) => self.settings.clearances.insert(key, c.clone()),
+            None => self.settings.clearances.remove(&key),
+        };
+        self.engine.send(Command::SetClearance(clearance));
+    }
+
+    /// Cloudflare section: Remove pressed.
+    pub fn remove_clearance(&mut self) {
+        self.cf_agent_input.clear();
+        self.cf_cookie_input.clear();
+        self.store_clearance(None);
+        self.settings.save();
+        self.onboard_error = None;
     }
 
     pub fn close_settings(&mut self) {
@@ -624,11 +682,33 @@ impl App {
         }
         self.mirror_open = false;
         let mirror = crate::casino::stake::normalize_mirror(&self.mirror_input);
+        let clearance = if self.casino().behind_cloudflare() {
+            let on = if mirror.is_empty() { self.settings.mirror().unwrap_or_default() } else { mirror.clone() };
+            match Clearance::from_input(&on, &self.cf_agent_input, &self.cf_cookie_input) {
+                // untouched values stay with the mirror they came from
+                Ok(Some(c)) => Some(self.settings.clearance().filter(|s| s.user_agent == c.user_agent && s.cookie == c.cookie).unwrap_or(c)),
+                Ok(None) => None,
+                Err(e) => {
+                    self.cf_open = true;
+                    self.onboard_error = Some(e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if self.settings.mirror().is_some() && !mirror.is_empty() && self.settings.mirror().as_deref() != Some(mirror.as_str()) {
             self.settings.mirrors.insert(self.casino().key().to_string(), mirror.clone());
             self.engine.send(Command::SetMirror(mirror));
             self.status = ConnStatus::Connecting;
             self.status_detail.clear();
+        }
+        if self.casino().behind_cloudflare() {
+            if let Some(c) = &clearance {
+                self.cf_agent_input = c.user_agent.clone();
+                self.cf_cookie_input = c.cookie.clone();
+            }
+            self.store_clearance(clearance);
         }
         *self.settings.token_mut() = key;
         self.settings.save();

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::casino::CasinoId;
+use crate::cloudflare::Clearance;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -55,6 +56,8 @@ pub struct Settings {
     pub usernames: BTreeMap<String, String>,
     /// Chosen domain per casino that has mirrors (Stake).
     pub mirrors: BTreeMap<String, String>,
+    /// Cloudflare cookie the user copied from their browser, per casino behind Cloudflare.
+    pub clearances: BTreeMap<String, Clearance>,
 
     pub mode: Mode,
     /// Empty = follow the currency selected on the site.
@@ -108,6 +111,7 @@ impl Default for Settings {
             tokens: Default::default(),
             usernames: Default::default(),
             mirrors: Default::default(),
+            clearances: Default::default(),
             mode: Mode::Manual,
             currency: String::new(),
             unit: Unit::Coin,
@@ -191,6 +195,16 @@ impl Settings {
         let default = self.casino.default_mirror()?;
         let saved = self.mirrors.get(self.casino.key()).map(|m| crate::casino::stake::normalize_mirror(m)).filter(|m| !m.is_empty());
         Some(saved.unwrap_or_else(|| default.to_string()))
+    }
+
+    /// Saved Cloudflare cookie for the current casino.
+    pub fn clearance(&self) -> Option<Clearance> {
+        self.clearances.get(self.casino.key()).filter(|c| c.is_complete()).cloned()
+    }
+
+    /// Everything the current casino connects with.
+    pub fn setup(&self) -> crate::casino::Setup {
+        crate::casino::Setup { token: self.token(), mirror: self.mirror(), clearance: self.clearance() }
     }
 
     /// Bets between automatic seed changes, 0 = off.

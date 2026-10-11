@@ -3,6 +3,7 @@
 
 mod bridge;
 mod casino;
+mod cloudflare;
 mod engine;
 mod login;
 mod money;
