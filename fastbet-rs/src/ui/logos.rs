@@ -14,6 +14,7 @@ fn svg(id: CasinoId) -> &'static [u8] {
         CasinoId::Stake => include_bytes!("../../assets/casinos/stake.svg"),
         CasinoId::Shuffle => include_bytes!("../../assets/casinos/shuffle.svg"),
         CasinoId::Goated => include_bytes!("../../assets/casinos/goated.svg"),
+        CasinoId::Gambulls => include_bytes!("../../assets/casinos/gambulls.svg"),
     }
 }
 

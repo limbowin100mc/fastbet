@@ -157,7 +157,7 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
             }
             Event::UserEvent(UserEvent::Cookies(url)) => {
                 // `COOKIES <url>`: the cookies the browser holds for it, HttpOnly ones included
-                // (not used by the app: a way to get real cookies when testing the browser login)
+                // (Gambulls reads its renewed login cookie this way)
                 let list: Vec<BridgeCookie> = webview
                     .cookies_for_url(&url)
                     .map(|cs| cs.iter().map(|c| BridgeCookie { name: c.name().to_string(), value: c.value().to_string(), domain: c.domain().unwrap_or("").to_string() }).collect())
@@ -217,6 +217,8 @@ const BRIDGE_SCRIPT: &str = r#"(function () {
 // --------------------------------------------------------------- parent side
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<BridgeResponse>>>>;
+/// Who waits for the answer to a `COOKIES` line (one at a time).
+type CookieWait = Arc<Mutex<Option<oneshot::Sender<Vec<BridgeCookie>>>>>;
 
 /// A running bridge process. Cloning shares it.
 #[derive(Clone)]
@@ -228,6 +230,7 @@ struct Inner {
     child: Mutex<Child>,
     stdin: Mutex<std::process::ChildStdin>,
     pending: Pending,
+    cookies: CookieWait,
     seq: AtomicU64,
 }
 
@@ -265,15 +268,21 @@ impl Bridge {
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let cookies: CookieWait = Arc::new(Mutex::new(None));
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         {
             let pending = pending.clone();
+            let cookies = cookies.clone();
             std::thread::spawn(move || {
                 let mut ready = Some(ready_tx);
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if line == "READY" {
                         if let Some(t) = ready.take() {
                             let _ = t.send(());
+                        }
+                    } else if let Some(json) = line.strip_prefix("COOKIES ") {
+                        if let Some(tx) = cookies.lock().unwrap().take() {
+                            let _ = tx.send(serde_json::from_str(json).unwrap_or_default());
                         }
                     } else if let Some(rest) = line.strip_prefix("RES ") {
                         if let Some((id, json)) = rest.split_once(' ') {
@@ -292,7 +301,7 @@ impl Bridge {
             });
         }
         let bridge = Self {
-            inner: Arc::new(Inner { child: Mutex::new(child), stdin: Mutex::new(stdin), pending, seq: AtomicU64::new(1) }),
+            inner: Arc::new(Inner { child: Mutex::new(child), stdin: Mutex::new(stdin), pending, cookies, seq: AtomicU64::new(1) }),
         };
         match tokio::time::timeout(Duration::from_secs(45), ready_rx).await {
             Ok(Ok(())) => Ok(bridge),
@@ -336,6 +345,22 @@ impl Bridge {
         let res = self.request(BridgeRequest { method: "POST".into(), url: url.into(), headers: h, body: Some(body.to_string()) }).await?;
         let v = serde_json::from_str(&res.body).map_err(|_| format!("HTTP {}: {}", res.status, res.body.chars().take(200).collect::<String>()))?;
         Ok((res.status, v))
+    }
+
+    /// The cookies the bridge's browser holds for `url`, HttpOnly ones included (a site that
+    /// renews its login cookie as it is used).
+    pub async fn cookies(&self, url: &str) -> Result<Vec<BridgeCookie>, String> {
+        let (tx, rx) = oneshot::channel();
+        *self.inner.cookies.lock().unwrap() = Some(tx);
+        {
+            let mut stdin = self.inner.stdin.lock().unwrap();
+            stdin.write_all(format!("COOKIES {url}
+").as_bytes()).and_then(|_| stdin.flush()).map_err(|e| format!("bridge write: {e}"))?;
+        }
+        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(list)) => Ok(list),
+            _ => Err("bridge didn't list its cookies".into()),
+        }
     }
 
     /// Shows or hides the bridge window (a Cloudflare check that wants a click).

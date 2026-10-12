@@ -105,9 +105,10 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::Token(t)) => {
-                let t = match id.login_cookie() {
-                    Some((url, name)) => with_cookie(&webview, &t, url, name, &mut misses),
-                    None => t,
+                let t = match (id.login_cookie(), id.cookie_login()) {
+                    (Some((url, name)), _) => with_cookie(&webview, &t, url, name, &mut misses),
+                    (None, Some((url, name))) => cookie_token(&webview, url, name),
+                    (None, None) => t,
                 };
                 let t = t.trim().to_string();
                 if !t.is_empty() && t != last {
@@ -146,6 +147,16 @@ fn with_cookie(webview: &wry::WebView, report: &str, url: &str, name: &str, miss
         o.remove("tick");
     }
     v.to_string()
+}
+
+/// A login that is an HttpOnly cookie (Gambulls): the report is the cookie `name` as the token,
+/// logged in once the browser holds it.
+fn cookie_token(webview: &wry::WebView, url: &str, name: &str) -> String {
+    let value = webview.cookies_for_url(url).ok().and_then(|cs| cs.iter().find(|c| c.name() == name).map(|c| c.value().to_string())).filter(|v| !v.is_empty());
+    match value {
+        Some(v) => serde_json::json!({ "token": v, "loggedIn": true }).to_string(),
+        None => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
+    }
 }
 
 /// Traffic capture for reverse-engineering a slot provider: opens `url` in a

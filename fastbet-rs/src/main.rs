@@ -60,6 +60,13 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `fastbet --gambulls-test [bets]`: connects to Gambulls the way the app does (see `casino::gambulls::self_test`).
+    if args.len() >= 2 && args[1] == "--gambulls-test" {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(casino::gambulls::self_test(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)));
+        return Ok(());
+    }
+
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FastBet")
