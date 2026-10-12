@@ -117,7 +117,23 @@ impl CasinoId {
     /// Slot producers the app can autoplay here, in lobby order. Empty: no slots.
     pub fn slot_producers(self) -> &'static [&'static str] {
         match self {
-            CasinoId::ChipsGg => &["hacksawgaming", "avatarux", "bgaming"],
+            CasinoId::ChipsGg => &[
+                "hacksawgaming",
+                "pragmaticplay",
+                "relaxgaming",
+                "playson",
+                "bgaming",
+                "avatarux",
+                "onetouch",
+                "onlyplay",
+                "penguinking",
+                "peter&sons",
+                "popiplay",
+                "shadylady",
+                "slotmillgames",
+                "spinomenal",
+                "wickedgames",
+            ],
             CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
             CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls => &[],
         }

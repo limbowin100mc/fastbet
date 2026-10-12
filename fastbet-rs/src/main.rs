@@ -60,6 +60,13 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `fastbet --slot-test <producer> <launch-url> [spins] [feature]`: a slot session the way the app opens it.
+    if args.len() >= 4 && args[1] == "--slot-test" {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(slots::self_test(&args[2], &args[3], args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5), args.get(5).map(String::as_str)));
+        return Ok(());
+    }
+
     // `fastbet --gambulls-test [bets]`: connects to Gambulls the way the app does (see `casino::gambulls::self_test`).
     if args.len() >= 2 && args[1] == "--gambulls-test" {
         let rt = tokio::runtime::Runtime::new().expect("runtime");

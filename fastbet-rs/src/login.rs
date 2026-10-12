@@ -315,14 +315,21 @@ const CAPTURE_SCRIPT: &str = r#"(function () {
       send({ kind: 'globals', res: JSON.stringify(extra.slice(0, 300)) });
     } catch (e) {}
   }, 25000);
-  // websockets
+  // websockets (binary frames as base64: "b64:…")
   var NW = window.WebSocket;
+  function wsData(d) {
+    try {
+      var b = d instanceof ArrayBuffer ? new Uint8Array(d) : (ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : null);
+      if (b) { var s = ''; for (var i = 0; i < Math.min(b.length, LIM); i++) s += String.fromCharCode(b[i]); return 'b64:' + btoa(s); }
+    } catch (e) {}
+    return cut(d);
+  }
   function W(u, p) {
     var ws = p === undefined ? new NW(u) : new NW(u, p);
     send({ kind: 'ws-open', url: String(u) });
     var os = ws.send;
-    ws.send = function (d) { send({ kind: 'ws-send', url: String(u), req: cut(d) }); return os.apply(ws, arguments); };
-    ws.addEventListener('message', function (ev) { send({ kind: 'ws-recv', url: String(u), res: cut(ev.data) }); });
+    ws.send = function (d) { send({ kind: 'ws-send', url: String(u), req: wsData(d) }); return os.apply(ws, arguments); };
+    ws.addEventListener('message', function (ev) { send({ kind: 'ws-recv', url: String(u), res: wsData(ev.data) }); });
     return ws;
   }
   W.prototype = NW.prototype; W.CONNECTING = 0; W.OPEN = 1; W.CLOSING = 2; W.CLOSED = 3;

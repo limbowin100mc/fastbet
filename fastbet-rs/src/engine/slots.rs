@@ -102,12 +102,11 @@ impl Engine {
     }
 
     async fn connect_slot(&self, game: SlotGame, mode: PlayMode, currency: String) {
-
         let Some(provider) = Provider::for_producer(&game.producer) else {
             return self.slot_fail(format!("{} games are not supported yet", game.producer));
         };
         let result: Result<Arc<dyn SlotSession>, String> = async {
-            // the casino's launch URL, for everything except Hacksaw demo
+            // the casino's launch URL
             let launch_url = |demo: bool| {
                 let game = game.clone();
                 let currency = currency.clone();
@@ -132,44 +131,15 @@ impl Engine {
                     Err(last)
                 }
             };
-            // … followed through the launcher's redirects to the final game URL
-            let launched = |demo: bool| {
-                let url = launch_url(demo);
-                async move { resolve_launcher(&url.await?).await }
-            };
             match provider {
-                Provider::Hacksaw => {
-                    let launch = if mode == PlayMode::Demo {
-                        let gid = game.provider_game_id.as_deref().and_then(|s| s.parse().ok()).ok_or("No provider game id for this game")?;
-                        Launch::demo(gid)
-                    } else {
-                        let final_url = launched(false).await?;
-                        let mut l = Launch::from_url(&final_url, "USD").ok_or_else(|| format!("Could not read the launch parameters from {final_url}"))?;
-                        l.env = crate::slots::hacksaw::live_env(&l.partner).await;
-                        l
-                    };
-                    let s = HacksawSession::open(launch).await.map_err(|e| e.to_string())?;
+                // Hacksaw's demo needs no launch from the casino
+                Provider::Hacksaw if mode == PlayMode::Demo => {
+                    let gid = game.provider_game_id.as_deref().and_then(|s| s.parse().ok()).ok_or("No provider game id for this game")?;
+                    let s = HacksawSession::open(Launch::demo(gid)).await.map_err(|e| e.to_string())?;
                     Ok(Arc::new(s) as Arc<dyn SlotSession>)
                 }
-                Provider::Avatarux => {
-                    let final_url = launched(mode == PlayMode::Demo).await?;
-                    let l = crate::slots::avatarux::Launch::from_url(&final_url).ok_or_else(|| format!("Could not read the launch parameters from {final_url}"))?;
-                    let s = crate::slots::avatarux::AvataruxSession::open(l).await.map_err(|e| e.to_string())?;
-                    Ok(Arc::new(s) as Arc<dyn SlotSession>)
-                }
-                Provider::Bgaming => {
-                    let final_url = launched(mode == PlayMode::Demo).await?;
-                    let l = crate::slots::bgaming::Launch::from_url(&final_url).ok_or_else(|| format!("Could not read the launch parameters from {final_url}"))?;
-                    let s = crate::slots::bgaming::BgamingSession::open(l).await.map_err(|e| e.to_string())?;
-                    Ok(Arc::new(s) as Arc<dyn SlotSession>)
-                }
-                Provider::StakeEngine => {
-                    // the game URL itself carries the RGS session; the game client is never loaded
-                    let url = launch_url(mode == PlayMode::Demo).await?;
-                    let l = crate::slots::stake_engine::Launch::from_url(&url).ok_or("Stake didn't return a game session")?;
-                    let s = crate::slots::stake_engine::StakeEngineSession::open(l).await.map_err(|e| e.to_string())?;
-                    Ok(Arc::new(s) as Arc<dyn SlotSession>)
-                }
+                // everyone else starts from the casino's launch URL (Stake Engine's carries the RGS session itself)
+                other => crate::slots::open_launch(other, &launch_url(mode == PlayMode::Demo).await?).await,
             }
         }
         .await;
@@ -381,26 +351,4 @@ impl Engine {
             }
         }
     }
-}
-
-/// Follows the casino's launcher redirect (plain HTTP, no browser needed) and
-/// returns the final URL whose query string carries the launch parameters.
-async fn resolve_launcher(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut current = url.to_string();
-    for _ in 0..6 {
-        let res = client.get(&current).send().await.map_err(|e| format!("launcher: {e}"))?;
-        if res.status().is_redirection() {
-            if let Some(loc) = res.headers().get("location").and_then(|v| v.to_str().ok()) {
-                current = if loc.starts_with("http") { loc.to_string() } else { format!("{}{}", current.split('/').take(3).collect::<Vec<_>>().join("/"), loc) };
-                continue;
-            }
-        }
-        return Ok(current);
-    }
-    Ok(current)
 }

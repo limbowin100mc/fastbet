@@ -1,6 +1,6 @@
-//! BGaming driver. The launcher redirects to an "interlayer" page whose
+//! BGaming driver (Popiplay runs the same platform). The launcher redirects to an "interlayer" page whose
 //! `_target` is the game page on demo./beta.bgaming-network.com; that page
-//! embeds a JSON config with the per-session API endpoint:
+//! embeds a JSON config with the per-session API endpoint (and a CSRF header Popiplay checks):
 //!   POST {api} {"command":"init"}                       -> options.available_bets (minor units),
 //!                                                          default_bet, currency{code, exponent}, balance.wallet
 //!   POST {api} {"command":"spin","options":{"bet":N}}  -> outcome.win, balance.wallet, flow{state, available_actions}
@@ -21,7 +21,7 @@ pub struct Launch {
 impl Launch {
     /// From the interlayer URL (or a direct game page URL).
     pub fn from_url(url: &str) -> Option<Self> {
-        if url.contains("bgaming-network.com/games/") {
+        if url.contains("bgaming-network.com/games/") || url.contains("popiplay.network/games/") {
             return Some(Self { page_url: url.to_string() });
         }
         let map = super::hacksaw::query_map(url);
@@ -38,6 +38,8 @@ impl Launch {
 pub struct BgamingSession {
     bridge: Bridge,
     api: String,
+    /// (header, value) the page asks every API call to carry
+    csrf: Option<(String, String)>,
     info: SessionInfo,
 }
 
@@ -50,10 +52,12 @@ impl BgamingSession {
             .map_err(|e| SlotError::Bridge(e.to_string()))?;
         let html = client.get(&launch.page_url).send().await.map_err(|e| SlotError::Bridge(format!("game page: {e}")))?.text().await.unwrap_or_default();
         let api = extract_json_string(&html, "\"api\":\"").ok_or_else(|| SlotError::Provider("Could not find the game API in the game page".into()))?;
+        let csrf = extract_json_string(&html, "\"csrfTokenHeaderValue\":\"").map(|v| (extract_json_string(&html, "\"csrfTokenHeaderName\":\"").unwrap_or_else(|| "X-CSRF-Token".into()), v));
         let origin = api.split('/').take(3).collect::<Vec<_>>().join("/");
         let bridge = Bridge::open(&format!("{origin}/robots.txt")).await.map_err(SlotError::Bridge)?;
 
-        let (status, init) = match bridge.post_json(&api, &[], &json!({ "command": "init" })).await {
+        let headers: Vec<(&str, &str)> = csrf.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (status, init) = match bridge.post_json(&api, &headers, &json!({ "command": "init" })).await {
             Ok(v) => v,
             Err(e) => {
                 bridge.close();
@@ -74,9 +78,9 @@ impl BgamingSession {
             bet_levels,
             default_bet: opts["default_bet"].as_i64(),
             features: vec![],
-            balance: init["balance"]["wallet"].as_i64(),
+            balance: init["balance"]["wallet"].as_i64().map(|w| w + init["balance"]["game"].as_i64().unwrap_or(0)),
         };
-        Ok(Self { bridge, api, info })
+        Ok(Self { bridge, api, csrf, info })
     }
 }
 
@@ -107,7 +111,8 @@ impl SlotSession for BgamingSession {
         let mut events = 0usize;
         let mut free_spins = false;
         for _ in 0..400 {
-            let (status, res) = match self.bridge.post_json(&self.api, &[], &body).await {
+            let headers: Vec<(&str, &str)> = self.csrf.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let (status, res) = match self.bridge.post_json(&self.api, &headers, &body).await {
                 Ok(v) => v,
                 Err(e) if e.starts_with("HTTP 429") => return Err(SlotError::RateLimited),
                 Err(e) => return Err(SlotError::Bridge(e)),
@@ -128,8 +133,9 @@ impl SlotSession for BgamingSession {
             }
             events += 1;
             total_win += res["outcome"]["win"].as_i64().unwrap_or(0);
+            // the round's win sits in `game` until the next action moves it to the wallet
             if let Some(b) = res["balance"]["wallet"].as_i64() {
-                balance = Some(b);
+                balance = Some(b + res["balance"]["game"].as_i64().unwrap_or(0));
             }
             if round_id.is_empty() {
                 round_id = res["flow"]["round_id"].as_i64().map(|r| r.to_string()).or_else(|| res["flow"]["round_id"].as_str().map(str::to_string)).unwrap_or_default();

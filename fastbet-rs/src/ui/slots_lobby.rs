@@ -72,10 +72,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     p.text(pos2(x0, full.top() + 40.0), Align2::LEFT_TOP, "Slots", theme::font_bold(28.0), TEXT);
     let casino = app.casino();
     let names: Vec<&str> = casino.slot_producers().iter().map(|p| Provider::display_producer(p)).collect();
+    // a long provider list reads as a count
+    let who = if names.len() > 4 { format!("{} providers", names.len()) } else { names.join(", ") };
     let sub = if casino.slots_curated() {
-        format!("Autoplay any {} game on {}. No animations, no delays.", names.join(", "), casino.name())
+        format!("Autoplay any {who} game on {}. No animations, no delays.", casino.name())
     } else {
-        format!("Autoplay {} on {}. Other providers show as Untested.", names.join(", "), casino.name())
+        format!("Autoplay slots from {who} on {}. Other providers show as Untested.", casino.name())
     };
     p.text(pos2(x0, full.top() + 82.0), Align2::LEFT_TOP, sub, theme::font(13.5), MUTED);
 
@@ -100,11 +102,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             } else {
                 if !casino.slots_curated() {
                     let featured = app.catalog.featured.clone();
-                    section(app, ui, &format!("Tested · {}", names.join(", ")), &featured, app.catalog.loading > 0 && featured.is_empty());
+                    section(app, ui, &format!("Tested · {who}"), &featured, app.catalog.loading > 0 && featured.is_empty());
                     ui.add_space(18.0);
                 }
                 let all = app.catalog.all.clone();
-                let title = if casino.slots_curated() { format!("{} · most played this week", names.join(", ")) } else { "All video slots".into() };
+                let title = if casino.slots_curated() { format!("{who} · most played this week") } else { "All video slots".into() };
                 section(app, ui, &title, &all, app.catalog.loading > 0 && all.is_empty());
                 if !app.catalog.all_done && !all.is_empty() {
                     ui.add_space(12.0);

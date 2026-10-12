@@ -78,7 +78,7 @@ Shuffle has no API keys, so the account is linked the way Antebot links it: **Op
 
 The **Slots** entry in the rail opens the casino's slot catalog: the search in the middle, then the games as artwork tiles in the shape of the casino's art (chips.gg's are landscape), each with its house edge.
 
-- **chips.gg**: the Hacksaw Gaming, AvatarUX and BGaming games first (marked **Tested**), then every video slot (**Untested** for providers without a driver yet).
+- **chips.gg**: the games of the 15 providers with a driver first (marked **Tested**), then every video slot (**Untested** for providers without a driver yet).
 - **Stake**: only Stake Engine games (Stake's own platform, games by many small studios), most played this week first. Every game in the list is playable, so there are no Tested/Untested badges; the tile shows the house edge and the game page shows the studio.
 
 Click a game to open its page:
@@ -89,7 +89,7 @@ Click a game to open its page:
 - **No. of spins** and **Stop on profit / loss** work like for Limbo. **Stop on next win / Pause / Stop** appear while running.
 - The table shows every round (feature, bet, multiplier, payout, balance); the Session panel on the right keeps the slot stats.
 
-How it works: the app launches the game session through the casino (demo or real), follows the launcher to the game, then talks to the slot provider's game server directly, skipping the game client and all its animations. Providers sit behind Cloudflare or similar bot checks that reject plain HTTP clients, so the calls go through a hidden WebView2 "browser bridge" (`fastbet --bridge <url>`, a child process) parked on the provider's origin.
+How it works: the app launches the game session through the casino (demo or real), follows the launcher to the game, then talks to the slot provider's game server directly, skipping the game client and all its animations. Providers that sit behind Cloudflare or similar bot checks (which reject plain HTTP clients) are called through a hidden WebView2 "browser bridge" (`fastbet --bridge <url>`, a child process) parked on the provider's origin; the others are called over plain HTTPS.
 
 On Stake, `startThirdPartySession(slug, source: <coin>, target: usd)` (or `startThirdPartyDemoSession(slug)`) returns the game URL, which carries the session id and the game server (`rgs_url`). The app never loads that game; it plays Stake Engine's public RGS protocol on the server instead: `/wallet/authenticate` (bet levels and modes), `/wallet/play` (one call returns the whole round, free spins included) and `/wallet/end-round` (settles a winning round; the next play is refused until then).
 
@@ -99,9 +99,21 @@ On Stake, `startThirdPartySession(slug, source: <coin>, target: usd)` (or `start
 | BGaming | Tested | ~90 ms per round. Free-spin rounds are followed to the end. No bonus buys yet. |
 | AvatarUX | Tested | ~150 ms per round plus a round-close call. Ante and bonus-buy modes exposed as feature spins. |
 | Stake Engine (Stake) | Tested on demo | ~150 ms per call; winning rounds need an end-round call. Every mode the game has (ante, bonus buys …) is a feature spin. The game server's Cloudflare drops calls that come too fast (seen from one PC: a short burst, then about 1–2 calls a second), so the app spaces calls out, widens the spacing whenever a call is refused, pauses a few seconds and retries, and narrows it again slowly. |
-| Nolimit City | Not yet | Launches through Evolution's hub with Akamai bot checks, encrypted websocket messages and LZW-compressed replies. Needs its cipher broken first. |
-| Pragmatic Play | Blocked | chips.gg refuses both demo and real launches for this region. |
+| Peter & Sons, Shady Lady, Wicked Games | Tested on demo | Same RGS as AvatarUX (Hub88's b2b platform), same driver. |
+| Popiplay | Tested on demo | BGaming's platform, BGaming driver (plus the page's CSRF header). |
+| Pragmatic Play | Tested on demo | Form POSTs to `gameService`; ante modes and bonus buys. chips.gg refuses launches from some regions (a VPN helps). |
+| Playson | Tested on demo | XML protocol; respins, hold-and-win, choices and buys followed to the end. |
+| Spinomenal | Tested on demo | JSON; free-spin picks and both kinds of buys. The demo server blocks for a minute after ~100 fast calls (the app backs off). |
+| Relax Gaming | Tested on demo | `engine2` JSON (`/play` + `/gamefinished`); the casino-client config/token calls go through the browser bridge. chips.gg refuses launches from some regions. |
+| OneTouch | Tested on demo | JSON; free spins are further `play` calls until the scene is back to `main`. |
+| Onlyplay | Tested on demo | JSON; spin levels and bonus buys (two request styles across games). |
+| Penguin King | Tested on demo | Outstanding Games' platform; the server sets the earliest next bet (~0.75 s per spin). Chance bets and bonus buys. |
+| Slotmill Games | Tested on demo | JSON; bonus rounds are collected with a follow-up call. Bonus buys. |
+| Play'n GO, NetEnt, Red Tiger, Novomatic | Not yet | Play'n GO plays over a SignalR/MessagePack websocket; NetEnt and Red Tiger run in Evolution's casino frontend. |
+| Nolimit City | Not supported | Encrypted websocket messages behind bot checks; FastBet only drives providers whose game protocol is plain. |
 | Others | Untested | Each needs its protocol captured (`fastbet --capture <launch url>` records every request a game makes) and a driver in `src/slots/`. |
+
+Real-money play has been tested on Hacksaw Gaming only; the providers marked "Tested on demo" open real sessions but no real spin has been placed with them yet. `fastbet --slot-test <producer> <launch url> [spins] [feature]` opens a session the way the app does and spins it, for checking a driver.
 
 Adding a provider means a new driver in `src/slots/` implementing `SlotSession` (open session, list bet levels and features, spin), one line in `Provider::for_producer`, and the producer in `CasinoId::slot_producers` for each casino that offers it.
 
