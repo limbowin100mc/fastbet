@@ -32,12 +32,11 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             app.mark_dirty();
         }
         let m = app.settings.orig.moles_count as u32;
-        let txt = if n == 0 {
-            "Click holes on the board: one per round, in order".to_string()
+        if n == 0 {
+            super::readout_idle(ui, "Click holes on the board: one per round, in order");
         } else {
-            format!("{n} rounds planned  ·  pays {} if every one hits", times(moles_multiplier(m, n as u32)))
-        };
-        ui.label(egui::RichText::new(txt).size(11.0).color(MUTED));
+            super::readout(ui, format!("{} planned  ·  pays {} if every one hits", super::count(n as u64, "round"), times(moles_multiplier(m, n as u32))));
+        }
     }
 }
 

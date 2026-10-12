@@ -76,9 +76,9 @@ impl CasinoId {
         matches!(self, CasinoId::Stake)
     }
 
-    /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated).
+    /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated, chips.gg).
     pub fn zero_bets(self) -> bool {
-        matches!(self, CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
     }
 
     /// Whether the account can also be linked through the embedded login window.
@@ -130,7 +130,8 @@ impl CasinoId {
     /// Originals besides Limbo the app can play here, in lobby order.
     pub fn originals(self) -> Vec<Game> {
         match self {
-            CasinoId::ChipsGg | CasinoId::Gambulls => vec![],
+            CasinoId::Gambulls => vec![],
+            CasinoId::ChipsGg => vec![Game::Keno, Game::Mines, Game::Hilo],
             CasinoId::Stake => Game::stake().collect(),
             CasinoId::Goated => vec![Game::Dice, Game::Mines],
             CasinoId::Shuffle => vec![Game::Dice, Game::Mines, Game::Keno, Game::Plinko, Game::Blitz, Game::DragonTower, Game::Chicken],
@@ -143,6 +144,12 @@ impl CasinoId {
             (CasinoId::Shuffle, Game::DragonTower) => "Waifu Tower",
             _ => game.name(),
         }
+    }
+
+    /// HiLo the chips.gg way: red / black and card-kind guesses besides higher and lower, and
+    /// the 1% edge taken once per round instead of on every guess.
+    pub fn hilo_side_guesses(self) -> bool {
+        matches!(self, CasinoId::ChipsGg)
     }
 
     /// Dice win chances accepted here, in percent (Goated pays at most 990×).
@@ -159,6 +166,11 @@ impl CasinoId {
             CasinoId::Shuffle => &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
             _ => &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("expert", "Expert")],
         }
+    }
+
+    /// Slot artwork is landscape (chips.gg's 4:3 thumbnails), so the lobby's tiles are too.
+    pub fn slot_art_landscape(self) -> bool {
+        matches!(self, CasinoId::ChipsGg)
     }
 
     /// The slot catalog lists only games the app can play (Stake: Stake Engine games),

@@ -3,14 +3,14 @@
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Stroke, StrokeKind, Ui};
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, GOLD, MUTED, TEXT, TEXT2};
+use super::super::theme::{self, alpha, GOLD, TEXT, TEXT2};
 use super::super::widgets::Btn;
 use super::super::App;
 use super::{board_button, card, cards_of, hit, payout_color, times};
 use crate::originals::{Game, Round, Step, VIDEO_POKER_PAYTABLE};
 
 pub fn params(_app: &mut App, ui: &mut Ui) {
-    ui.label(egui::RichText::new("Bet to deal five cards, click the ones to hold, then draw.").size(11.0).color(MUTED));
+    super::nothing_to_set(ui, "Nothing to set: bet, then hold and draw on the board.");
 }
 
 pub fn bet_params() -> Result<Value, String> {

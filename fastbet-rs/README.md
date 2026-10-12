@@ -2,7 +2,7 @@
 
 A native desktop app that places Limbo bets straight over the casino's websocket API. No browser, no animations, none of the site's built-in delays. This is the Rust rewrite of the `FastBet for chips.gg Limbo` Chrome extension in the parent folder, built so more casinos can be added later.
 
-- **chips.gg**: Limbo and slots.
+- **chips.gg**: Limbo, Keno, Mines, HiLo and slots.
 - **Stake**: Limbo, 28 more Stake Originals and Stake Engine slots, through stake.com or any of its 131 mirrors.
 - **Shuffle**: Limbo, Dice, Mines, Keno, Plinko, Blitz, Waifu Tower and Chicken, through shuffle.com or any of its 43 mirrors.
 - **Goated**: Limbo, Dice and Mines.
@@ -24,8 +24,8 @@ The binary ends up in `target/release/fastbet.exe`. It is self-contained; copy i
 
 1. **Pick your account**: one row per account (casino logo, casino, the username last seen). A casino can have several accounts. **Add account** lists the casinos; pick one and its settings open. **Remove account**, under an account's settings card, forgets that login on this PC (press it twice).
 2. **Account**: avatar, **Settings** and **Login ›**. Settings holds the **API key**: on chips.gg open *Settings → API Keys → Create API Key*, copy the key (the site shows it only once), paste it and press Save. The same kind of key other betting bots use; it keeps working until you delete it on the site. No key? *log in in a window instead* opens a login window (Microsoft Edge WebView2, part of Windows 11); the app picks up the session token the moment you are in and closes the window by itself. For **Stake** the card asks for the **API token** (*Settings → Security → API Tokens* on Stake; *Get API token ↗* opens it) and the **Mirror** to connect through, a searchable list of stake.com and its mirrors. *Casino website ↗* opens the chosen mirror.
-3. **Login ›** runs the connection check (reaching the casino, checking credentials) and drops you in the **lobby**: left rail, the wallet pill on top, the Limbo tile, and the session stats on the right. The wallet pill shows one balance, in fiat or crypto; click it for the coin list with a search box, **Display in fiat** and **Hide empty balances**. Picking a coin is what you bet with.
-4. **Limbo**: title, session timer and bet count on the left; **Manual Bet / Automatic** tabs in the middle; **Start** on the right. While a run is going, Start becomes **Stop on next win / Pause / Stop**. Settings live in the left panel (General open, the rest as collapsible rows), the result and bet table in the middle.
+3. **Login ›** runs the connection check (reaching the casino, checking credentials) and drops you in the **lobby**: the casino's originals as artwork tiles with their edge (Limbo first), the left rail (Originals, Limbo, Slots), the wallet pill on top, and the session stats on the right. The wallet pill shows one balance, in fiat or crypto; click it for the coin list with a search box, **Display in fiat** and **Hide empty balances**. Picking a coin is what you bet with.
+4. **Limbo**: title, session timer and bet count on the left; **Manual Bet / Automatic** tabs in the middle; **Start** on the right. While a run is going, Start becomes **Stop on next win / Pause / Stop**. Settings live in the left panel: the **Bet** and **Target** cards stay open, the rest fold away and show what is set on their header ("Off", "3 bets · 2 in flight"); a **?** beside a setting explains it on hover. The result and bet table are in the middle.
 
 The casino's logo at the bottom of the rail opens the account menu (username, casino, **Switch account**); Switch account takes you back to the account list. `FASTBET_ACCOUNT_MENU=1` opens it at start, for UI work. The key is stored in your settings file (see below).
 
@@ -68,9 +68,15 @@ Shuffle has no API keys, so the account is linked the way Antebot links it: **Op
 - API: REST at `https://apis.goated.com`, `Authorization: Bearer <access token>`; the access token lives a day and is renewed an hour before it runs out with the refresh cookie (`/user/auth/token/refresh`).
 - Limbo, Dice (win chance 0.1%–98%: Goated pays at most 990× on Dice) and Mines (manual with cash out, or automatic with tiles picked up front). Bets of 0 are allowed.
 
+## chips.gg originals
+
+- Keno, Mines and HiLo go over the same websocket as Limbo (`private.betKeno`; `betMinesGame`, `pickMinesGameTile`, `cashoutMinesGame`; `betHiloGame`, `chooseHighOrLow`, `cashoutHiloGame`) and reuse Stake's boards. Keno pays exactly like Stake's. Mines pays chips.gg's own table (`public.getGameConfig`, cut to cents). Its auto bets reveal the picked tiles one by one and cash out, because chips.gg has no one-request auto bet.
+- HiLo adds chips.gg's side guesses: red, black, and the same kind of card (a number 2–10, a face card or an ace). chips.gg takes its 1% edge once per round, so each right guess multiplies the payout by exactly 1 / chance. Skipped cards alone can't be cashed out.
+- Bets of 0 are allowed, on Limbo too.
+
 ## Slots
 
-The **Slots** entry in the rail opens the casino's slot catalog with a search box.
+The **Slots** entry in the rail opens the casino's slot catalog: the search in the middle, then the games as artwork tiles in the shape of the casino's art (chips.gg's are landscape), each with its house edge.
 
 - **chips.gg**: the Hacksaw Gaming, AvatarUX and BGaming games first (marked **Tested**), then every video slot (**Untested** for providers without a driver yet).
 - **Stake**: only Stake Engine games (Stake's own platform, games by many small studios), most played this week first. Every game in the list is playable, so there are no Tested/Untested badges; the tile shows the house edge and the game page shows the studio.
@@ -101,7 +107,7 @@ Adding a provider means a new driver in `src/slots/` implementing `SlotSession` 
 
 ## Originals
 
-On Stake the lobby lists every Stake Original with the site's own artwork; Limbo opens its usual page, the others a page of their own, shaped like Limbo's: bet size on the left with the game's settings under it, the game's board in the middle, its rounds below, the session stats on the right. Manual / Automatic, the strategy (change by % on win / loss), number of bets, delay, async, stop on profit / loss / max bet / hit, force restart and the seed changes work as on Limbo. A bet of 0 is allowed (Stake plays it for free).
+The lobby lists the casino's originals with the site's own artwork (every Stake Original on Stake); Limbo opens its usual page, the others a page of their own, shaped like Limbo's: the **Bet** card on the left with a card of the game's own settings under it (its **?** says how the game plays; a readout sums up what the settings add up to), the game's board in the middle, its rounds below, the session stats on the right. Manual / Automatic, the strategy (change by % on win / loss), number of bets, delay, async, stop on profit / loss / max bet / hit, force restart and the seed changes work as on Limbo. A bet of 0 is allowed (Stake plays it for free).
 
 | Game | On the board | Auto |
 |---|---|---|
@@ -115,7 +121,7 @@ On Stake the lobby lists every Stake Original with the site's own artwork; Limbo
 | Pump, Chicken, Snakes | Pump / cross / roll and cash out. Auto: pumps, lanes or rolls per bet | ✓ |
 | Moles | Whack a hole each round. Auto: plan the holes up front | ✓ |
 | Flip, Rock Paper Scissors | Call each flip / throw and cash out. Auto: the calls up front | ✓ |
-| HiLo | Higher / lower (or same at A and K), skip, cash out; pick the start card | – |
+| HiLo | Higher / lower (or same at A and K), skip, cash out. Start card picked in the settings (A♠ by default) or a random one every bet. Auto plays a **pattern**, Antebot's codes, one per card (`2,2,2,5,5`): 0 low, 1 high, 2 equal (ace or king only, 12.87×; other cards are skipped until one comes), 3 random of high / low / equal, 4 the least likely side, 5 the likeliest side (the default), 6 random of high / low, 7 skip; it starts over when it runs out. *Cash out at ≥* takes the winnings and bets on, *Stop at ≥* takes them and ends the run (a hit) | ✓ |
 | Blackjack | Hit, stand, double, split, insurance | – |
 | Video Poker | Click cards to hold, then draw; the paytable | – |
 | Baccarat | Back the player, banker and / or tie | ✓ |
@@ -131,9 +137,9 @@ How it works: the site posts its originals to `/_api/casino/<game>/<action>` (`d
 
 | Section | What's in it |
 |---|---|
-| General | Bet size with ½ and ×2, COIN/USD unit, target with quick buttons. On Stake a bet of 0 is placed too: a real round that pays nothing. Shows win chance and profit on a win. The currency is picked in the balance pill on top (**Site** follows the currency selected on chips.gg). |
+| Bet / Target | Bet size with ½ and ×2, COIN/USD unit; the target with quick buttons. On Stake a bet of 0 is placed too: a real round that pays nothing. Shows win chance and profit on a win. The currency is picked in the balance pill on top (**Site** follows the currency selected on chips.gg). |
 | Increase on win / loss | *Reset to base*, or *Change by %* (+100% after a loss doubles the bet, i.e. martingale). Automatic mode only. |
-| No. of bets, delay & async | Number of bets (0 = no limit), a delay in ms between bets, and **Async mode**: how many bets may be in flight at once (1, 2, 3, 4, 6 or 8). Automatic mode only. |
+| Bets, delay & async | Number of bets (0 = no limit), a delay in ms between bets, and **Async mode**: how many bets may be in flight at once (1, 2, 3, 4, 6 or 8). Automatic mode only. |
 
 ### Why async mode
 
@@ -160,7 +166,7 @@ src/
   settings.rs        persisted settings (JSON)
   casino/
     mod.rs           the Casino trait + shared types (Market, BetReply, ProvableState …)
-    chipsgg.rs       chips.gg websocket client
+    chipsgg.rs       chips.gg websocket client: Limbo, Keno, Mines, HiLo, slot catalog + launch
     stake.rs         Stake GraphQL client (through the browser bridge) + the mirror list, Stake Engine catalog + launch, Stake Originals over REST
   originals/         the originals: games, rounds, payout math and tables
   cloudflare.rs      cf_clearance cookie + User Agent pasted from the user's browser, IP check

@@ -54,19 +54,26 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
         }
     });
     caption(ui, "Patterns");
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-        for (name, picks) in PATTERNS {
-            let on = app.settings.orig.keno_picks == *picks;
-            let w = ui.painter().layout_no_wrap(name.to_string(), theme::font_semi(11.0), TEXT).size().x + 18.0;
-            if chip_button_sized(ui, name, on, !locked, vec2(w, 26.0)).clicked() {
-                app.settings.orig.keno_picks = picks.to_vec();
-                app.mark_dirty();
+    // an even grid, three to a row
+    for row in PATTERNS.chunks(3) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let w = ((ui.available_width() - 12.0) / 3.0).floor();
+            for (name, picks) in row {
+                let on = app.settings.orig.keno_picks == *picks;
+                if chip_button_sized(ui, name, on, !locked, vec2(w, 28.0)).clicked() {
+                    app.settings.orig.keno_picks = picks.to_vec();
+                    app.mark_dirty();
+                }
             }
-        }
-    });
+        });
+    }
     let n = app.settings.orig.keno_picks.len();
-    ui.label(egui::RichText::new(if n == 0 { "Pick 1–10 numbers on the board".to_string() } else { format!("{n} picked") }).size(11.0).color(MUTED));
+    if n == 0 {
+        super::readout_idle(ui, "Pick 1–10 numbers on the board");
+    } else {
+        super::readout(ui, format!("{n} of 10 picked"));
+    }
 }
 
 pub fn bet_params(app: &App) -> Result<Value, String> {

@@ -1,9 +1,10 @@
-//! Limbo settings panel: General open, everything else collapsed rows.
+//! The settings column every game page shares: the bet card, then the auto-run cards that fold
+//! away (strategy, bets and speed, stops, force restart), seeds and sound. Limbo's own panel too.
 
 use egui::{vec2, Align, Frame, Layout, Margin, RichText, Ui};
 
-use super::theme::{self, DIM, MUTED, TEXT2};
-use super::widgets::{self, caption, check_field, chip_button_sized, field, section, segmented, text_box, toggle, Btn, FIELD_H};
+use super::theme::{self, MUTED, TEXT2};
+use super::widgets::{self, caption, caption_help, card, check_field_help, chip_button_sized, field, fold, readout, segmented, text_box, toggle_help, Btn, FIELD_H};
 use super::App;
 use crate::money::{self, fmt_multi, mul_f};
 use crate::settings::{Adjust, Mode, Unit};
@@ -34,33 +35,27 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 fn general(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let cur = app.active_currency();
-    let mut open = app.settings.open.general;
-    section(ui, w, "General", true, &mut open, |ui| {
-        bet_size(app, ui);
-        target(app, ui, &cur, locked);
+    bet_card(app, ui, w);
+    let right = target_readout(app, &cur);
+    card(ui, w, "Target", Some("The multiplier a bet has to reach. Higher targets pay more and hit less often."), Some(right), |ui| {
+        target(app, ui, locked);
     });
-    if open != app.settings.open.general {
-        app.settings.open.general = open;
-        app.mark_dirty();
-    }
 }
 
-/// Bet size with ½ / 2× and the coin / USD unit switch, shared by every game page.
-pub(super) fn bet_size(app: &mut App, ui: &mut Ui) {
+/// The bet card every game page starts with: bet size, and what it is worth in the other unit.
+pub(super) fn bet_card(app: &mut App, ui: &mut Ui, w: f32) {
+    let cur = app.active_currency();
+    let other = app.to_base(&app.settings.amount, &cur).map(|b| app.sec(b, &cur, false)).unwrap_or_default();
+    let right = (!other.is_empty()).then(|| widgets::semi(format!("≈ {other}"), 11.5, MUTED));
+    card(ui, w, "Bet", None, right, |ui| bet_size(app, ui));
+}
+
+/// Bet size with ½ / 2× and the coin / USD unit switch.
+fn bet_size(app: &mut App, ui: &mut Ui) {
     let locked = app.auto.running;
     let cur = app.active_currency();
     let cur_up = cur.to_uppercase();
     {
-        // bet size
-        ui.horizontal(|ui| {
-            caption(ui, "Bet size");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let other = app.to_base(&app.settings.amount, &cur).map(|b| app.sec(b, &cur, false)).unwrap_or_default();
-                if !other.is_empty() {
-                    ui.label(RichText::new(format!("≈ {other}")).size(10.5).color(MUTED));
-                }
-            });
-        });
         let unit_sfx = if app.usd_mode() { "USD".to_string() } else { cur_up.clone() };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -80,7 +75,7 @@ pub(super) fn bet_size(app: &mut App, ui: &mut Ui) {
             }
         });
         // unit
-        ui.horizontal(|ui| {
+        widgets::row(ui, 32.0, |ui| {
             caption(ui, "Unit");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.scope(|ui| {
@@ -97,25 +92,24 @@ pub(super) fn bet_size(app: &mut App, ui: &mut Ui) {
     }
 }
 
-fn target(app: &mut App, ui: &mut Ui, cur: &str, locked: bool) {
+/// Limbo's target card header: the chance to win and the profit, or the allowed range.
+fn target_readout(app: &App, cur: &str) -> RichText {
+    let id = app.casino();
+    let txt = match app.target() {
+        Some(t) => {
+            let mut s = format!("{:.*}% win", if t > 9900.0 { 4 } else { 2 }, id.win_chance(t));
+            if let Some(b) = app.to_base(&app.settings.amount, cur) {
+                s += &format!("  ·  +{}", app.prim(mul_f(b, t) - b, cur, false));
+            }
+            s
+        }
+        None => format!("{}–{}×", id.min_target(), money::group_thousands(&format!("{}", id.max_target() as i64))),
+    };
+    widgets::semi(txt, 11.5, if app.target().is_some() { theme::G2 } else { MUTED })
+}
+
+fn target(app: &mut App, ui: &mut Ui, locked: bool) {
     {
-        ui.horizontal(|ui| {
-            caption(ui, "Target");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let id = app.casino();
-                let txt = match app.target() {
-                    Some(t) => {
-                        let mut s = format!("{:.*}% win", if t > 9900.0 { 4 } else { 2 }, id.win_chance(t));
-                        if let Some(b) = app.to_base(&app.settings.amount, cur) {
-                            s += &format!("  ·  +{}", app.prim(mul_f(b, t) - b, cur, false));
-                        }
-                        s
-                    }
-                    None => format!("{}–{}×", id.min_target(), money::group_thousands(&format!("{}", id.max_target() as i64))),
-                };
-                ui.label(widgets::semi(txt, 11.0, if app.target().is_some() { theme::G2 } else { MUTED }));
-            });
-        });
         if text_box(ui, &mut app.settings.target, "2.00", Some("×"), !locked, false).changed() {
             app.mark_dirty();
         }
@@ -139,10 +133,21 @@ fn target(app: &mut App, ui: &mut Ui, cur: &str, locked: bool) {
 pub(super) fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let active = app.settings.on_win != Adjust::Reset || app.settings.on_loss != Adjust::Reset;
+    let pct = |adj: Adjust, v: &str| (adj == Adjust::Increase).then(|| format!("{}%", v.trim()));
+    let summary = match (pct(app.settings.on_win, &app.settings.on_win_pct), pct(app.settings.on_loss, &app.settings.on_loss_pct)) {
+        (None, None) => "Off".to_string(),
+        (Some(w), None) => format!("Win {w}"),
+        (None, Some(l)) => format!("Loss {l}"),
+        (Some(w), Some(l)) => format!("Win {w} · Loss {l}"),
+    };
     let mut open = app.settings.open.strategy;
-    section(ui, w, "Increase on win / loss", active, &mut open, |ui| {
+    fold(ui, w, "Increase on win / loss", &summary, active, &mut open, |ui| {
         for (label, which) in [("After a win", true), ("After a loss", false)] {
-            caption(ui, label);
+            if which {
+                caption(ui, label);
+            } else {
+                caption_help(ui, label, "Change by % adds that much to the stake: +100% after a loss doubles it (martingale). Reset goes back to the base bet.");
+            }
             let (adj, pct) = if which {
                 (&mut app.settings.on_win, &mut app.settings.on_win_pct)
             } else {
@@ -171,7 +176,6 @@ pub(super) fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
                 app.mark_dirty();
             }
         }
-        hint(ui, "+100% after a loss doubles the stake (martingale).");
     });
     if open != app.settings.open.strategy {
         app.settings.open.strategy = open;
@@ -183,8 +187,15 @@ pub(super) fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let cnt: u32 = app.settings.count.trim().parse().unwrap_or(0);
     let dl = money::num(&app.settings.delay).unwrap_or(0.0);
+    let mut parts = vec![if cnt > 0 { format!("{cnt} bets") } else { "No limit".to_string() }];
+    if dl > 0.0 {
+        parts.push(format!("{} ms", app.settings.delay.trim()));
+    }
+    if app.settings.async_bets > 1 {
+        parts.push(format!("{} in flight", app.settings.async_bets));
+    }
     let mut open = app.settings.open.count;
-    section(ui, w, "No. of bets, delay & async", cnt > 0 || dl > 0.0 || app.settings.async_bets > 1, &mut open, |ui| {
+    fold(ui, w, "Bets, delay & async", &parts.join(" · "), cnt > 0 || dl > 0.0 || app.settings.async_bets > 1, &mut open, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let w = (ui.available_width() - 8.0) / 2.0;
@@ -203,8 +214,7 @@ pub(super) fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
                 }
             });
         });
-        widgets::hsep(ui);
-        caption(ui, "Async mode · bets in flight");
+        caption_help(ui, "Async mode · bets in flight", "Sends the next bet before the previous one answers, for more bets per second. Flat stake only: with Change by % the bets go one at a time.");
         const LANES: [u32; 6] = [1, 2, 3, 4, 6, 8];
         let cur = app.settings.async_bets.max(1);
         let sel = LANES.iter().position(|n| *n == cur).unwrap_or(0);
@@ -213,7 +223,6 @@ pub(super) fn bets_and_speed(app: &mut App, ui: &mut Ui, w: f32) {
             app.mark_dirty();
             app.sync_concurrency();
         }
-        hint(ui, "Sends the next bet before the previous one answers. Flat stake only; with Change by % bets go one at a time.");
     });
     if open != app.settings.open.count {
         app.settings.open.count = open;
@@ -226,8 +235,18 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
     let s = &app.settings;
     let active = [&s.stop_profit, &s.stop_loss, &s.max_bet].iter().any(|v| !v.trim().is_empty()) || s.stop_on_hit;
     let unit = if app.usd_mode() { "USD".to_string() } else { app.active_currency().to_uppercase() };
+    let mut parts = vec![];
+    for (name, v) in [("Profit", &s.stop_profit), ("Loss", &s.stop_loss), ("Max", &s.max_bet)] {
+        if !v.trim().is_empty() {
+            parts.push(format!("{name} {}", v.trim()));
+        }
+    }
+    if s.stop_on_hit {
+        parts.push(format!("Hit {}×", s.hit_multi.trim()));
+    }
+    let summary = if parts.is_empty() { "Off".to_string() } else { parts.join(" · ") };
     let mut open = app.settings.open.stops;
-    section(ui, w, "Stop on profit / loss / hit", active, &mut open, |ui| {
+    fold(ui, w, "Stop on profit / loss / hit", &summary, active, &mut open, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let w = (ui.available_width() - 8.0) / 2.0;
@@ -249,19 +268,18 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
         if field(ui, "Max bet", &mut app.settings.max_bet, "off", Some(&unit), !locked).changed() {
             app.mark_dirty();
         }
-        widgets::hsep(ui);
         // on Limbo an empty hit line means the target; the other games have none
-        let hint = if app.screen == super::Screen::Limbo {
-            app.target().map(|t| format!("empty = target ({})", fmt_multi(t))).unwrap_or("empty = target".into())
+        let help = if app.screen == super::Screen::Limbo {
+            let target = app.target().map(|t| format!(" ({})", fmt_multi(t))).unwrap_or_default();
+            format!("Stops the run on a bet that rolls at least this multiplier. Empty: the target{target}.")
         } else {
-            "Stops the run on a round paying at least this many × the stake".into()
+            "Stops the run on a round that pays at least this many times the stake.".into()
         };
         let mut on = app.settings.stop_on_hit;
-        if check_field(ui, "Stop on hit  ≥", &mut on, &mut app.settings.hit_multi, Some("×"), !locked) {
+        if check_field_help(ui, "Stop on hit  ≥", Some(&help), &mut on, &mut app.settings.hit_multi, Some("×"), !locked) {
             app.settings.stop_on_hit = on;
             app.mark_dirty();
         }
-        hint_line(ui, &hint);
     });
     if open != app.settings.open.stops {
         app.settings.open.stops = open;
@@ -274,29 +292,27 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
 pub(super) fn force_restart(app: &mut App, ui: &mut Ui, w: f32) {
     let mut open = app.settings.open.restart;
     let active = app.settings.force_restart || app.settings.restart_on_error;
-    section(ui, w, "Force restart betting", active, &mut open, |ui| {
+    let summary = match (app.settings.force_restart, app.settings.restart_on_error) {
+        (false, false) => "Off",
+        (true, false) => "Always",
+        (false, true) => "On errors",
+        (true, true) => "Always · on errors",
+    };
+    fold(ui, w, "Force restart betting", summary, active, &mut open, |ui| {
         let (mut always, mut on_error) = (app.settings.force_restart, app.settings.restart_on_error);
-        if toggle(ui, "Force restart betting always", &mut always, true) {
+        let help_always = "When the run ends by itself (stop profit or loss, a hit, the number of bets, max bet, an error), it starts \
+                           again at once from the base bet, with its counters back at zero. Stop and Stop on next win still end it.";
+        if toggle_help(ui, "Restart always", Some(help_always), &mut always, true) {
             app.set_force_restart(always, on_error);
         }
-        hint(
-            ui,
-            "When the run ends by itself (stop profit or loss, a hit, the number of bets, max bet, an error), it starts again \
-             at once from the base bet, with its counters back at zero.",
-        );
-        widgets::hsep(ui);
-        if toggle(ui, "Force restart on errors", &mut on_error, true) {
+        let help_errors = "An error doesn't stop the run: it bets again at once, with the same bet size and counters. When errors \
+                           keep coming, it waits 1, 2, 4, then 8 s between tries.";
+        if toggle_help(ui, "Restart on errors", Some(help_errors), &mut on_error, true) {
             app.set_force_restart(always, on_error);
         }
-        hint(
-            ui,
-            "An error doesn't stop the run: it bets again at once, with the same bet size and counters. When errors keep \
-             coming, it waits 1, 2, 4, then 8 s between tries.",
-        );
-        hint(ui, "Stop and Stop on next win always end the run.");
         let a = &app.auto;
         if a.running && (a.restarts > 0 || a.errors > 0) {
-            hint_line(ui, &format!("Restarted {}×  ·  errors {}×  ·  {}", a.restarts, a.errors, a.msg));
+            readout(ui, format!("Restarted {}×  ·  errors {}×  ·  {}", a.restarts, a.errors, a.msg), TEXT2, theme::G1);
         }
     });
     if open != app.settings.open.restart {
@@ -307,26 +323,28 @@ pub(super) fn force_restart(app: &mut App, ui: &mut Ui, w: f32) {
 
 pub(super) fn seed(app: &mut App, ui: &mut Ui, w: f32) {
     let every = app.settings.seed_every();
+    let summary = if every > 0 { format!("Every {every} bets") } else { "Off".to_string() };
     let mut open = app.settings.open.seed;
-    section(ui, w, "Auto seed changes", app.settings.seed_enabled, &mut open, |ui| {
+    fold(ui, w, "Auto seed changes", &summary, app.settings.seed_enabled, &mut open, |ui| {
         let mut en = app.settings.seed_enabled;
-        if check_field(ui, "Change after bets", &mut en, &mut app.settings.seed_every, None, true) {
+        let help = "Gets a new client seed (and server seed) after this many bets, without stopping the run.";
+        if check_field_help(ui, "Change after bets", Some(help), &mut en, &mut app.settings.seed_every, None, true) {
             app.settings.seed_enabled = en;
             app.mark_dirty();
             app.sync_seed_policy();
         }
-        let mut txt = if app.seed.busy {
-            "Changing…".to_string()
+        let mut parts = vec![];
+        if app.seed.busy {
+            parts.push("Changing…".to_string());
         } else if every > 0 {
-            format!("Next change in {} bets", every.saturating_sub(app.seed.count))
-        } else {
-            "Off".to_string()
-        };
-        if app.seed.rotations > 0 {
-            txt += &format!("  ·  {} changed", app.seed.rotations);
+            parts.push(format!("Next change in {} bets", every.saturating_sub(app.seed.count)));
         }
-        hint_line(ui, &txt);
-        widgets::hsep(ui);
+        if app.seed.rotations > 0 {
+            parts.push(format!("{} changed", app.seed.rotations));
+        }
+        if !parts.is_empty() {
+            readout(ui, parts.join("  ·  "), TEXT2, theme::G1);
+        }
         kv(ui, "Client seed", app.provable.client_seed.clone().unwrap_or("–".into()));
         kv(ui, "Nonce", app.provable.nonce.map(|n| n.to_string()).unwrap_or("–".into()));
         if let Some(h) = &app.provable.server_seed_hash {
@@ -367,29 +385,25 @@ pub(super) fn restarts_chip(app: &App, ui: &mut Ui) {
     }
 }
 
-/// Muted helper text under a control.
-fn hint(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(DIM));
-}
-
-fn hint_line(ui: &mut Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.0).color(MUTED)).truncate());
-}
-
 pub(super) fn notifications(app: &mut App, ui: &mut Ui, w: f32) {
+    let summary = match (app.settings.hit_sound, app.settings.hotkeys) {
+        (false, false) => "Off",
+        (true, false) => "Sound",
+        (false, true) => "Hotkeys",
+        (true, true) => "Sound · Hotkeys",
+    };
     let mut open = app.settings.open.keys;
-    section(ui, w, "Sound & hotkeys", app.settings.hit_sound || app.settings.hotkeys, &mut open, |ui| {
+    fold(ui, w, "Sound & hotkeys", summary, app.settings.hit_sound || app.settings.hotkeys, &mut open, |ui| {
         let mut snd = app.settings.hit_sound;
-        if toggle(ui, "Sound on hit", &mut snd, true) {
+        if toggle_help(ui, "Sound on hit", None, &mut snd, true) {
             app.settings.hit_sound = snd;
             app.mark_dirty();
         }
         let mut hk = app.settings.hotkeys;
-        if toggle(ui, "Hotkeys", &mut hk, true) {
+        if toggle_help(ui, "Hotkeys", None, &mut hk, true) {
             app.settings.hotkeys = hk;
             app.mark_dirty();
         }
-        widgets::hsep(ui);
         for (k, what) in [("Space", "Place one bet"), ("P", "Pause / resume"), ("Esc", "Stop"), ("Ctrl+R", "Reset session: history, stats, seed")] {
             ui.horizontal(|ui| {
                 let kw = ui.painter().layout_no_wrap(k.to_string(), theme::font_semi(10.0), TEXT2).size().x + 12.0;

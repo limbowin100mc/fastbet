@@ -9,7 +9,7 @@ use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Marg
 use super::originals::{self, times};
 use super::stats::{clock, HistEntry};
 use super::theme::{self, alpha, BG, BG1, DIM, GOLD, GREEN, LINE, MUTED, RED, STAGE, TEXT, TEXT2};
-use super::widgets::{self, button, button_key, section, tab_bar, Btn};
+use super::widgets::{self, button, button_key, tab_bar, Btn};
 use super::{controls, App};
 use crate::money::{fmt_int, fmt_time};
 use crate::originals::{dragon_multiplier, Game, Round, Step};
@@ -24,7 +24,9 @@ const TABLE_ROWS: usize = 150;
 pub fn cashout_multiplier(r: &Round) -> f64 {
     let last_round = || r.state["rounds"].as_array().and_then(|a| a.last()).and_then(|x| x["payoutMultiplier"].as_f64());
     match r.game {
-        Game::Mines | Game::Hilo => last_round().unwrap_or(0.0),
+        Game::Mines => last_round().unwrap_or(0.0),
+        // skipped cards alone pay nothing to cash out (0.99× on chips.gg, which refuses it)
+        Game::Hilo => last_round().filter(|m| *m > 1.0).unwrap_or(0.0),
         Game::DragonTower => {
             let rows = r.state["currentRound"].as_u64().unwrap_or(0) as u32;
             if rows == 0 {
@@ -60,7 +62,7 @@ pub fn cashout_multiplier(r: &Round) -> f64 {
 }
 
 pub fn show(app: &mut App, ui: &mut Ui, game: Game) {
-    // HiLo has no auto mode: its page is always manual
+    // blackjack and video poker have no auto mode: their pages are always manual
     if !game.auto() && app.settings.mode == Mode::Auto && !app.auto.running {
         app.settings.mode = Mode::Manual;
     }
@@ -167,14 +169,10 @@ fn settings(app: &mut App, ui: &mut Ui, game: Game) {
             let w = panel_w - 26.0 - 4.0;
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.set_max_width(w);
-            let locked = app.auto.running || app.orig.open(game).is_some();
-            let mut open = true;
-            section(ui, w, "General", true, &mut open, |ui| {
-                controls::bet_size(app, ui);
-                widgets::hsep(ui);
-                originals::params(app, ui, game, app.auto.running);
-            });
-            let _ = locked;
+            controls::bet_card(app, ui, w);
+            // the game's own settings, under its name; the "?" says how it plays
+            let help = originals::help(app.casino(), game);
+            widgets::card(ui, w, app.casino().original_name(game), Some(&help), None, |ui| originals::params(app, ui, game, app.auto.running));
             if app.settings.mode == Mode::Auto && game.auto() {
                 controls::strategy(app, ui, w);
                 controls::bets_and_speed(app, ui, w);

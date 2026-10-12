@@ -78,14 +78,13 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     if changed {
         app.mark_dirty();
     }
-    let txt = match valid(app) {
+    match valid(app) {
         Some(t) => {
             let c = chance(&app.settings.orig.primedice_condition, &t);
-            format!("{c:.2}% win  ·  about {}", times(if c > 0.0 { 99.0 / c } else { 0.0 }))
+            super::readout(ui, format!("{c:.2}% win  ·  about {}", times(if c > 0.0 { 99.0 / c } else { 0.0 })));
         }
-        None => "Set the range edges (0–100, in order)".into(),
-    };
-    ui.label(egui::RichText::new(txt).size(11.0).color(if valid(app).is_some() { theme::G2 } else { RED }));
+        None => super::readout_bad(ui, "Set the range edges (0–100, in order)"),
+    }
 }
 
 pub fn bet_params(app: &App) -> Result<Value, String> {

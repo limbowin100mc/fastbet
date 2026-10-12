@@ -9,7 +9,7 @@ use super::{payout_color, times, trim};
 use crate::originals::{Game, Round};
 
 pub fn params(_app: &mut App, ui: &mut Ui) {
-    ui.label(egui::RichText::new("No settings: spin, and bonus spins play out by themselves.").size(11.0).color(MUTED));
+    super::nothing_to_set(ui, "Nothing to set: every bet spins, and bonus spins play out by themselves.");
 }
 
 pub fn bet_params() -> Result<Value, String> {

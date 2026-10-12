@@ -57,8 +57,6 @@ pub struct State {
     pub resumed: HashSet<Game>,
     /// When the latest round landed, for the reveal animation.
     pub landed: Option<(Game, Instant)>,
-    /// HiLo's next start card (rank, suit).
-    pub hilo_card: (String, String),
     /// Steps of FASTBET_ORIG_PLAY already sent.
     pub dev_steps: usize,
     /// Video poker: the round the holds belong to, and which cards are held.
@@ -76,7 +74,6 @@ impl Default for State {
             busy: HashSet::new(),
             resumed: HashSet::new(),
             landed: None,
-            hilo_card: hilo::random_card(),
             dev_steps: 0,
             vp_hold: (String::new(), [false; 5]),
         }
@@ -99,6 +96,45 @@ impl State {
             _ => f32::MAX,
         }
     }
+}
+
+/// How the game plays, for the "?" on its settings card.
+pub fn help(casino: crate::casino::CasinoId, game: Game) -> String {
+    let text = match game {
+        Game::Dice => "Roll 0–100: the bet wins when the roll lands over (or under) the target. The lower the chance, the more it pays.",
+        Game::Keno => "Pick 1 to 10 of the 40 numbers; ten are drawn. The payout depends on the risk and on how many of your numbers are drawn.",
+        Game::Mines => "25 tiles hide gems and mines. Every gem raises the payout, a mine ends the round. Manual: reveal tiles and cash out any time. Automatic: every bet reveals the tiles picked on the board, then cashes out.",
+        Game::Plinko => "A ball drops through rows of pegs into a bucket, and the bucket's multiplier pays. More risk means bigger edges and smaller middles.",
+        Game::Wheel => "A spin lands on one segment, which pays its multiplier. The risk and the number of segments set the payouts.",
+        Game::Diamonds => "Five gems are drawn: pairs and better pay like poker hands, up to 50× for five of a kind.",
+        Game::DragonTower => "Climb nine rows, one tile per row: eggs are safe, a dragon ends the round, and every row raises the payout. Automatic: click a path on the board; every bet climbs it and cashes out at the top.",
+        Game::Pump => "Every pump raises the payout until the balloon pops; harder levels pop sooner and pay more. Automatic: pumps a set number of times, then cashes out.",
+        Game::Hilo => "Guess whether the next card is higher or lower: every right guess multiplies the payout, a wrong one ends the round, a skip draws another card. Automatic: every bet starts from the start card and plays the pattern until Cash out or Stop.",
+        Game::Flip => "Call heads or tails: every right call multiplies the payout by 1.96, a wrong one ends the round. Automatic: set the calls up front; every bet plays them and cashes out.",
+        Game::Blackjack => "Beat the dealer without going over 21. Hit, stand, double, split and insurance are played on the board. Blackjack pays 3:2, insurance 2:1.",
+        Game::VideoPoker => "Jacks or better: five cards are dealt, click the ones to hold, then draw once. The final hand pays from the table.",
+        Game::Baccarat => "Back the player, the banker or a tie: the hand closest to nine wins. The bet size goes on each side picked.",
+        Game::Roulette => "Single-zero roulette. Click the table to put a chip of the bet size on a number or an outside bet; right-click takes one off.",
+        Game::Cases => "Open a case: what's inside pays. Harder levels hold bigger prizes and more near-empty cases.",
+        Game::Darts => "One dart at a board of rings: the ring it lands in pays. Harder levels have smaller bullseyes that pay more.",
+        Game::Tarot => "Three cards are drawn and their multipliers multiply.",
+        Game::Packs => "A pack holds five cards, and their multipliers add up.",
+        Game::Bars => "Pick up to five of the 30 tiles: each hides a multiplier, and the picked ones add up.",
+        Game::Drill => "Three drills dig. Pick one and a target depth (a multiplier): it wins if your drill gets that far.",
+        Game::Primedice => "Roll 0–100 and win inside a range, inside either of two ranges, or outside one. The smaller the winning area, the more it pays.",
+        Game::Chicken => "Cross lane after lane: every lane raises the payout, a car ends the round. Automatic: crosses a set number of lanes, then cashes out.",
+        Game::Snakes => "Roll two dice: the total multiplies the payout, a snake total ends the round. Automatic: rolls a set number of times, then cashes out.",
+        Game::Moles => "Each round some of the seven holes hide a mole: whack one to go on. Automatic: plan one hole per round on the board.",
+        Game::RockPaperScissors => "Rock, paper, scissors against the house: every win multiplies the payout, a loss ends the round. Automatic: set the throws up front.",
+        Game::ScarabSpin => "A five-reel slot: a spin pays its winning lines and scatters. The bet size is spread over the lines played.",
+        Game::TomeOfLife => "A five-reel slot: a spin pays its winning lines; bonus rounds play out by themselves. The bet size is spread over the lines played.",
+        Game::BlueSamurai => "A slot with uneven reels: a spin pays its wins, and bonus spins play out by themselves.",
+        Game::Blitz => "Cards come from an endless deck: the bet pays when every card drawn is different. More cards pay more.",
+    };
+    if game == Game::Hilo && casino.hilo_side_guesses() {
+        return format!("{text} chips.gg also takes red / black and card-kind guesses, and takes its 1% edge once per round.");
+    }
+    text.to_string()
 }
 
 /// The game's settings, under the bet size.
@@ -180,7 +216,7 @@ pub fn bet_params(app: &App, game: Game, auto: bool) -> Result<Value, String> {
         Game::Diamonds => Ok(serde_json::json!({})),
         Game::DragonTower => dragon::bet_params(app, auto),
         Game::Pump => pump::bet_params(app, auto),
-        Game::Hilo => hilo::bet_params(app),
+        Game::Hilo => hilo::bet_params(app, auto),
         Game::Flip => flip::bet_params(app, auto),
         Game::Blackjack => blackjack::bet_params(),
         Game::VideoPoker => video_poker::bet_params(),
@@ -200,6 +236,14 @@ pub fn bet_params(app: &App, game: Game, auto: bool) -> Result<Value, String> {
         Game::ScarabSpin | Game::TomeOfLife => reels::bet_params(app, game),
         Game::BlueSamurai => samurai::bet_params(),
         Game::Blitz => blitz::bet_params(app),
+    }
+}
+
+/// An auto run's stop multiplier of the game's own (HiLo's Stop), which ends it like a hit.
+pub fn stop_line(app: &App, game: Game) -> Option<f64> {
+    match game {
+        Game::Hilo => hilo::stop_line(app),
+        _ => None,
     }
 }
 
@@ -235,6 +279,31 @@ pub fn result_text(r: &Round) -> String {
         Game::BlueSamurai => samurai::result_text(r),
         Game::Blitz => blitz::result_text(r),
     }
+}
+
+/// What a game's settings add up to, on the settings card ("5 picked", "pays 1.28× …").
+pub fn readout(ui: &mut Ui, text: impl Into<String>) {
+    super::widgets::readout(ui, text, theme::TEXT2, theme::G1);
+}
+
+/// A readout of settings still to be made ("Pick at least one side").
+pub fn readout_idle(ui: &mut Ui, text: impl Into<String>) {
+    super::widgets::readout(ui, text, theme::MUTED, LINE2);
+}
+
+/// A readout of settings that don't work as they are (a range out of order).
+pub fn readout_bad(ui: &mut Ui, text: impl Into<String>) {
+    super::widgets::readout(ui, text, RED, RED);
+}
+
+/// For games with nothing to set: what to do instead.
+pub fn nothing_to_set(ui: &mut Ui, text: &str) {
+    super::widgets::note(ui, text);
+}
+
+/// "1 flip", "3 flips".
+pub fn count(n: u64, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
 /// A multiplier without trailing zeros: 2 -> "2", 1.125 -> "1.125", 0.2 -> "0.2".

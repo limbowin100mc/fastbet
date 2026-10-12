@@ -5,7 +5,7 @@
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Stroke, StrokeKind, Ui};
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, GREEN, MUTED, RED};
+use super::super::theme::{self, alpha, GREEN, RED};
 use super::super::widgets::{chip_button_sized, field};
 use super::super::App;
 use super::{card, payout_color, times};
@@ -43,7 +43,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     });
     let n = picks(app);
     let txt = format!("Pays {} when all {n} cards are different", times(blitz_multiplier(n)));
-    ui.label(egui::RichText::new(txt).size(11.0).color(MUTED));
+    super::readout(ui, txt);
 }
 
 pub fn bet_params(app: &App) -> Result<Value, String> {

@@ -33,7 +33,11 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             app.mark_dirty();
         }
     });
-    ui.label(egui::RichText::new(if n == 0 { "Pick 1–5 tiles on the board".to_string() } else { format!("{n} of 5 picked") }).size(11.0).color(MUTED));
+    if n == 0 {
+        super::readout_idle(ui, "Pick 1–5 tiles on the board");
+    } else {
+        super::readout(ui, format!("{n} of 5 picked"));
+    }
 }
 
 pub fn bet_params(app: &App) -> Result<Value, String> {

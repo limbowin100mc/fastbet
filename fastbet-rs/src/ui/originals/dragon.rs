@@ -45,12 +45,11 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
                 app.mark_dirty();
             }
         });
-        let txt = if n == 0 {
-            "Click a tile per row, from the bottom: every bet climbs that path".to_string()
+        if n == 0 {
+            super::readout_idle(ui, "Click a tile per row on the board, from the bottom: every bet climbs that path");
         } else {
-            format!("{n} rows  ·  pays {} at the top of the path", times(dragon_multiplier(&app.settings.orig.dragon_difficulty, n as u32)))
-        };
-        ui.label(egui::RichText::new(txt).size(11.0).color(MUTED));
+            super::readout(ui, format!("{}  ·  pays {} at the top of the path", super::count(n as u64, "row"), times(dragon_multiplier(&app.settings.orig.dragon_difficulty, n as u32))));
+        }
     }
 }
 

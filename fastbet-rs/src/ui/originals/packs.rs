@@ -9,7 +9,7 @@ use super::{payout_color, times};
 use crate::originals::{Game, Round};
 
 pub fn params(_app: &mut App, ui: &mut Ui) {
-    ui.label(egui::RichText::new("No settings: a pack holds five cards, and their multipliers add up.").size(11.0).color(MUTED));
+    super::nothing_to_set(ui, "Nothing to set: every bet opens a pack.");
 }
 
 pub fn bet_params() -> Result<Value, String> {

@@ -15,7 +15,11 @@ fn red(n: u32) -> bool {
 
 pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     let chips: u32 = app.settings.orig.roulette_chips.values().sum();
-    ui.label(egui::RichText::new(if chips == 0 { "Click the table to place chips of the bet size; right-click removes one.".to_string() } else { format!("{chips} chips on the table") }).size(11.0).color(MUTED));
+    if chips == 0 {
+        super::readout_idle(ui, "Click the table to place chips of the bet size; right-click removes one");
+    } else {
+        super::readout(ui, format!("{chips} chips on the table"));
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let w = (ui.available_width() - 6.0) / 2.0;

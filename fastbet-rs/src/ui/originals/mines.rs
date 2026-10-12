@@ -5,11 +5,11 @@ use egui::{pos2, vec2, Align2, Rect, Ui};
 use rand::seq::IndexedRandom;
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, GREEN, MUTED, TEXT2};
+use super::super::theme::{self, alpha, GREEN, TEXT2};
 use super::super::widgets::{caption, chip_button_sized};
 use super::super::App;
 use super::{bomb, gem, grid, hit, nums, tile, tile_face, times, Tile};
-use crate::originals::{mines_multiplier, Game, Round, Step};
+use crate::originals::{Game, Round, Step};
 use crate::settings::Mode;
 
 fn auto_mode(app: &App) -> bool {
@@ -31,6 +31,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             caption(ui, "Mines");
             let mut n = app.settings.orig.mines_count;
             ui.add_enabled_ui(!locked && !open, |ui| {
+                super::super::widgets::field_combos(ui);
                 egui::ComboBox::from_id_salt("mines-count").width(w).selected_text(format!("{n}")).show_ui(ui, |ui| {
                     for k in 1..=24u8 {
                         ui.selectable_value(&mut n, k, format!("{k}"));
@@ -70,12 +71,11 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
                 app.mark_dirty();
             }
         });
-        let txt = if n == 0 {
-            "Click tiles on the board: every bet reveals them".to_string()
+        if n == 0 {
+            super::readout_idle(ui, "Click tiles on the board: every bet reveals them");
         } else {
-            format!("{n} tiles  ·  pays {} if all are gems", times(mines_multiplier(app.settings.orig.mines_count as u32, n)))
-        };
-        ui.label(egui::RichText::new(txt).size(11.0).color(MUTED));
+            super::readout(ui, format!("{}  ·  pays {} if all are gems", super::count(n as u64, "tile"), times(app.orig.tables.mines(app.settings.orig.mines_count as u32, n))));
+        }
     } else if open {
         let w = ui.available_width();
         let busy = app.orig.busy.contains(&Game::Mines);
@@ -206,10 +206,10 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
     let txt = match &open {
         Some(r) => {
             let gems = revealed(r).len() as u32;
-            format!("{} so far  ·  next tile pays {}", times(r.state["rounds"].as_array().and_then(|a| a.last()).and_then(|x| x["payoutMultiplier"].as_f64()).unwrap_or(1.0)), times(mines_multiplier(r.state["minesCount"].as_u64().unwrap_or(m as u64) as u32, gems + 1)))
+            format!("{} so far  ·  next tile pays {}", times(r.state["rounds"].as_array().and_then(|a| a.last()).and_then(|x| x["payoutMultiplier"].as_f64()).unwrap_or(1.0)), times(app.orig.tables.mines(r.state["minesCount"].as_u64().unwrap_or(m as u64) as u32, gems + 1)))
         }
         None if auto => format!("{m} mines  ·  click tiles to pick them"),
-        None => format!("{m} mines  ·  first gem pays {}", times(mines_multiplier(m, 1))),
+        None => format!("{m} mines  ·  first gem pays {}", times(app.orig.tables.mines(m, 1))),
     };
     super::note(p, pos2(rect.center().x, y), &txt);
 }

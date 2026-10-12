@@ -12,7 +12,7 @@ use crate::originals::{Game, Round};
 const SIDES: [(&str, &str); 3] = [("player", "Player  2×"), ("banker", "Banker  1.95×"), ("tie", "Tie  9×")];
 
 pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
-    caption(ui, "Bet on (the bet size goes on each)");
+    caption(ui, "Bet on");
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -34,7 +34,11 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
         app.mark_dirty();
     }
     let n = app.settings.orig.baccarat_sides.len();
-    ui.label(egui::RichText::new(if n == 0 { "Pick at least one side".to_string() } else { format!("Stakes {n}× the bet size per round") }).size(11.0).color(MUTED));
+    if n == 0 {
+        super::readout_idle(ui, "Pick at least one side");
+    } else {
+        super::readout(ui, format!("Stakes {n}× the bet size per round"));
+    }
 }
 
 pub fn bet_params(app: &App) -> Result<Value, String> {

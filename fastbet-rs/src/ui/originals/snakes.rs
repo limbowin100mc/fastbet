@@ -5,7 +5,7 @@ use egui::{pos2, vec2, Align2, Color32, Rect, Ui};
 use serde_json::{json, Value};
 
 use super::super::theme::{self, alpha, GREEN, MUTED, RED, TEXT};
-use super::super::widgets::{field, Btn};
+use super::super::widgets::Btn;
 use super::super::App;
 use super::{board_button, die, levels, payout_color, text_color_on, times, trim};
 use crate::originals::{snakes_payout, Game, Round, Step, SNAKES_LEVELS};
@@ -20,13 +20,13 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     }
     if app.settings.mode == Mode::Auto {
         let mut s = app.settings.orig.snakes_rolls.to_string();
-        if field(ui, "Rolls per bet", &mut s, "3", None, !locked).changed() {
+        super::super::widgets::caption_help(ui, "Rolls per bet", "Every bet rolls this many times and cashes out, unless a snake ends it first.");
+        if super::super::widgets::text_box(ui, &mut s, "3", None, !locked, false).changed() {
             if let Ok(n) = s.trim().parse::<u32>() {
                 app.settings.orig.snakes_rolls = n.clamp(1, 20) as u8;
                 app.mark_dirty();
             }
         }
-        ui.label(egui::RichText::new("Cashes out after that many rolls without a snake.").size(11.0).color(MUTED));
     }
 }
 

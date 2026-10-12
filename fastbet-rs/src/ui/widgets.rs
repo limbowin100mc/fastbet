@@ -23,9 +23,92 @@ pub fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
     RichText::new(text.into()).size(size).color(color).family(theme::mono())
 }
 
+/// Colour of the captions over fields: quieter than values, louder than notes.
+const LABEL: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb8);
+
 /// Small caption like "Bet size".
 pub fn caption(ui: &mut Ui, text: &str) {
-    ui.label(semi(text, 11.5, MUTED));
+    ui.label(semi(text, 11.5, LABEL));
+}
+
+/// A caption with a "?" after it that explains the field when hovered.
+pub fn caption_help(ui: &mut Ui, text: &str, help: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        caption(ui, text);
+        help_icon(ui, help);
+    });
+}
+
+/// A small "?" that shows `text` when hovered.
+pub fn help_icon(ui: &mut Ui, text: &str) -> Response {
+    help_icon_ui(ui, |ui| {
+        ui.label(RichText::new(text).size(12.0).color(TEXT2));
+    })
+}
+
+/// A small "?" that shows what `add` draws when hovered.
+pub fn help_icon_ui(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+    help_glyph(ui.painter(), rect.center(), resp.hovered());
+    help_tip(resp, add)
+}
+
+/// The "?" in a circle.
+fn help_glyph(p: &Painter, c: Pos2, hovered: bool) {
+    p.circle(c, 7.5, if hovered { BG3 } else { BG2 }, Stroke::new(1.0, if hovered { G1 } else { LINE2 }));
+    p.text(c + vec2(0.0, 0.5), Align2::CENTER_CENTER, "?", theme::font_bold(10.0), if hovered { TEXT } else { MUTED });
+}
+
+fn help_tip(resp: Response, add: impl FnOnce(&mut Ui)) -> Response {
+    resp.on_hover_cursor(egui::CursorIcon::Help).on_hover_ui(|ui| {
+        ui.set_max_width(280.0);
+        ui.spacing_mut().item_spacing.y = 6.0;
+        add(ui);
+    })
+}
+
+/// A one-line readout of what the settings add up to ("2 tiles · pays 1.28× if all are gems"),
+/// in `color` on a recessed strip with an `accent` edge.
+pub fn readout(ui: &mut Ui, text: impl Into<String>, color: Color32, accent: Color32) {
+    let w = ui.available_width();
+    let galley = ui.painter().layout(text.into(), theme::font_semi(11.5), color, w - 26.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, galley.size().y + 16.0), Sense::hover());
+    let p = ui.painter();
+    p.rect(rect, CornerRadius::same(RADIUS), BG, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    let edge = Rect::from_min_max(pos2(rect.left() + 1.0, rect.top() + 7.0), pos2(rect.left() + 3.0, rect.bottom() - 7.0));
+    p.rect_filled(edge, CornerRadius::same(1), accent);
+    p.galley(pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0), galley, color);
+}
+
+/// A row of exactly `height` with its contents centred on it, so a caption lines up with the
+/// taller control beside it.
+pub fn row(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui)) {
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(w, height), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_height(height);
+        add(ui);
+    });
+}
+
+/// Dropdowns (egui combo boxes) drawn like the text fields next to them: same height, fill and
+/// border. Applies to the rest of `ui`.
+pub fn field_combos(ui: &mut Ui) {
+    ui.spacing_mut().interact_size.y = FIELD_H;
+    ui.spacing_mut().button_padding = vec2(12.0, 8.0);
+    let w = &mut ui.visuals_mut().widgets;
+    for (state, stroke) in [(&mut w.inactive, LINE), (&mut w.hovered, LINE2), (&mut w.active, G1), (&mut w.open, LINE2)] {
+        state.weak_bg_fill = BG;
+        state.bg_fill = BG;
+        state.bg_stroke = Stroke::new(1.0, stroke);
+        state.corner_radius = CornerRadius::same(RADIUS);
+        state.expansion = 0.0;
+    }
+}
+
+/// Quiet text inside a card, for games with nothing to set.
+pub fn note(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(MUTED));
 }
 
 /// Paints `text` no wider than `max_w`, shrinking the font down to 75% before it gives up and clips.
@@ -108,6 +191,24 @@ pub fn glow(p: &Painter, center: Pos2, radius: f32, color: Color32) {
     let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     p.add(egui::epaint::RectShape::filled(rect, CornerRadius::ZERO, color).with_texture(tex.id(), uv));
+}
+
+/// A texture filling `rect`, cut to the rect's shape rather than stretched: art of another
+/// shape loses its sides (or its top and bottom).
+pub fn image_cover(p: &Painter, rect: Rect, tex: &TextureHandle, radius: u8) {
+    let [w, h] = tex.size().map(|v| v.max(1) as f32);
+    let (fit_w, fit_h) = ((rect.aspect_ratio() * h / w).min(1.0), (w / h / rect.aspect_ratio()).min(1.0));
+    let uv = Rect::from_center_size(pos2(0.5, 0.5), vec2(fit_w, fit_h));
+    p.add(egui::epaint::RectShape::filled(rect, CornerRadius::same(radius), Color32::WHITE).with_texture(tex.id(), uv));
+}
+
+/// A small label on a game tile ("Edge: 1%"), its `align` corner at `at`. Returns where it went.
+pub fn tile_badge(p: &Painter, at: Pos2, align: Align2, text: &str, fill: Color32, fg: Color32) -> Rect {
+    let g = p.layout_no_wrap(text.to_string(), theme::font_semi(10.0), fg);
+    let r = align.anchor_size(at, g.size() + vec2(12.0, 6.0));
+    p.rect_filled(r, CornerRadius::same(5), fill);
+    p.galley(r.min + vec2(6.0, 3.0), g, fg);
+    r
 }
 
 /// Drop shadow under a rounded rect.
@@ -373,52 +474,101 @@ pub fn rail_button(ui: &mut Ui, on: bool, tip: &str, draw: impl FnOnce(&egui::Pa
 /// Collapsible settings card: a header row with title, optional status dot and
 /// chevron; the body sits inside the same card under a hairline.
 pub fn section(ui: &mut Ui, width: f32, title: &str, active: bool, open: &mut bool, add: impl FnOnce(&mut Ui)) {
+    fold(ui, width, title, "", active, open, add);
+}
+
+/// The surface every settings card sits on.
+fn card_frame(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui, f32)) {
     ui.set_max_width(width);
     Frame::new()
         .fill(BG1)
         .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
             let inner_w = width - 2.0;
             ui.set_width(inner_w);
             ui.spacing_mut().item_spacing.y = 0.0;
-            let (rect, resp) = ui.allocate_exact_size(vec2(inner_w, 42.0), Sense::click());
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            if resp.clicked() {
-                *open = !*open;
-            }
-            let t = ui.ctx().animate_bool_with_time(resp.id.with("open"), *open, 0.12);
-            let p = ui.painter();
-            if resp.hovered() {
-                let r = if *open { CornerRadius { nw: 9, ne: 9, sw: 0, se: 0 } } else { CornerRadius::same(9) };
-                p.rect_filled(rect, r, alpha(Color32::WHITE, 6));
-            }
-            let font = theme::font_semi(13.0);
-            p.text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, title, font.clone(), if *open { TEXT } else { TEXT2 });
+            add(ui, inner_w);
+        });
+}
+
+/// A card's fields, under a hairline.
+fn card_body(ui: &mut Ui, inner_w: f32, add: impl FnOnce(&mut Ui)) {
+    let (sep, _) = ui.allocate_exact_size(vec2(inner_w, 1.0), Sense::hover());
+    ui.painter().hline(sep.x_range(), sep.center().y, Stroke::new(1.0, LINE));
+    Frame::new().inner_margin(Margin { left: 14, right: 14, top: 14, bottom: 14 }).show(ui, |ui| {
+        let w = inner_w - 28.0;
+        ui.set_max_width(w);
+        ui.set_width(w);
+        ui.spacing_mut().item_spacing.y = 10.0;
+        add(ui);
+    });
+}
+
+/// A settings card that is always open: a title (with a "?" that explains it, and a value on the
+/// right) over its fields.
+pub fn card(ui: &mut Ui, width: f32, title: &str, help: Option<&str>, right: Option<RichText>, add: impl FnOnce(&mut Ui)) {
+    card_frame(ui, width, |ui, inner_w| {
+        let (rect, _) = ui.allocate_exact_size(vec2(inner_w, 42.0), Sense::hover());
+        let font = theme::font_semi(13.0);
+        let tw = ui.painter().layout_no_wrap(title.to_string(), font.clone(), TEXT).size().x;
+        ui.painter().text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, title, font, TEXT);
+        if let Some(h) = help {
+            let r = Rect::from_center_size(pos2(rect.left() + 14.0 + tw + 14.0, rect.center().y), vec2(16.0, 16.0));
+            let resp = ui.interact(r, ui.id().with(("card-help", title)), Sense::hover());
+            help_glyph(ui.painter(), r.center(), resp.hovered());
+            help_tip(resp, |ui| {
+                ui.label(RichText::new(h).size(12.0).color(TEXT2));
+            });
+        }
+        if let Some(t) = right {
+            let mut rui = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(14.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
+            rui.label(t);
+        }
+        card_body(ui, inner_w, add);
+    });
+}
+
+/// A settings card that folds away. Its header says what is set (`summary`, green while
+/// `active`), so a closed card still shows its state.
+pub fn fold(ui: &mut Ui, width: f32, title: &str, summary: &str, active: bool, open: &mut bool, add: impl FnOnce(&mut Ui)) {
+    card_frame(ui, width, |ui, inner_w| {
+        let (rect, resp) = ui.allocate_exact_size(vec2(inner_w, 42.0), Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            *open = !*open;
+        }
+        let t = ui.ctx().animate_bool_with_time(resp.id.with("open"), *open, 0.12);
+        let p = ui.painter();
+        if resp.hovered() {
+            let r = if *open { CornerRadius { nw: 11, ne: 11, sw: 0, se: 0 } } else { CornerRadius::same(11) };
+            p.rect_filled(rect.shrink(1.0), r, alpha(Color32::WHITE, 5));
+        }
+        let font = theme::font_semi(13.0);
+        let title_w = p.layout_no_wrap(title.to_string(), font.clone(), TEXT).size().x;
+        p.text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, title, font, if *open || resp.hovered() { TEXT } else { TEXT2 });
+        // chevron flips between down (closed) and up (open)
+        let c = pos2(rect.right() - 18.0, rect.center().y);
+        let dy = 2.2 - 4.4 * t;
+        let pts = [c + vec2(-4.5, -dy), c + vec2(0.0, dy), c + vec2(4.5, -dy)];
+        p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
+        if summary.is_empty() {
             if active {
-                let tw = p.layout_no_wrap(title.to_string(), font, TEXT).size().x;
-                let c = pos2(rect.left() + 14.0 + tw + 10.0, rect.center().y);
+                let c = pos2(rect.left() + 14.0 + title_w + 10.0, rect.center().y);
                 p.circle_filled(c, 5.5, alpha(G1, 40));
                 p.circle_filled(c, 3.0, G1);
             }
-            // chevron flips between down (closed) and up (open)
-            let c = pos2(rect.right() - 18.0, rect.center().y);
-            let dy = 2.2 - 4.4 * t;
-            let pts = [c + vec2(-4.5, -dy), c + vec2(0.0, dy), c + vec2(4.5, -dy)];
-            p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
-            if *open {
-                let (sep, _) = ui.allocate_exact_size(vec2(inner_w, 1.0), Sense::hover());
-                ui.painter().hline(sep.x_range(), sep.center().y, Stroke::new(1.0, LINE));
-                Frame::new().inner_margin(Margin { left: 14, right: 14, top: 12, bottom: 14 }).show(ui, |ui| {
-                    let w = inner_w - 28.0;
-                    ui.set_max_width(w);
-                    ui.set_width(w);
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    add(ui);
-                });
-            }
-        });
+        } else {
+            // the state, right-aligned before the chevron, cut short rather than overlap the title
+            let room = rect.width() - title_w - 14.0 - 40.0 - 16.0;
+            let color = if active { G2 } else { DIM };
+            fit_text(p, pos2(rect.right() - 34.0, rect.center().y), Align2::RIGHT_CENTER, summary, theme::font_semi(11.5), color, room.max(40.0));
+        }
+        if *open {
+            card_body(ui, inner_w, add);
+        }
+    });
 }
 
 // ----------------------------------------------------------------- fields
@@ -546,9 +696,18 @@ pub fn tab_bar(ui: &mut Ui, items: &[&str], selected: usize, enabled: bool) -> O
 
 /// On/off switch with a label to its left.
 pub fn toggle(ui: &mut Ui, text: &str, on: &mut bool, enabled: bool) -> bool {
+    toggle_help(ui, text, None, on, enabled)
+}
+
+/// On/off switch with a label to its left, and a "?" after the label that explains it.
+pub fn toggle_help(ui: &mut Ui, text: &str, help: Option<&str>, on: &mut bool, enabled: bool) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(RichText::new(text).size(12.5).color(if enabled { TEXT2 } else { DIM }));
+        if let Some(h) = help {
+            help_icon(ui, h);
+        }
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             let size = vec2(34.0, 18.0);
             let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
@@ -572,6 +731,11 @@ pub fn toggle(ui: &mut Ui, text: &str, on: &mut bool, enabled: bool) -> bool {
 
 /// Checkbox row with a number field on the right, like "Change after bets [70]".
 pub fn check_field(ui: &mut Ui, text: &str, on: &mut bool, value: &mut String, suffix: Option<&str>, enabled: bool) -> bool {
+    check_field_help(ui, text, None, on, value, suffix, enabled)
+}
+
+/// [`check_field`] with a "?" after the label that explains it.
+pub fn check_field_help(ui: &mut Ui, text: &str, help: Option<&str>, on: &mut bool, value: &mut String, suffix: Option<&str>, enabled: bool) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 9.0;
@@ -591,6 +755,10 @@ pub fn check_field(ui: &mut Ui, text: &str, on: &mut bool, value: &mut String, s
         if label.clicked() && enabled {
             *on = !*on;
             changed = true;
+        }
+        if let Some(h) = help {
+            ui.add_space(-3.0);
+            help_icon(ui, h);
         }
         let _ = resp;
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {

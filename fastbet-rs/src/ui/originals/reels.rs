@@ -5,7 +5,6 @@ use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Ui};
 use serde_json::{json, Value};
 
 use super::super::theme::{self, alpha, mix, BG2, GOLD, MUTED, TEXT, TEXT2};
-use super::super::widgets::field;
 use super::super::App;
 use super::{payout_color, times, trim};
 use crate::originals::{Game, Round};
@@ -20,14 +19,14 @@ fn lines_of(app: &mut App, game: Game) -> &mut u8 {
 
 pub fn params(app: &mut App, ui: &mut Ui, game: Game, locked: bool) {
     let mut s = lines_of(app, game).to_string();
-    if field(ui, "Lines", &mut s, "20", None, !locked).changed() {
+    super::super::widgets::caption_help(ui, "Lines", "The bet size is spread over the lines played, 1 to 20.");
+    if super::super::widgets::text_box(ui, &mut s, "20", None, !locked, false).changed() {
         if let Ok(n) = s.trim().parse::<u8>() {
             *lines_of(app, game) = n.clamp(1, 20);
             app.mark_dirty();
         }
     }
-    ui.label(egui::RichText::new("The bet size is spread over the lines played (1–20).").size(11.0).color(MUTED));
-}
+    }
 
 pub fn bet_params(app: &App, game: Game) -> Result<Value, String> {
     let lines = if game == Game::TomeOfLife { app.settings.orig.tome_lines } else { app.settings.orig.scarab_lines };

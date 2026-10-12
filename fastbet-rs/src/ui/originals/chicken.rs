@@ -4,7 +4,7 @@
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Shape, Stroke, Ui};
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, mix, GOLD, MUTED, RED, TEXT};
+use super::super::theme::{self, alpha, mix, GOLD, RED, TEXT};
 use super::super::widgets::{field, Btn};
 use super::super::App;
 use super::{board_button, levels, times};
@@ -28,7 +28,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             }
         }
         let n = app.settings.orig.chicken_lanes as u32;
-        ui.label(egui::RichText::new(format!("Cashes out after {n} lanes at {}", times(chicken_multiplier(&app.settings.orig.chicken_difficulty, n)))).size(11.0).color(MUTED));
+        super::readout(ui, format!("Cashes out after {} at {}", super::count(n as u64, "lane"), times(chicken_multiplier(&app.settings.orig.chicken_difficulty, n))));
     }
 }
 

@@ -207,6 +207,18 @@ pub struct OriginalPrefs {
     pub tome_lines: u8,
     /// Blitz (Shuffle): cards drawn per bet.
     pub blitz_picks: u8,
+    /// HiLo: the start card (rank "A"…"K", suit letter), or a random one for every bet.
+    pub hilo_rank: String,
+    pub hilo_suit: String,
+    pub hilo_random: bool,
+    /// HiLo auto: what to do on each card, as Antebot's codes ("2,2,2,5,5").
+    pub hilo_pattern: String,
+    /// HiLo auto: take the winnings once a round pays this much, and bet on.
+    pub hilo_cashout_on: bool,
+    pub hilo_cashout: String,
+    /// HiLo auto: take the winnings once a round pays this much, and end the run.
+    pub hilo_stop_on: bool,
+    pub hilo_stop: String,
 }
 
 impl Default for OriginalPrefs {
@@ -249,6 +261,14 @@ impl Default for OriginalPrefs {
             scarab_lines: 20,
             tome_lines: 20,
             blitz_picks: 10,
+            hilo_rank: "A".into(),
+            hilo_suit: "S".into(),
+            hilo_random: false,
+            hilo_pattern: "5".into(),
+            hilo_cashout_on: false,
+            hilo_cashout: "2".into(),
+            hilo_stop_on: true,
+            hilo_stop: "100".into(),
         }
     }
 }

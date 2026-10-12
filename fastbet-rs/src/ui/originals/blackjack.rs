@@ -3,14 +3,14 @@
 use egui::{pos2, vec2, Align2, Rect, Ui};
 use serde_json::{json, Value};
 
-use super::super::theme::{self, GOLD, GREEN, MUTED, RED, TEXT, TEXT2};
+use super::super::theme::{self, GOLD, GREEN, RED, TEXT, TEXT2};
 use super::super::widgets::Btn;
 use super::super::App;
 use super::{board_button, card, card_back, cards_of, times};
 use crate::originals::{Game, Round, Step};
 
 pub fn params(_app: &mut App, ui: &mut Ui) {
-    ui.label(egui::RichText::new("Bet to deal, then play the hand on the board. Blackjack pays 3:2, insurance 2:1.").size(11.0).color(MUTED));
+    super::nothing_to_set(ui, "Nothing to set: bet, then play the hand on the board.");
 }
 
 pub fn bet_params() -> Result<Value, String> {

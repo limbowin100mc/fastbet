@@ -38,7 +38,7 @@ fn coin(p: &egui::Painter, c: Pos2, r: f32, side: Option<&str>, ring: Option<Col
 
 pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     if app.settings.mode != Mode::Auto {
-        ui.label(egui::RichText::new("Bet, then call each flip on the board. Cash out any time.").size(11.0).color(MUTED));
+        super::nothing_to_set(ui, "Bet, then call each flip on the board and cash out any time.");
         return;
     }
     caption(ui, "Calls, in order");
@@ -74,7 +74,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
         }
     });
     let n = app.settings.orig.flip_calls.len() as u32;
-    ui.label(egui::RichText::new(format!("{n} flips  ·  pays {} if every call is right", times(flip_multiplier(n)))).size(11.0).color(MUTED));
+    super::readout(ui, format!("{}  ·  pays {} if every call is right", super::count(n as u64, "flip"), times(flip_multiplier(n))));
     if changed {
         app.mark_dirty();
     }

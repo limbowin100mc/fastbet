@@ -8,7 +8,7 @@ use super::{gem, times};
 use crate::originals::{diamonds_hand, Game, Round, DIAMONDS_PAYTABLE};
 
 pub fn params(_app: &mut App, ui: &mut Ui) {
-    ui.label(egui::RichText::new("No settings: five gems are drawn, and a pair or better pays.").size(11.0).color(MUTED));
+    super::nothing_to_set(ui, "Nothing to set: every bet draws five gems.");
 }
 
 fn hand(r: &Round) -> Vec<String> {

@@ -615,12 +615,20 @@ impl Engine {
         self.emit_seed();
 
         let casino = self.casino()?;
+        // an original's fields for the casino, and how an auto bet plays its round on
+        let (params, plan) = match &wager {
+            Wager::Original(b) => {
+                let (params, plan) = crate::originals::prepare(b.game, b.params.clone());
+                (params, plan.filter(|_| b.auto))
+            }
+            Wager::Limbo(_) => (serde_json::Value::Null, None),
+        };
         let mut attempt = 0u32;
         let (reply, ms) = loop {
             let t0 = Instant::now();
             let res = match &wager {
                 Wager::Limbo(req) => casino.bet_limbo(req).await.map(Reply::Limbo),
-                Wager::Original(b) => casino.original_bet(b.game, &b.currency, b.amount, b.params.clone(), b.auto).await.map(Reply::Original),
+                Wager::Original(b) => casino.original_bet(b.game, &b.currency, b.amount, params.clone(), b.auto).await.map(Reply::Original),
             };
             match res {
                 Ok(r) => break (r, t0.elapsed().as_secs_f64() * 1000.0),
@@ -645,11 +653,12 @@ impl Engine {
             (Wager::Limbo(req), Reply::Limbo(reply)) => (req, reply),
             (_, Reply::Original(mut round)) => {
                 self.emit(Event::Round(round.clone()));
-                // bonus spins need no decisions: play them out
-                let mut spins = 0;
-                while round.active && round.game.plays_itself() && spins < 500 {
-                    spins += 1;
-                    round = casino.original_step(round.game, Step::Next, serde_json::json!({})).await.map_err(BetError::from)?;
+                // bonus spins need no decisions, and an auto bet's plan makes them (HiLo): play the round out
+                let mut steps = 0;
+                while round.active && steps < 500 {
+                    let Some((step, next)) = crate::originals::auto_step(&round, plan.as_ref()) else { break };
+                    steps += 1;
+                    round = casino.original_step(round.game, step, next).await.map_err(BetError::from)?;
                     self.emit(Event::Round(round.clone()));
                 }
                 if round.active {

@@ -480,7 +480,7 @@ impl App {
         }
         let amount = self.to_base(&self.settings.amount, &cur).ok_or("Enter a bet amount")?;
         let id = self.casino();
-        // a 0 bet is still placed where the casino takes it (Stake, Shuffle, Goated)
+        // a 0 bet is still placed where the casino takes it (Stake, Shuffle, Goated, chips.gg)
         if amount == 0 && !id.zero_bets() {
             return Err(format!("{} doesn't take bets of 0", id.name()));
         }
@@ -651,6 +651,10 @@ impl App {
         };
         cfg.original = Some((game, params));
         cfg.hit_line = self.orig_hit_line();
+        // HiLo's Stop takes the winnings and ends the run: a hit
+        if let Some(stop) = originals::stop_line(self, game) {
+            cfg.hit_line = Some(cfg.hit_line.map_or(stop, |h| h.min(stop)));
+        }
         self.hit_badge_n = None;
         self.flash = None;
         self.engine.send(Command::StartAuto(cfg));
@@ -1435,7 +1439,7 @@ impl App {
             ui.add_space(4.0);
             widgets::logo_mark(ui, 32.0);
             ui.add_space(18.0);
-            if widgets::rail_button(ui, self.screen == Screen::Lobby, "Lobby", |p, r, c| widgets::icon(p, r, "home", c)).clicked() {
+            if widgets::rail_button(ui, self.screen == Screen::Lobby, "Originals", |p, r, c| widgets::icon(p, r, "home", c)).clicked() {
                 self.go_lobby();
             }
             if widgets::rail_button(ui, self.screen == Screen::Limbo, "Limbo", |p, r, c| widgets::icon(p, r, "trend", c)).clicked() {

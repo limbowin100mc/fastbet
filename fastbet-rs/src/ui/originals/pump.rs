@@ -37,7 +37,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             }
         }
         let n = app.settings.orig.pump_pumps as u32;
-        ui.label(egui::RichText::new(format!("Cashes out after {n} pumps at {}", times(pump_multiplier(&app.settings.orig.pump_difficulty, n)))).size(11.0).color(MUTED));
+        super::readout(ui, format!("Cashes out after {} at {}", super::count(n as u64, "pump"), times(pump_multiplier(&app.settings.orig.pump_difficulty, n))));
     }
 }
 

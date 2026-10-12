@@ -43,7 +43,7 @@ fn hand(p: &egui::Painter, c: Pos2, s: f32, which: &str, color: Color32) {
 
 pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     if app.settings.mode != Mode::Auto {
-        ui.label(egui::RichText::new("Bet, then throw a hand each round. Cash out any time.").size(11.0).color(MUTED));
+        super::nothing_to_set(ui, "Bet, then throw a hand each round on the board and cash out any time.");
         return;
     }
     caption(ui, "Throws, in order");
