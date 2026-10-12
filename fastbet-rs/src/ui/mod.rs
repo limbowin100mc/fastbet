@@ -84,8 +84,11 @@ pub struct App {
     pub cf_cookie_input: String,
     /// "Clear cookies" just emptied the login window's profile (settings card note).
     pub cookies_cleared: bool,
-    /// Account list: the casino picker of "Add account" is open.
-    pub adding_account: bool,
+    /// Account list: the casino opened on its accounts, the search over them, and the account
+    /// whose remove button was pressed once (a second press removes it).
+    pub open_casino: Option<CasinoId>,
+    pub account_search: String,
+    pub remove_row: Option<String>,
     /// Settings card: "Remove account" was pressed once and waits for the second press.
     pub remove_armed: bool,
     /// Manual login (Goated): the tokens pasted from the browser.
@@ -195,7 +198,9 @@ impl App {
             mirror_open: false,
             cf_open: false,
             cookies_cleared: false,
-            adding_account: false,
+            open_casino: None,
+            account_search: String::new(),
+            remove_row: None,
             remove_armed: false,
             login_manual: false,
             manual_access: String::new(),
@@ -238,6 +243,9 @@ impl App {
             last_save: Instant::now(),
             title: String::new(),
         };
+        // the account list opens on the casino last used
+        let last = app.settings.casino;
+        app.open_casino = app.settings.accounts.iter().any(|a| a.casino == last).then_some(last);
         if let Some(n) = preview {
             app.load_preview(n);
         }
@@ -761,7 +769,17 @@ impl App {
         self.wallet_open = false;
         self.stage = Stage::Idle;
         self.onboard_error = None;
+        self.open_casino = Some(self.casino());
+        self.account_search.clear();
+        self.remove_row = None;
         self.screen = Screen::Accounts;
+    }
+
+    /// Account list: opens `casino` on its accounts, or closes it when it's the open one.
+    pub fn toggle_casino(&mut self, casino: CasinoId) {
+        self.open_casino = if self.open_casino == Some(casino) { None } else { Some(casino) };
+        self.account_search.clear();
+        self.remove_row = None;
     }
 
     pub fn open_account(&mut self, account: &str) {
@@ -779,24 +797,34 @@ impl App {
         let id = a.id.clone();
         self.settings.accounts.push(a);
         self.settings.save();
-        self.adding_account = false;
         self.open_account(&id);
         self.open_settings();
     }
 
-    /// Settings card: "Remove account" pressed twice. Forgets the login and its login window profile.
+    /// Settings card: "Remove account" pressed twice.
     pub fn remove_account(&mut self) {
         let id = self.settings.account.clone();
-        self.settings.accounts.retain(|a| a.id != id);
-        self.settings.removed.push(id.clone());
-        self.settings.account.clear();
-        self.settings.save();
-        let _ = crate::login::clear_profile(&id);
-        // nothing is connected until another account is opened
-        self.engine.send(Command::SetToken(None));
-        self.market = Market::default();
-        self.remove_armed = false;
+        self.forget_account(&id);
         self.go_accounts();
+    }
+
+    /// Forgets an account's login and its login window profile (the casino account itself stays).
+    pub fn forget_account(&mut self, id: &str) {
+        let active = id == self.settings.account;
+        self.settings.accounts.retain(|a| a.id != id);
+        self.settings.removed.push(id.to_string());
+        if active {
+            self.settings.account.clear();
+        }
+        self.settings.save();
+        let _ = crate::login::clear_profile(id);
+        if active {
+            // nothing is connected until another account is opened
+            self.engine.send(Command::SetToken(None));
+            self.market = Market::default();
+        }
+        self.remove_armed = false;
+        self.remove_row = None;
     }
 
     pub fn open_settings(&mut self) {

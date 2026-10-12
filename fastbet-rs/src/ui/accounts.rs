@@ -8,10 +8,11 @@ use super::theme::{self, alpha, BG1, BG2, DIM, G1, G2, GOLD, GREEN, LINE, MUTED,
 use super::widgets::{self, button, icon, list_row, pill_button, Btn};
 use super::{App, Stage};
 use crate::casino::{CasinoId, ConnStatus};
+use crate::settings::Account;
 use crate::cloudflare;
 
 fn header(ui: &mut Ui, full: Rect) {
-    ui.add_space(full.height() * 0.11);
+    ui.add_space(full.height() * 0.07);
     ui.horizontal(|ui| {
         ui.add_space((ui.available_width() - 190.0) / 2.0);
         widgets::logo_mark(ui, 40.0);
@@ -24,23 +25,42 @@ fn footer(ui: &Ui, full: Rect) {
     ui.painter().text(pos2(full.left() + 20.0, full.bottom() - 16.0), Align2::LEFT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(10.5), DIM);
 }
 
-/// "Pick your account": one row per saved account (several per casino if the user likes),
-/// then "Add account", which lists the casinos.
+const CASINO_H: f32 = 48.0;
+const ACCOUNT_H: f32 = 40.0;
+/// Height of [`list_row`] ("More casinos").
+const MORE_H: f32 = 42.0;
+/// A casino with this many accounts gets a search box over them.
+const SEARCH_FROM: usize = 8;
+const SEARCH_H: f32 = 46.0;
+
+/// What a click on the account list asks for.
+enum Pick {
+    Toggle(CasinoId),
+    Open(String),
+    Add(CasinoId),
+    Arm(String),
+    Remove(String),
+}
+
+/// "Pick your casino": one row per casino with its account count. A click opens it on its
+/// accounts (scrolling once there are more than fit), each with a remove button, then "Add account".
 pub fn accounts(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     widgets::dot_grid(ui, full);
-    ui.vertical_centered(|ui| {
+    let mut pick = None;
+    // the page scrolls too, for windows too short for the open casino's two first accounts
+    egui::ScrollArea::vertical().id_salt("account-list").auto_shrink([false, false]).show(ui, |ui| ui.vertical_centered(|ui| {
+        let page_top = ui.cursor().top();
         header(ui, full);
-        ui.add_space(full.height() * 0.12);
-        ui.label(widgets::semi("Pick your account", 13.5, TEXT2));
-        ui.add_space(22.0);
+        ui.add_space(full.height() * 0.045);
+        ui.label(widgets::semi("Pick your casino", 13.5, TEXT2));
+        ui.add_space(18.0);
         let w = 500.0_f32.min(full.width() - 40.0);
-        let mut picked = None;
-        let mut add = None;
-        // grouped by casino, in the order they were added
-        let mut accounts = app.settings.accounts.clone();
-        accounts.sort_by_key(|a| CasinoId::ALL.iter().position(|c| *c == a.casino));
-        let adding = app.adding_account || accounts.is_empty();
+        // what the open casino's accounts may take: the window under the card's top, less the
+        // other rows, "Add account" and a margin (the version sits left of the card). Measured
+        // from the page's top, so it doesn't change as the page scrolls.
+        let rows = CasinoId::ALL.len() as f32 * CASINO_H + MORE_H + ACCOUNT_H;
+        let room = full.height() - (ui.cursor().top() - page_top) - rows - 20.0;
         Frame::new()
             .fill(BG1)
             .stroke(Stroke::new(1.0, LINE))
@@ -49,36 +69,201 @@ pub fn accounts(app: &mut App, ui: &mut Ui) {
             .show(ui, |ui| {
                 ui.set_width(w);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for a in &accounts {
-                    let value = app.account_name(a).unwrap_or_else(|| "Not logged in yet".to_string());
-                    let logos = &mut app.logos;
-                    let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), a.casino, TEXT);
-                    if list_row(ui, mark, a.casino.name(), &value, true).clicked() {
-                        picked = Some(a.id.clone());
-                    }
-                }
-                if !accounts.is_empty() && list_row(ui, |p, r| widgets::letter_mark(p, r, "+", G2), "Add account", if adding { "Pick the casino" } else { "Another login, any casino" }, true).clicked() {
-                    app.adding_account = !app.adding_account;
-                }
-                if adding {
-                    for id in CasinoId::ALL {
-                        let logos = &mut app.logos;
-                        let mark = |p: &egui::Painter, r: Rect| logos.paint(p, r.shrink(1.0), *id, TEXT);
-                        if list_row(ui, mark, id.name(), "Add account", true).clicked() {
-                            add = Some(*id);
-                        }
-                    }
+                for &casino in CasinoId::ALL {
+                    casino_group(app, ui, casino, room, &mut pick);
                 }
                 list_row(ui, |p, r| widgets::letter_mark(p, r, "?", DIM), "More casinos", "Coming soon", false);
             });
-        if let Some(id) = picked {
-            app.open_account(&id);
-        } else if let Some(casino) = add {
-            app.add_account(casino);
-        }
-    });
+        ui.add_space(16.0);
+    }));
+    // a click anywhere but the armed remove button (or Esc) takes it back
+    let clicked = ui.input(|i| i.pointer.any_click() || i.key_pressed(egui::Key::Escape));
+    if clicked && !matches!(pick, Some(Pick::Arm(_) | Pick::Remove(_))) {
+        app.remove_row = None;
+    }
+    match pick {
+        Some(Pick::Toggle(casino)) => app.toggle_casino(casino),
+        Some(Pick::Open(id)) => app.open_account(&id),
+        Some(Pick::Add(casino)) => app.add_account(casino),
+        Some(Pick::Arm(id)) => app.remove_row = Some(id),
+        Some(Pick::Remove(id)) => app.forget_account(&id),
+        None => {}
+    }
     footer(ui, full);
     gear_menu(app, ui, full);
+}
+
+/// One casino of the account list: its row, and under it (while open) its accounts and "Add account".
+fn casino_group(app: &mut App, ui: &mut Ui, casino: CasinoId, room: f32, pick: &mut Option<Pick>) {
+    let n = app.settings.accounts.iter().filter(|a| a.casino == casino).count();
+    let t = ui.ctx().animate_bool_with_time(egui::Id::new(("casino-group", casino.key())), app.open_casino == Some(casino), 0.16);
+    let w = ui.available_width();
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, CASINO_H), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hot = resp.hovered();
+    let p = ui.painter();
+    if hot {
+        p.rect_filled(rect, CornerRadius::ZERO, alpha(egui::Color32::WHITE, 6));
+    }
+    let cy = rect.center().y;
+    // the open casino's marker on the card's edge
+    if t > 0.0 {
+        let bar = Rect::from_center_size(pos2(rect.left() + 1.5, cy), vec2(3.0, 20.0));
+        p.rect_filled(bar, CornerRadius::same(2), alpha(G1, (255.0 * t) as u8));
+    }
+    app.logos.paint(p, Rect::from_center_size(pos2(rect.left() + 26.0, cy), vec2(22.0, 22.0)).shrink(1.0), casino, TEXT);
+    p.text(pos2(rect.left() + 48.0, cy), Align2::LEFT_CENTER, casino.name(), theme::font_semi(13.5), theme::mix(TEXT2, TEXT, t.max(f32::from(u8::from(hot)))));
+    let count = match n {
+        0 => "No accounts yet".to_string(),
+        1 => "1 account".to_string(),
+        n => format!("{n} accounts"),
+    };
+    p.text(pos2(rect.right() - 38.0, cy), Align2::RIGHT_CENTER, count, theme::font(12.0), if n == 0 { DIM } else { MUTED });
+    chevron(p, pos2(rect.right() - 18.0, cy), t, if hot { TEXT2 } else { MUTED });
+    if resp.clicked() {
+        *pick = Some(Pick::Toggle(casino));
+    }
+
+    if t > 0.0 {
+        group_body(app, ui, casino, room, t, pick);
+    }
+    let bottom = ui.cursor().top();
+    ui.painter().hline(rect.x_range(), bottom - 0.5, Stroke::new(1.0, LINE));
+}
+
+/// An open casino: search (with many accounts), its accounts in a scroll area, "Add account".
+/// `t` is how far open it is, for the slide.
+fn group_body(app: &mut App, ui: &mut Ui, casino: CasinoId, room: f32, t: f32, pick: &mut Option<Pick>) {
+    let all: Vec<Account> = app.settings.accounts.iter().filter(|a| a.casino == casino).cloned().collect();
+    let search = all.len() >= SEARCH_FROM;
+    let q = app.account_search.trim().to_lowercase();
+    let matches = |a: &Account| q.is_empty() || app.account_name(a).is_some_and(|u| u.to_lowercase().contains(&q)) || a.mirror.as_ref().is_some_and(|m| m.contains(&q));
+    let shown: Vec<&Account> = all.iter().filter(|a| matches(a)).collect();
+    let search_h = if search { SEARCH_H } else { 0.0 };
+    // whole rows, at least two
+    let fit = ((room - search_h) / ACCOUNT_H).floor().max(2.0);
+    let list_h = if shown.is_empty() && search { ACCOUNT_H } else { shown.len() as f32 * ACCOUNT_H }.min(fit * ACCOUNT_H);
+    let body_h = search_h + list_h + ACCOUNT_H;
+
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(w, (body_h * t).round()), egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, alpha(theme::BG, 110));
+    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, alpha(LINE, 160)));
+    let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(rect.min, vec2(w, body_h))).layout(Layout::top_down(Align::Min)));
+    ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+    ui.spacing_mut().item_spacing.y = 0.0;
+
+    if search {
+        Frame::new().inner_margin(Margin { left: 46, right: 14, top: 8, bottom: 6 }).show(&mut ui, |ui| {
+            let count = format!("{} of {}", shown.len(), all.len());
+            widgets::text_box(ui, &mut app.account_search, "Search accounts", Some(&count), true, false);
+        });
+    }
+    let scroll = egui::ScrollArea::vertical().id_salt(("accounts", casino.key())).max_height(list_h).auto_shrink([false, true]).show(&mut ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for a in &shown {
+            account_row(app, ui, a, pick);
+        }
+        if shown.is_empty() && search {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), ACCOUNT_H), egui::Sense::hover());
+            ui.painter().text(pos2(r.left() + 78.0, r.center().y), Align2::LEFT_CENTER, "No account matches", theme::font_semi(12.0), MUTED);
+        }
+    });
+    // more accounts below: the last row fades out
+    let view = scroll.inner_rect;
+    if scroll.state.offset.y + view.height() < scroll.content_size.y - 1.0 {
+        for i in 0..12 {
+            let y = view.bottom() - 24.0 + i as f32 * 2.0;
+            let strip = Rect::from_min_max(pos2(view.left(), y), pos2(view.right() - 8.0, y + 2.0));
+            ui.painter().rect_filled(strip, CornerRadius::ZERO, alpha(BG1, (i * 18) as u8));
+        }
+    }
+    if scroll.content_size.y > view.height() + 1.0 {
+        ui.painter().hline(view.x_range(), view.bottom(), Stroke::new(1.0, alpha(LINE, 160)));
+    }
+
+    let (r, resp) = ui.allocate_exact_size(vec2(w, ACCOUNT_H), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(r, CornerRadius::ZERO, alpha(egui::Color32::WHITE, 6));
+    }
+    let c = pos2(r.left() + 60.0, r.center().y);
+    p.circle_stroke(c, 9.5, Stroke::new(1.2, alpha(G2, if resp.hovered() { 200 } else { 120 })));
+    p.line_segment([c - vec2(4.0, 0.0), c + vec2(4.0, 0.0)], Stroke::new(1.6, G2));
+    p.line_segment([c - vec2(0.0, 4.0), c + vec2(0.0, 4.0)], Stroke::new(1.6, G2));
+    p.text(pos2(r.left() + 78.0, r.center().y), Align2::LEFT_CENTER, "Add account", theme::font_semi(12.5), G2);
+    if resp.clicked() {
+        *pick = Some(Pick::Add(casino));
+    }
+}
+
+/// One account of an open casino: initial, username, mirror (when it isn't the main site),
+/// and on hover a bin that asks for a second press.
+fn account_row(app: &App, ui: &mut Ui, a: &Account, pick: &mut Option<Pick>) {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, ACCOUNT_H), egui::Sense::click());
+    let armed = app.remove_row.as_deref() == Some(a.id.as_str());
+    let over = ui.rect_contains_pointer(rect);
+    let cy = rect.center().y;
+
+    // the bin, or once pressed, "Remove" in red
+    let bin = if armed {
+        Rect::from_min_max(pos2(rect.right() - 98.0, cy - 12.0), pos2(rect.right() - 34.0, cy + 12.0))
+    } else {
+        Rect::from_center_size(pos2(rect.right() - 46.0, cy), vec2(26.0, 26.0))
+    };
+    let bin_resp = (over || armed).then(|| {
+        let hint = if armed { "Forgets this login on this PC (the casino account itself stays)" } else { "Remove account" };
+        ui.interact(bin, ui.id().with(("remove", &a.id)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint)
+    });
+
+    let p = ui.painter();
+    if over && !armed {
+        p.rect_filled(rect, CornerRadius::ZERO, alpha(egui::Color32::WHITE, 6));
+    }
+    let name = app.account_name(a);
+    let c = pos2(rect.left() + 60.0, cy);
+    p.circle_filled(c, 10.0, theme::BG3);
+    let initial = name.as_deref().and_then(|u| u.chars().next()).map(|ch| ch.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+    p.text(c, Align2::CENTER_CENTER, initial, theme::font_bold(10.5), if name.is_some() { TEXT2 } else { DIM });
+    let (label, color) = match &name {
+        Some(u) => (u.clone(), TEXT),
+        None => ("Not logged in yet".to_string(), MUTED),
+    };
+    p.text(pos2(rect.left() + 78.0, cy), Align2::LEFT_CENTER, label, theme::font_semi(12.5), color);
+    let mirror = a.mirror.as_deref().filter(|m| Some(*m) != a.casino.default_mirror());
+    if let (Some(m), false) = (mirror, armed) {
+        p.text(pos2(rect.right() - 66.0, cy), Align2::RIGHT_CENTER, m, theme::font(11.5), MUTED);
+    }
+    match &bin_resp {
+        Some(b) if armed => {
+            p.rect(bin, CornerRadius::same(12), alpha(RED, if b.hovered() { 60 } else { 36 }), Stroke::new(1.0, alpha(RED, 150)), StrokeKind::Inside);
+            p.text(bin.center(), Align2::CENTER_CENTER, "Remove", theme::font_semi(11.0), RED);
+        }
+        Some(b) => {
+            if b.hovered() {
+                p.rect_filled(bin, CornerRadius::same(theme::RADIUS_SM), alpha(RED, 30));
+            }
+            icon(p, Rect::from_center_size(bin.center(), vec2(13.0, 13.0)), "trash", if b.hovered() { RED } else { MUTED });
+        }
+        None => {}
+    }
+    chevron(p, pos2(rect.right() - 18.0, cy), 0.0, if over { TEXT2 } else { DIM });
+
+    if bin_resp.as_ref().is_some_and(|b| b.clicked()) {
+        *pick = Some(if armed { Pick::Remove(a.id.clone()) } else { Pick::Arm(a.id.clone()) });
+    } else if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        *pick = Some(Pick::Open(a.id.clone()));
+    }
+}
+
+/// A chevron pointing right, turned to point down as `t` goes to 1.
+fn chevron(p: &egui::Painter, c: egui::Pos2, t: f32, color: egui::Color32) {
+    let (sin, cos) = (t * std::f32::consts::FRAC_PI_2).sin_cos();
+    let turn = |x: f32, y: f32| c + vec2(x * cos - y * sin, x * sin + y * cos);
+    p.add(egui::Shape::line(vec![turn(-2.0, -4.0), turn(2.0, 0.0), turn(-2.0, 4.0)], Stroke::new(1.6, color)));
 }
 
 /// The gear in the top-right corner of the welcome screen and its menu (version, Check for updates).
@@ -141,7 +326,7 @@ pub fn account(app: &mut App, ui: &mut Ui) {
     // scrolls once the settings card (with the Cloudflare section open) outgrows a small window
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ui.vertical_centered(|ui| {
         header(ui, full);
-        ui.add_space(full.height() * 0.1);
+        ui.add_space(full.height() * 0.14);
         let (rect, _) = ui.allocate_exact_size(vec2(76.0, 76.0), egui::Sense::hover());
         let p = ui.painter();
         p.circle_filled(rect.center(), 38.0, BG2);
