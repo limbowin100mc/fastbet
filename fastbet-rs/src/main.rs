@@ -79,6 +79,8 @@ fn main() -> eframe::Result<()> {
         .with_title("FastBet")
         .with_inner_size([1360.0, 860.0])
         .with_min_inner_size([1040.0, 640.0])
+        // FastBet draws its own title bar (ui::titlebar)
+        .with_decorations(false)
         .with_app_id("gg.fastbet");
     if let Some(icon) = icon {
         viewport = viewport.with_icon(Arc::new(icon));

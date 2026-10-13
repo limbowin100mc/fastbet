@@ -1,11 +1,13 @@
 //! Reusable widgets: pills, section cards, fields, segmented controls,
 //! buttons, stat chips, gradients and glows, the dot-grid background and the logo.
 
+use egui::emath::GuiRounding as _;
 use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Painter, Pos2, Rect, Response, RichText, Sense,
     Stroke, StrokeKind, TextEdit, TextureHandle, Ui, UiBuilder, Vec2,
 };
 
+use super::logos;
 use super::theme::{self, alpha, mix, BG, BG1, BG2, BG3, DIM, G1, G2, GOLD, INK, LINE, LINE2, MUTED, RADIUS, RADIUS_SM, RED, TEXT, TEXT2};
 
 /// Height of text fields and the buttons that sit next to them.
@@ -240,13 +242,13 @@ pub fn paint_logo(ui: &Ui, rect: Rect) {
     p.add(egui::Shape::mesh(mesh));
 }
 
-/// Wordmark: "Fast" in green, "bet" in white.
-pub fn wordmark(ui: &mut Ui, size: f32) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.label(bold("Fast", size, G1));
-        ui.label(bold("bet", size, TEXT));
-    });
+/// Wordmark: "FASTBET" in a red-to-yellow gradient, letters `height` points tall.
+/// Its glow spills past the space it takes.
+pub fn wordmark(ui: &mut Ui, height: f32) {
+    let glow = height * logos::WORDMARK_GLOW;
+    let w = (height + 2.0 * glow) * logos::wordmark_aspect() - 2.0 * glow;
+    let (rect, _) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
+    logos::paint_wordmark(ui.painter(), rect.expand(glow).round_to_pixels(ui.ctx().pixels_per_point()));
 }
 
 // ----------------------------------------------------------------- pills
@@ -451,8 +453,9 @@ pub fn glyph_button(ui: &mut Ui, icon_name: &str, tip: &str) -> Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
-/// Left rail navigation button: icon only, accent tint and edge marker when active.
-pub fn rail_button(ui: &mut Ui, on: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Rect, Color32)) -> Response {
+/// Left rail navigation button: icon only, accent tint and edge marker when active. `draw`
+/// paints the icon in the colour given, and gets the hover (0–1, eased) to animate it.
+pub fn rail_button(ui: &mut Ui, on: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Rect, Color32, f32)) -> Response {
     let rail_left = ui.max_rect().left();
     let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.1);
@@ -465,7 +468,7 @@ pub fn rail_button(ui: &mut Ui, on: bool, tip: &str, draw: impl FnOnce(&egui::Pa
         p.rect_filled(rect, CornerRadius::same(10), alpha(Color32::WHITE, (10.0 * t) as u8));
     }
     let color = if on { G1 } else { mix(MUTED, TEXT, t) };
-    draw(p, rect.shrink(11.0), color);
+    draw(p, rect.shrink(11.0), color, t);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
@@ -843,29 +846,46 @@ pub fn menu_item(ui: &mut Ui, icon_name: &str, text: &str) -> Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Originals: a die tipped onto its corner, five pips up. `roll` (0–1, the hover) tips it further.
+pub fn paint_die(p: &egui::Painter, r: Rect, color: Color32, roll: f32) {
+    let c = r.center();
+    let side = r.width() * 0.8;
+    let angle = -0.26 - 0.45 * roll;
+    let body = Rect::from_center_size(c, vec2(side, side));
+    p.add(egui::epaint::RectShape::new(body, CornerRadius::same((side * 0.24) as u8), alpha(color, 40), Stroke::new(1.6, color), StrokeKind::Middle).with_angle(angle));
+    let turn = egui::emath::Rot2::from_angle(angle);
+    let k = side * 0.26;
+    for (x, y) in [(0.0, 0.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        p.circle_filled(c + turn * vec2(x * k, y * k), side * 0.095, color);
+    }
+}
+
+/// Slots: a slot machine, three reels in its window and the lever at its side. `pull` (0–1, the
+/// hover) pulls the lever down.
+pub fn paint_slot_machine(p: &egui::Painter, r: Rect, color: Color32, pull: f32) {
+    let s = Stroke::new(1.6, color);
+    let at = |fx: f32, fy: f32| pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
+    p.rect(Rect::from_min_max(at(0.0, 0.1), at(0.74, 1.0)), CornerRadius::same(3), alpha(color, 40), s, StrokeKind::Middle);
+    // the window, a symbol on each reel
+    p.rect(Rect::from_min_max(at(0.13, 0.3), at(0.61, 0.64)), CornerRadius::same(1), alpha(color, 30), Stroke::new(1.2, color), StrokeKind::Middle);
+    for fx in [0.21, 0.37, 0.53] {
+        p.circle_filled(at(fx, 0.47), r.width() * 0.06, color);
+    }
+    // the payout tray
+    p.line_segment([at(0.22, 0.82), at(0.52, 0.82)], s);
+    // the lever: out of the side, up to its knob
+    let knob = 0.12 + 0.38 * pull;
+    p.add(egui::Shape::line(vec![at(0.74, 0.72), at(0.92, 0.72), at(0.92, knob)], s));
+    p.circle_filled(at(0.92, knob), r.width() * 0.11, color);
+}
+
 /// Paints a tiny icon by name into `r`.
 pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
     let s = Stroke::new(1.6, color);
     let at = |fx: f32, fy: f32| pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
     match name {
-        "home" => {
-            p.add(egui::Shape::line(vec![at(0.0, 0.48), at(0.5, 0.04), at(1.0, 0.48)], s));
-            p.add(egui::Shape::line(vec![at(0.16, 0.36), at(0.16, 0.96), at(0.84, 0.96), at(0.84, 0.36)], s));
-            p.add(egui::Shape::line(vec![at(0.4, 0.96), at(0.4, 0.66), at(0.6, 0.66), at(0.6, 0.96)], s));
-        }
-        "trend" => {
-            // a rising multiplier line with an arrow head
-            p.add(egui::Shape::line(vec![at(0.0, 0.88), at(0.34, 0.54), at(0.56, 0.72), at(0.98, 0.18)], s));
-            p.add(egui::Shape::line(vec![at(0.62, 0.16), at(0.98, 0.16), at(0.98, 0.52)], s));
-        }
-        "slots" => {
-            p.rect_stroke(r, CornerRadius::same(3), s, StrokeKind::Middle);
-            p.line_segment([at(0.36, 0.0), at(0.36, 1.0)], s);
-            p.line_segment([at(0.64, 0.0), at(0.64, 1.0)], s);
-            for fx in [0.18, 0.5, 0.82] {
-                p.circle_filled(at(fx, 0.5), 1.4, color);
-            }
-        }
+        "dice" => paint_die(p, r, color, 0.0),
+        "slots" => paint_slot_machine(p, r, color, 0.0),
         "bolt" => {
             let pts = [(13.2, 2.0), (4.0, 13.6), (10.6, 13.6), (9.8, 22.0), (20.0, 9.9), (13.3, 9.9)];
             let sc = r.height() / 22.0;
@@ -995,6 +1015,30 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.line_segment([at(0.05, 0.2), at(0.95, 0.2)], s);
             p.add(egui::Shape::line(vec![at(0.35, 0.2), at(0.38, 0.04), at(0.62, 0.04), at(0.65, 0.2)], s));
             p.add(egui::Shape::line(vec![at(0.16, 0.2), at(0.22, 0.98), at(0.78, 0.98), at(0.84, 0.2)], s));
+        }
+        "grip" => {
+            // something to take hold of: two columns of three dots
+            for fx in [0.3, 0.7] {
+                for fy in [0.18, 0.5, 0.82] {
+                    p.circle_filled(at(fx, fy), 1.3, color);
+                }
+            }
+        }
+        "minimize" => {
+            p.line_segment([at(0.12, 0.55), at(0.88, 0.55)], s);
+        }
+        "expand" => {
+            // arrows out to two corners
+            p.line_segment([at(0.14, 0.86), at(0.86, 0.14)], s);
+            p.add(egui::Shape::line(vec![at(0.5, 0.1), at(0.9, 0.1), at(0.9, 0.5)], s));
+            p.add(egui::Shape::line(vec![at(0.1, 0.5), at(0.1, 0.9), at(0.5, 0.9)], s));
+        }
+        "dock" => {
+            // a window with its right column filled: back to the side
+            let side = Rect::from_min_max(at(0.62, 0.0), at(1.0, 1.0));
+            p.rect_filled(side, CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, alpha(color, 110));
+            p.rect_stroke(r, CornerRadius::same(2), s, StrokeKind::Middle);
+            p.line_segment([at(0.62, 0.0), at(0.62, 1.0)], s);
         }
         _ => {}
     }

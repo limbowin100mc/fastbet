@@ -142,12 +142,33 @@ pub struct Settings {
     /// The originals' own settings (risk, rows, picked tiles …).
     pub orig: OriginalPrefs,
 
+    /// Where the Session pane sits: docked on the right, or floating, and whether it's minimized.
+    pub session: SessionPane,
+
     /// The file exists but couldn't be read: saving is off so it is never overwritten.
     #[serde(skip)]
     pub unreadable: bool,
     /// Accounts removed by the user this session: the only logins a save may drop.
     #[serde(skip)]
     pub removed: Vec<String>,
+}
+
+/// Where the Session pane sits.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionPane {
+    /// On the right side (the default); otherwise floating at `pos`.
+    pub docked: bool,
+    /// The floating pane's top-left corner, in points from the window's top-left.
+    pub pos: [f32; 2],
+    /// Shrunk to a small card with just the profit.
+    pub minimized: bool,
+}
+
+impl Default for SessionPane {
+    fn default() -> Self {
+        Self { docked: true, pos: [0.0, 0.0], minimized: false }
+    }
 }
 
 /// What each original's board was last set to.
@@ -323,6 +344,7 @@ impl Default for Settings {
             slot_stop_loss: String::new(),
             slot_prefs: Default::default(),
             orig: OriginalPrefs::default(),
+            session: SessionPane::default(),
             unreadable: false,
             removed: vec![],
         }

@@ -12,13 +12,9 @@ use crate::settings::Account;
 use crate::cloudflare;
 
 fn header(ui: &mut Ui, full: Rect) {
-    ui.add_space(full.height() * 0.07);
-    ui.horizontal(|ui| {
-        ui.add_space((ui.available_width() - 190.0) / 2.0);
-        widgets::logo_mark(ui, 40.0);
-        ui.add_space(8.0);
-        widgets::wordmark(ui, 40.0);
-    });
+    ui.add_space(full.height() * 0.07 + 4.0);
+    widgets::wordmark(ui, 32.0);
+    ui.add_space(4.0);
 }
 
 fn footer(ui: &Ui, full: Rect) {

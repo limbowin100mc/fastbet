@@ -15,6 +15,7 @@ pub mod sound;
 pub mod stats;
 pub mod stats_pane;
 pub mod theme;
+pub mod titlebar;
 pub mod update;
 pub mod wallet;
 pub mod widgets;
@@ -1467,15 +1468,14 @@ impl App {
             ui.add_space(4.0);
             widgets::logo_mark(ui, 32.0);
             ui.add_space(18.0);
-            if widgets::rail_button(ui, self.screen == Screen::Lobby, "Originals", |p, r, c| widgets::icon(p, r, "home", c)).clicked() {
+            // Limbo and every other original open from the Originals lobby
+            let in_originals = matches!(self.screen, Screen::Lobby | Screen::Limbo | Screen::Original(_));
+            if widgets::rail_button(ui, in_originals, "Originals", widgets::paint_die).clicked() {
                 self.go_lobby();
-            }
-            if widgets::rail_button(ui, self.screen == Screen::Limbo, "Limbo", |p, r, c| widgets::icon(p, r, "trend", c)).clicked() {
-                self.go_limbo();
             }
             if self.casino().has_slots() {
                 let on_slots = matches!(self.screen, Screen::Slots | Screen::Slot);
-                if widgets::rail_button(ui, on_slots, "Slots", |p, r, c| widgets::icon(p, r, "slots", c)).clicked() {
+                if widgets::rail_button(ui, on_slots, "Slots", widgets::paint_slot_machine).clicked() {
                     self.go_slots();
                 }
             }
@@ -1669,6 +1669,11 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("titlebar")
+            .exact_size(titlebar::HEIGHT)
+            .frame(Frame::new().fill(BG))
+            .show_separator_line(false)
+            .show(ui, |ui| titlebar::show(self, ui));
         match self.screen {
             Screen::Accounts => {
                 egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| accounts::accounts(self, ui));
@@ -1698,17 +1703,21 @@ impl eframe::App for App {
                         self.top_bar(ui);
                     });
 
-                egui::Panel::right("stats")
-                    .resizable(true)
-                    .default_size(280.0)
-                    .size_range(250.0..=380.0)
-                    .frame(Frame::new().fill(BG1).inner_margin(Margin::same(0)))
-                    .show_separator_line(false)
-                    .show(ui, |ui| {
-                        let r = ui.max_rect();
-                        ui.painter().vline(r.left() - 0.5, r.y_range(), Stroke::new(1.0, LINE));
-                        stats_pane::show(self, ui)
-                    });
+                // the Session pane: on the right, or floating over the page (see stats_pane)
+                let docked = self.settings.session.docked && !self.settings.session.minimized;
+                if docked {
+                    egui::Panel::right("stats")
+                        .resizable(true)
+                        .default_size(280.0)
+                        .size_range(250.0..=380.0)
+                        .frame(Frame::new().fill(BG1).inner_margin(Margin::same(0)))
+                        .show_separator_line(false)
+                        .show(ui, |ui| {
+                            let r = ui.max_rect();
+                            ui.painter().vline(r.left() - 0.5, r.y_range(), Stroke::new(1.0, LINE));
+                            stats_pane::docked(self, ui)
+                        });
+                }
 
                 egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| {
                     let area = ui.max_rect();
@@ -1721,9 +1730,13 @@ impl eframe::App for App {
                     }
                     self.toast(ui, area);
                 });
+                if !docked {
+                    stats_pane::floating(self, ui.ctx());
+                }
             }
         }
         update::show(self, ui.ctx());
+        titlebar::resize_grips(ui);
     }
 }
 
