@@ -1,12 +1,12 @@
 //! Mines: 25 tiles, some hide mines. Manual: reveal one at a time and cash out.
 //! Auto: pick the tiles up front; every bet reveals them all.
 
-use egui::{pos2, vec2, Align2, Rect, Ui};
+use egui::{pos2, vec2, Align2, CornerRadius, Rect, Stroke, StrokeKind, Ui};
 use rand::seq::IndexedRandom;
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, GREEN, TEXT2};
-use super::super::widgets::{caption, chip_button_sized};
+use super::super::theme::{self, alpha, BG1, BG2, DIM, GREEN, LINE2, MUTED, TEXT, TEXT2};
+use super::super::widgets::{self, caption, chip_button_sized};
 use super::super::App;
 use super::{bomb, gem, grid, hit, nums, tile, tile_face, times, Tile};
 use crate::originals::{Game, Round, Step};
@@ -127,7 +127,7 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
     let mines: Vec<i64> = shown.as_ref().filter(|r| !r.active).map(|r| nums(&r.state["mines"])).unwrap_or_default();
     let settled = shown.as_ref().is_some_and(|r| !r.active);
 
-    let area = Rect::from_min_max(rect.min + vec2(24.0, 16.0), pos2(rect.max.x - 24.0, rect.max.y - 44.0));
+    let area = Rect::from_min_max(rect.min + vec2(24.0, 16.0), pos2(rect.max.x - 24.0, rect.max.y - BAR_ROOM));
     let cells = grid(area, 5, 5, 10.0, 96.0);
     let mut clicked: Option<u8> = None;
     for (i, cell) in cells.iter().enumerate() {
@@ -199,17 +199,154 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
         }
     }
 
-    // the line under the board: what the next tile pays
-    let p = ui.painter();
-    let y = rect.bottom() - 24.0;
+    stat_bar(app, ui, rect, open.as_ref());
+}
+
+/// Height of the readouts under the board, and the room they take with their margins.
+const BAR_H: f32 = 32.0;
+const BAR_ROOM: f32 = BAR_H + 30.0;
+
+/// One readout under the board: "Payout  52,598.70× | $52.60".
+struct Stat {
+    label: &'static str,
+    /// A multiplier shown before the value, when the value is money.
+    mult: Option<String>,
+    value: String,
+}
+
+/// Chance that the next `k` tiles are all gems, with `gems` already found (in %).
+fn gem_chance(mines: u32, gems: u32, k: u32) -> f64 {
+    (0..k).map(|i| (25.0 - (mines + gems + i) as f64) / (25.0 - (gems + i) as f64)).product::<f64>().max(0.0) * 100.0
+}
+
+/// A chance with enough digits to tell small ones apart: 91.67%, 0.001882%.
+fn fmt_chance(pct: f64) -> String {
+    if pct >= 1.0 || pct <= 0.0 {
+        return format!("{pct:.2}%");
+    }
+    let decimals = (3 - pct.log10().floor() as i32).clamp(2, 10) as usize;
+    format!("{pct:.decimals$}%")
+}
+
+/// A multiplier with two decimals, thousands grouped: 52,598.70×.
+fn fmt_mult(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{}×", crate::money::group_thousands(&format!("{m:.2}")))
+    } else {
+        times(m)
+    }
+}
+
+/// The readouts under the board, Antebot's: what the picked tiles pay and the chance they are all
+/// gems (auto), or the cash out, the next gem and its chance (a manual round).
+fn stat_bar(app: &mut App, ui: &mut Ui, rect: Rect, open: Option<&Round>) {
+    let auto = auto_mode(app);
     let m = app.settings.orig.mines_count as u32;
-    let txt = match &open {
-        Some(r) => {
-            let gems = revealed(r).len() as u32;
-            format!("{} so far  ·  next tile pays {}", times(r.state["rounds"].as_array().and_then(|a| a.last()).and_then(|x| x["payoutMultiplier"].as_f64()).unwrap_or(1.0)), times(app.orig.tables.mines(r.state["minesCount"].as_u64().unwrap_or(m as u64) as u32, gems + 1)))
-        }
-        None if auto => format!("{m} mines  ·  click tiles to pick them"),
-        None => format!("{m} mines  ·  first gem pays {}", times(app.orig.tables.mines(m, 1))),
+    let picks = app.settings.orig.mines_picks.len() as u32;
+    let cur = app.active_currency();
+    let bet = app.to_base(&app.settings.amount, &cur);
+    // money when the bet size is known, else just the multiplier
+    let paid = |label: &'static str, mult: f64| match bet {
+        Some(b) => Stat { label, mult: Some(fmt_mult(mult)), value: app.prim(crate::money::mul_f(b, mult), &cur, false) },
+        None => Stat { label, mult: None, value: fmt_mult(mult) },
     };
-    super::note(p, pos2(rect.center().x, y), &txt);
+    let stats: Vec<Stat> = match open {
+        Some(r) => {
+            let mines = r.state["minesCount"].as_u64().unwrap_or(m as u64) as u32;
+            let gems = revealed(r).len() as u32;
+            let now = r.state["rounds"].as_array().and_then(|a| a.last()).and_then(|x| x["payoutMultiplier"].as_f64()).unwrap_or(0.0);
+            let cash = if gems == 0 { Stat { label: "Cash out", mult: None, value: "–".into() } } else { paid("Cash out", now) };
+            vec![
+                cash,
+                paid("Next gem", app.orig.tables.mines(mines, gems + 1)),
+                Stat { label: "Gem chance", mult: None, value: fmt_chance(gem_chance(mines, gems, 1)) },
+            ]
+        }
+        None if auto && picks == 0 => vec![],
+        None if auto => vec![
+            paid("Payout", app.orig.tables.mines(m, picks)),
+            Stat { label: "Win chance", mult: None, value: fmt_chance(gem_chance(m, 0, picks)) },
+        ],
+        None => vec![
+            paid("First gem", app.orig.tables.mines(m, 1)),
+            Stat { label: "Gem chance", mult: None, value: fmt_chance(gem_chance(m, 0, 1)) },
+        ],
+    };
+
+    let mid_y = rect.bottom() - 15.0 - BAR_H / 2.0;
+    if stats.is_empty() {
+        super::note(ui.painter(), pos2(rect.center().x, mid_y), &format!("{m} mines  ·  click tiles to pick them, every bet reveals them"));
+        return;
+    }
+
+    // lay the pills out first, to centre the row
+    let p = ui.painter().clone();
+    let (pad, gap, inner) = (12.0, 8.0, 8.0);
+    let text = |s: &str, color| p.layout_no_wrap(s.to_string(), theme::font_semi(12.0), color);
+    let pills: Vec<_> = stats
+        .iter()
+        .map(|s| {
+            let label = text(s.label, MUTED);
+            let mult = s.mult.as_deref().map(|t| text(t, TEXT2));
+            let value = text(&s.value, TEXT);
+            let w = pad * 2.0 + label.size().x + inner + mult.as_ref().map_or(0.0, |g| g.size().x + inner * 2.0 + 1.0) + value.size().x;
+            (label, mult, value, w)
+        })
+        .collect();
+    let clear = auto && open.is_none();
+    let clear_label = text("Clear board", TEXT2);
+    let clear_w = pad * 2.0 + 18.0 + clear_label.size().x;
+    let total = pills.iter().map(|x| x.3).sum::<f32>() + gap * (pills.len() as f32 - 1.0) + if clear { gap + clear_w } else { 0.0 };
+    let mut x = rect.center().x - total / 2.0;
+
+    let pill = |r: Rect, hot: bool| {
+        p.rect(r, CornerRadius::same(8), if hot { BG2 } else { BG1 }, Stroke::new(1.0, if hot { LINE2 } else { theme::LINE }), StrokeKind::Inside);
+    };
+    let at = |x: f32, g: &std::sync::Arc<egui::Galley>| pos2(x, mid_y - g.size().y / 2.0);
+    for (label, mult, value, w) in pills {
+        let r = Rect::from_min_size(pos2(x, mid_y - BAR_H / 2.0), vec2(w, BAR_H));
+        pill(r, false);
+        let mut cx = r.left() + pad;
+        let lw = label.size().x;
+        p.galley(at(cx, &label), label, MUTED);
+        cx += lw + inner;
+        if let Some(g) = mult {
+            let gw = g.size().x;
+            p.galley(at(cx, &g), g, TEXT2);
+            cx += gw + inner;
+            p.vline(cx, (mid_y - 7.0)..=(mid_y + 7.0), Stroke::new(1.0, LINE2));
+            cx += 1.0 + inner;
+        }
+        p.galley(at(cx, &value), value, TEXT);
+        x += w + gap;
+    }
+    if clear {
+        let r = Rect::from_min_size(pos2(x, mid_y - BAR_H / 2.0), vec2(clear_w, BAR_H));
+        let can = !app.auto.running && picks > 0;
+        let resp = hit(ui, r, "mines-clear", can);
+        let hot = can && resp.hovered();
+        pill(r, hot);
+        let color = if !can { DIM } else if hot { TEXT } else { TEXT2 };
+        widgets::icon(&p, Rect::from_center_size(pos2(r.left() + pad + 6.0, mid_y), vec2(12.0, 12.0)), "trash", color);
+        p.galley(at(r.left() + pad + 18.0, &clear_label), clear_label, color);
+        if resp.clicked() {
+            app.settings.orig.mines_picks.clear();
+            app.mark_dirty();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readouts_match_antebot() {
+        // 20 mines, 5 tiles picked: 0.99 × 53,130 (Antebot cuts it to 52,598.69×) and 0.001882%
+        assert_eq!(fmt_mult(crate::originals::mines_multiplier(20, 5)), "52,598.70×");
+        assert_eq!(fmt_chance(gem_chance(20, 0, 5)), "0.001882%");
+        assert_eq!(fmt_chance(gem_chance(1, 0, 2)), "92.00%");
+        // one mine left among 23 unrevealed tiles after 2 gems
+        assert!((gem_chance(1, 2, 1) - 100.0 * 22.0 / 23.0).abs() < 1e-9);
+    }
 }

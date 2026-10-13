@@ -47,6 +47,8 @@ pub enum Command {
     RotateSeed,
     /// Bets between automatic seed changes, 0 = off.
     SeedPolicy { every: u32 },
+    /// What client seed every seed change sends.
+    ClientSeed(ClientSeed),
     /// Async mode: bets allowed in flight at once (1 = sequential).
     SetConcurrency(u32),
     /// Slot catalog query; answered with `Event::Slots`.
@@ -58,6 +60,21 @@ pub enum Command {
     PauseSlot,
     SlotStopOnNextWin,
     Shutdown,
+}
+
+/// The client seed a seed change sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientSeed {
+    /// The user's own name, every time.
+    Own(String),
+    /// A new random one: `len` characters picked from `alphabet`.
+    Random { len: usize, alphabet: String },
+}
+
+impl Default for ClientSeed {
+    fn default() -> Self {
+        ClientSeed::Random { len: crate::settings::RANDOM_SEED_DEFAULT, alphabet: crate::settings::SeedChars::default().alphabet() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +273,8 @@ struct Engine {
     seed_count: AtomicU32,
     rotations: AtomicU32,
     seed_busy: AtomicBool,
+    /// The user's own client seed (Settings → Seed), used by every seed change.
+    client_seed: Mutex<ClientSeed>,
 
     auto: Mutex<AutoState>,
     auto_cfg: Mutex<Option<AutoConfig>>,
@@ -290,6 +309,7 @@ impl Engine {
             seed_count: AtomicU32::new(0),
             rotations: AtomicU32::new(0),
             seed_busy: AtomicBool::new(false),
+            client_seed: Mutex::new(ClientSeed::default()),
             auto: Mutex::new(AutoState::default()),
             auto_cfg: Mutex::new(None),
             auto_run: AtomicU64::new(0),
@@ -458,6 +478,7 @@ impl Engine {
                     }
                     self.emit_seed();
                 }
+                Command::ClientSeed(seed) => *self.client_seed.lock() = seed,
                 Command::SetConcurrency(n) => {
                     let n = n.clamp(1, MAX_CONCURRENCY);
                     if self.concurrency.swap(n, Ordering::SeqCst) != n {
@@ -553,7 +574,10 @@ impl Engine {
         let casino = self.casino.lock().clone().ok_or(CasinoError::NotConnected)?;
         self.seed_busy.store(true, Ordering::SeqCst);
         self.emit_seed();
-        let client_seed = random_seed();
+        let client_seed = match self.client_seed.lock().clone() {
+            ClientSeed::Own(name) => name,
+            ClientSeed::Random { len, alphabet } => random_seed(len, &alphabet),
+        };
         let res = casino.rotate_seed(&client_seed).await;
         self.seed_busy.store(false, Ordering::SeqCst);
         match res {
@@ -874,8 +898,10 @@ impl Engine {
             Arc::new(move || me.auto_live(run))
         };
         // A progressive stake depends on the previous result, so it stays sequential. So does an
-        // original with steps: the casino holds one round of it at a time.
-        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some() || cfg.original.as_ref().is_some_and(|(g, _)| g.has_steps());
+        // original with steps (the casino holds one round of it at a time), unless its auto bet
+        // settles the round in one request (Mines on Stake and Shuffle).
+        let one_round = cfg.original.as_ref().is_some_and(|(g, _)| g.has_steps() && !self.casino().is_ok_and(|c| c.auto_settles(*g)));
+        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some() || one_round;
         let mut inflight: u32 = 0;
         let mut launched: u32 = 0;
         let mut settled: u32 = 0;
@@ -1025,9 +1051,10 @@ enum Reply {
     Original(Round),
 }
 
-fn random_seed() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// `len` characters picked at random from `alphabet`.
+pub fn random_seed(len: usize, alphabet: &str) -> String {
+    use rand::seq::IndexedRandom;
+    let abc: Vec<char> = alphabet.chars().collect();
+    let mut rng = rand::rng();
+    (0..len).filter_map(|_| abc.choose(&mut rng)).collect()
 }

@@ -91,9 +91,20 @@ impl Casino for Mock {
     async fn launch_slot(&self, _id: &str, _demo: bool, _cur: &str) -> Result<String, CasinoError> {
         Err(CasinoError::NotConnected)
     }
+    /// Like Stake's: a Mines auto bet settles in its one request.
+    fn auto_settles(&self, game: Game) -> bool {
+        game == Game::Mines
+    }
     /// Originals: the scripted outcome is the round's payout multiplier; `{"open": true}` keeps it open.
     async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: serde_json::Value, _auto: bool) -> Result<Round, CasinoError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_inflight.fetch_max(now, Ordering::SeqCst);
+        let delay = self.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
         let m = self.outcomes.lock().pop_front().unwrap_or(0.0);
         let active = params["open"].as_bool() == Some(true);
         Ok(Round {
@@ -266,6 +277,32 @@ async fn seed_rotates_every_n_bets() {
 }
 
 #[tokio::test]
+async fn own_client_seed_survives_every_seed_change() {
+    let mock = Mock::new(&[1.0; 5]);
+    let (e, rx) = engine_with(mock.clone());
+    e.seed_every.store(2, Ordering::SeqCst);
+    *e.client_seed.lock() = ClientSeed::Own("sxsethh".into());
+    let mut c = cfg(100, 2.0);
+    c.limit = 5;
+    e.start_auto(c);
+    wait_stopped(&e).await;
+    let _g = e.lane.write().await;
+    e.rotate_seed("manual").await.unwrap();
+    let seeds: Vec<String> = rx.try_iter().filter_map(|e| if let Event::SeedRotated { client_seed, .. } = e { Some(client_seed) } else { None }).collect();
+    assert_eq!(seeds, ["sxsethh"; 3]);
+
+    // off again: random ones, as long as asked and from the characters asked
+    for (len, alphabet) in [(24, "0123456789abcdef"), (1, "0123456789abcdef"), (128, "ABCxyz")] {
+        *e.client_seed.lock() = ClientSeed::Random { len, alphabet: alphabet.into() };
+        e.rotate_seed("manual").await.unwrap();
+        let seeds: Vec<String> = rx.try_iter().filter_map(|e| if let Event::SeedRotated { client_seed, .. } = e { Some(client_seed) } else { None }).collect();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].len(), len);
+        assert!(seeds[0].chars().all(|c| alphabet.contains(c)), "{}", seeds[0]);
+    }
+}
+
+#[tokio::test]
 async fn async_mode_pipelines_flat_bets() {
     let mock = Mock::new(&[1.0; 12]);
     mock.delay_ms.store(40, Ordering::SeqCst);
@@ -397,6 +434,37 @@ async fn auto_runs_an_original() {
     let amounts: Vec<_> = bets(&rx).iter().map(|b| b.amount).collect();
     assert_eq!(amounts, vec![100, 100, 200, 400]);
     assert_eq!(a.profit, 100 - 100 - 200 + 800);
+}
+
+#[tokio::test]
+async fn mines_auto_runs_async_where_one_request_settles_it() {
+    // the casino settles a Mines auto bet in one request: as many in flight as async mode allows
+    let mock = Mock::new(&[0.0; 12]);
+    mock.delay_ms.store(30, Ordering::SeqCst);
+    let (e, rx) = engine_with(mock.clone());
+    e.concurrency.store(4, Ordering::SeqCst);
+    *e.slots.lock() = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut c = cfg(100, 0.0);
+    c.limit = 12;
+    c.original = Some((Game::Mines, serde_json::json!({ "minesCount": 3, "fields": [0, 1] })));
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    assert_eq!((a.msg.as_str(), a.done), ("Done", 12));
+    assert_eq!(bets(&rx).len(), 12);
+    assert_eq!(mock.peak_inflight.load(Ordering::SeqCst), 4, "four Mines bets in flight at once");
+
+    // a game whose rounds take steps there still goes one round at a time
+    let mock = Mock::new(&[0.0; 6]);
+    mock.delay_ms.store(10, Ordering::SeqCst);
+    let (e, _rx) = engine_with(mock.clone());
+    e.concurrency.store(4, Ordering::SeqCst);
+    *e.slots.lock() = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut c = cfg(100, 0.0);
+    c.limit = 6;
+    c.original = Some((Game::DragonTower, serde_json::json!({})));
+    e.start_auto(c);
+    wait_stopped(&e).await;
+    assert_eq!(mock.peak_inflight.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -118,6 +118,13 @@ pub struct Settings {
     pub hit_sound: bool,
     pub seed_enabled: bool,
     pub seed_every: String,
+    /// Settings → Seed: every seed change uses `seed_name` as the client seed, not a random one.
+    pub own_seed: bool,
+    pub seed_name: String,
+    /// Settings → Seed: how many characters the random client seeds have (when `own_seed` is off),
+    /// and which characters.
+    pub seed_length: String,
+    pub seed_chars: SeedChars,
     pub hotkeys: bool,
     pub open: Sections,
     /// Wallet dropdown: hide coins with a zero balance.
@@ -151,6 +158,39 @@ pub struct Settings {
     /// Accounts removed by the user this session: the only logins a save may drop.
     #[serde(skip)]
     pub removed: Vec<String>,
+}
+
+/// The characters random client seeds are made of: hex, or any mix of the other three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SeedChars {
+    /// 0–9 and a–f; the others don't count while it's on.
+    pub hex: bool,
+    pub upper: bool,
+    pub lower: bool,
+    pub digits: bool,
+}
+
+impl Default for SeedChars {
+    fn default() -> Self {
+        Self { hex: true, upper: false, lower: false, digits: false }
+    }
+}
+
+impl SeedChars {
+    /// Every character a seed can have.
+    pub fn alphabet(self) -> String {
+        if self.hex || !(self.upper || self.lower || self.digits) {
+            return "0123456789abcdef".into();
+        }
+        let mut abc = String::new();
+        for (on, set) in [(self.upper, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"), (self.lower, "abcdefghijklmnopqrstuvwxyz"), (self.digits, "0123456789")] {
+            if on {
+                abc.push_str(set);
+            }
+        }
+        abc
+    }
 }
 
 /// Where the Session pane sits.
@@ -330,6 +370,10 @@ impl Default for Settings {
             hit_sound: true,
             seed_enabled: false,
             seed_every: "100".into(),
+            own_seed: false,
+            seed_name: String::new(),
+            seed_length: RANDOM_SEED_DEFAULT.to_string(),
+            seed_chars: SeedChars::default(),
             hotkeys: true,
             open: Sections::default(),
             hide_empty: false,
@@ -561,6 +605,30 @@ impl Settings {
             0
         }
     }
+
+    /// The client seed every seed change uses; `None` = a random one.
+    pub fn client_seed(&self) -> Option<String> {
+        Some(clean_seed_name(&self.seed_name)).filter(|s| self.own_seed && !s.is_empty())
+    }
+
+    /// Characters in a random client seed: `seed_length` kept to [`RANDOM_SEED_LEN`].
+    pub fn random_seed_len(&self) -> usize {
+        let (lo, hi) = (*RANDOM_SEED_LEN.start(), *RANDOM_SEED_LEN.end());
+        self.seed_length.trim().parse::<usize>().map_or(RANDOM_SEED_DEFAULT, |n| n.clamp(lo, hi))
+    }
+}
+
+/// Longest client seed name (Antebot's limit too).
+pub const SEED_NAME_MAX: usize = 128;
+
+/// Lengths a random client seed can have (as in Antebot), and the one it has unless set
+/// (FastBet's seeds were always 24 hex characters before the format could be set).
+pub const RANDOM_SEED_LEN: std::ops::RangeInclusive<usize> = 1..=128;
+pub const RANDOM_SEED_DEFAULT: usize = 24;
+
+/// A client seed name as the casinos take it: letters, digits, `-` and `_`, at most [`SEED_NAME_MAX`].
+pub fn clean_seed_name(name: &str) -> String {
+    name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).take(SEED_NAME_MAX).collect()
 }
 
 #[cfg(test)]
@@ -577,6 +645,42 @@ mod tests {
         assert_eq!(s.target, "10");
         // a known casino isn't this fallback's business
         assert!(Settings::without_unknown_casino(r#"{"casino":"Shuffle"}"#).is_none());
+    }
+
+    #[test]
+    fn own_seed_is_off_until_turned_on_with_a_name() {
+        let mut s = Settings::default();
+        s.seed_name = "sx seth!".into();
+        assert_eq!(s.client_seed(), None);
+        s.own_seed = true;
+        assert_eq!(s.client_seed().as_deref(), Some("sxseth"));
+        s.seed_name = " !".into();
+        assert_eq!(s.client_seed(), None);
+        assert_eq!(clean_seed_name(&"a".repeat(200)).len(), SEED_NAME_MAX);
+    }
+
+    #[test]
+    fn random_seed_length_stays_in_range() {
+        let mut s = Settings::default();
+        assert_eq!(s.random_seed_len(), 24);
+        for (typed, len) in [("16", 16), ("0", 1), ("128", 128), ("500", 128), ("", 24), ("x", 24)] {
+            s.seed_length = typed.into();
+            assert_eq!(s.random_seed_len(), len, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn seed_characters() {
+        let mut c = SeedChars::default();
+        assert_eq!(c.alphabet(), "0123456789abcdef");
+        c.upper = true;
+        c.digits = true;
+        // hex wins while it's on
+        assert_eq!(c.alphabet(), "0123456789abcdef");
+        c.hex = false;
+        assert_eq!(c.alphabet(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+        c = SeedChars { hex: false, upper: false, lower: false, digits: false };
+        assert_eq!(c.alphabet(), "0123456789abcdef");
     }
 
     #[test]

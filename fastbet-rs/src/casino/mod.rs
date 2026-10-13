@@ -76,6 +76,13 @@ impl CasinoId {
         matches!(self, CasinoId::Stake)
     }
 
+    /// An auto bet on `game` settles its round in one request (the tiles go up front), so an auto
+    /// run can have several in flight, like Limbo's: Mines on Stake (`mines/bet` with the tiles)
+    /// and Shuffle (`minesAuto`).
+    pub fn auto_settles(self, game: Game) -> bool {
+        matches!(self, CasinoId::Stake | CasinoId::Shuffle) && game == Game::Mines
+    }
+
     /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated, chips.gg).
     pub fn zero_bets(self) -> bool {
         matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
@@ -590,6 +597,11 @@ pub trait Casino: Send + Sync {
     async fn list_slots(&self, filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError>;
     /// Launch URL for a slot session (real money needs a logged-in token).
     async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError>;
+
+    /// See [`CasinoId::auto_settles`].
+    fn auto_settles(&self, game: Game) -> bool {
+        self.id().auto_settles(game)
+    }
 
     /// Starts a round of an original ([`CasinoId::originals`]). `params` are the game's own
     /// fields; the stake, currency and an idempotency key are added here. `auto`: a bet of an

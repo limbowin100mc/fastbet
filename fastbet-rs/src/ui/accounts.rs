@@ -274,6 +274,7 @@ fn gear_menu(app: &mut App, ui: &mut Ui, full: Rect) {
     if !app.welcome_menu_open {
         return;
     }
+    let mut prefs = false;
     let mut updates = false;
     let area = egui::Area::new(egui::Id::new("welcome-menu"))
         .order(egui::Order::Foreground)
@@ -295,6 +296,9 @@ fn gear_menu(app: &mut App, ui: &mut Ui, full: Rect) {
                     p.text(pos2(hr.left() + 12.0, hr.center().y), Align2::LEFT_CENTER, "FastBet", theme::font_bold(13.0), TEXT);
                     p.text(pos2(hr.right() - 12.0, hr.center().y), Align2::RIGHT_CENTER, format!("v{}", env!("CARGO_PKG_VERSION")), theme::font(11.5), MUTED);
                     widgets::hsep(ui);
+                    if widgets::menu_item(ui, "gear", "Settings").clicked() {
+                        prefs = true;
+                    }
                     if widgets::menu_item(ui, "download", "Check for updates").clicked() {
                         updates = true;
                     }
@@ -305,6 +309,9 @@ fn gear_menu(app: &mut App, ui: &mut Ui, full: Rect) {
     let outside = ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !anchor.contains(p)));
     if outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.welcome_menu_open = false;
+    }
+    if prefs {
+        app.open_prefs();
     }
     if updates {
         app.check_updates();

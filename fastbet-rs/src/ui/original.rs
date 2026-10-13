@@ -123,6 +123,11 @@ fn header(app: &mut App, ui: &mut Ui, game: Game) {
         };
         widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
         widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
+        let runs_async = !game.has_steps() || app.casino().auto_settles(game);
+        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && game.auto() && runs_async {
+            widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
+                .on_hover_text("Bets in flight at once. Set it under Bets, delay & async.");
+        }
         controls::restarts_chip(app, ui);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

@@ -9,6 +9,7 @@ pub mod lobby;
 pub mod logos;
 pub mod original;
 pub mod originals;
+pub mod prefs;
 pub mod slot;
 pub mod slots_lobby;
 pub mod sound;
@@ -124,6 +125,17 @@ pub struct App {
     pub welcome_menu_open: bool,
     pub updater: crate::update::Updater,
     pub update_open: bool,
+    /// The Settings window, and the category it shows.
+    pub prefs_open: bool,
+    pub prefs_tab: prefs::Tab,
+    /// The seed name field has the focus: the name is only used once typing is done.
+    pub seed_name_editing: bool,
+    /// The client seed the engine was last given.
+    seed_sent: Option<engine::ClientSeed>,
+    /// Account and seed name the seed was last changed for, so it happens once each.
+    seed_applied: Option<(String, String)>,
+    /// Settings → Seed: a sample random seed, for the format (length, characters) it was made for.
+    pub seed_preview: Option<((usize, String), String)>,
     /// When the installer started; the app closes shortly after.
     pub update_close_at: Option<Instant>,
     pub wallet_search: String,
@@ -229,6 +241,13 @@ impl App {
             welcome_menu_open: std::env::var("FASTBET_WELCOME_MENU").is_ok(),
             updater,
             update_open: false,
+            // FASTBET_PREFS=1: the Settings window opens at start (UI work)
+            prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
+            prefs_tab: prefs::Tab::default(),
+            seed_name_editing: false,
+            seed_sent: None,
+            seed_applied: None,
+            seed_preview: None,
             update_close_at: None,
             wallet_search: String::new(),
             wallet_search_focused: false,
@@ -717,6 +736,42 @@ impl App {
 
     pub fn sync_seed_policy(&mut self) {
         self.engine.send(Command::SeedPolicy { every: self.settings.seed_every() });
+    }
+
+    /// Settings → Seed: tells the engine which client seed to send (the user's name, or random ones
+    /// of the length set), and when the casino's current one isn't the name, changes the seed once
+    /// (per account and name) to put the name on it.
+    fn sync_own_seed(&mut self) {
+        if self.seed_name_editing {
+            return;
+        }
+        let want = match self.settings.client_seed() {
+            Some(name) => engine::ClientSeed::Own(name),
+            None => engine::ClientSeed::Random { len: self.settings.random_seed_len(), alphabet: self.settings.seed_chars.alphabet() },
+        };
+        if self.seed_sent.as_ref() != Some(&want) {
+            self.seed_sent = Some(want.clone());
+            self.seed_applied = None;
+            self.engine.send(Command::ClientSeed(want.clone()));
+        }
+        let engine::ClientSeed::Own(name) = want else { return };
+        let key = (self.settings.account.clone(), name);
+        if !self.ready() || self.seed.busy || self.seed_applied.as_ref() == Some(&key) {
+            return;
+        }
+        // wait until the casino has told us its current seed
+        let Some(current) = self.provable.client_seed.as_deref() else { return };
+        if current != key.1 {
+            self.rotate_now();
+        }
+        self.seed_applied = Some(key);
+    }
+
+    /// Opens the Settings window.
+    pub fn open_prefs(&mut self) {
+        self.account_menu_open = false;
+        self.welcome_menu_open = false;
+        self.prefs_open = true;
     }
 
     /// Force restart betting (always / on errors) on or off; it applies to a run already going too.
@@ -1383,7 +1438,7 @@ impl App {
             self.reset_session();
             return;
         }
-        if !self.settings.hotkeys {
+        if !self.settings.hotkeys || self.prefs_open {
             return;
         }
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -1546,6 +1601,7 @@ impl App {
         let site = self.casino_site();
         let width = 230.0;
         let mut switch = false;
+        let mut prefs = false;
         let mut updates = false;
         let logos = &mut self.logos;
         let area = egui::Area::new(egui::Id::new("account-menu"))
@@ -1576,6 +1632,9 @@ impl App {
                         if widgets::menu_item(ui, "swap", "Switch account").clicked() {
                             switch = true;
                         }
+                        if widgets::menu_item(ui, "gear", "Settings").clicked() {
+                            prefs = true;
+                        }
                         if widgets::menu_item(ui, "download", "Check for updates").clicked() {
                             updates = true;
                         }
@@ -1589,6 +1648,9 @@ impl App {
         }
         if switch {
             self.go_accounts();
+        }
+        if prefs {
+            self.open_prefs();
         }
         if updates {
             self.check_updates();
@@ -1624,6 +1686,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.sync_own_seed();
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
             self.go_lobby();
         }
@@ -1735,6 +1798,7 @@ impl eframe::App for App {
                 }
             }
         }
+        prefs::show(self, ui.ctx());
         update::show(self, ui.ctx());
         titlebar::resize_grips(ui);
     }

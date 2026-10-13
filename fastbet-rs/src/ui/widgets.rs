@@ -732,6 +732,39 @@ pub fn toggle_help(ui: &mut Ui, text: &str, help: Option<&str>, on: &mut bool, e
     changed
 }
 
+/// A checkbox and its label (both click it), laid out in the current row. Returns whether it flipped.
+pub fn checkbox(ui: &mut Ui, text: &str, on: &mut bool, enabled: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 9.0;
+        check_label(ui, text, on, enabled)
+    })
+    .inner
+}
+
+fn check_label(ui: &mut Ui, text: &str, on: &mut bool, enabled: bool) -> bool {
+    let mut changed = false;
+    let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), if enabled { Sense::click() } else { Sense::hover() });
+    if resp.clicked() && enabled {
+        *on = !*on;
+        changed = true;
+    }
+    let p = ui.painter();
+    p.rect(rect, CornerRadius::same(5), if *on { G1 } else { BG }, Stroke::new(1.0, if *on { G1 } else { LINE2 }), StrokeKind::Inside);
+    if *on {
+        let o = rect.left_top();
+        p.add(egui::Shape::line(vec![o + vec2(4.5, 9.0), o + vec2(7.8, 12.3), o + vec2(13.5, 5.5)], Stroke::new(1.9, INK)));
+    }
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let label = ui.add(egui::Label::new(RichText::new(text).size(12.5).color(if enabled { TEXT2 } else { DIM })).sense(Sense::click()));
+    if label.clicked() && enabled {
+        *on = !*on;
+        changed = true;
+    }
+    changed
+}
+
 /// Checkbox row with a number field on the right, like "Change after bets [70]".
 pub fn check_field(ui: &mut Ui, text: &str, on: &mut bool, value: &mut String, suffix: Option<&str>, enabled: bool) -> bool {
     check_field_help(ui, text, None, on, value, suffix, enabled)
@@ -742,28 +775,11 @@ pub fn check_field_help(ui: &mut Ui, text: &str, help: Option<&str>, on: &mut bo
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 9.0;
-        let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), if enabled { Sense::click() } else { Sense::hover() });
-        if resp.clicked() && enabled {
-            *on = !*on;
-            changed = true;
-        }
-        let p = ui.painter();
-        p.rect(rect, CornerRadius::same(5), if *on { G1 } else { BG }, Stroke::new(1.0, if *on { G1 } else { LINE2 }), StrokeKind::Inside);
-        if *on {
-            let o = rect.left_top();
-            p.add(egui::Shape::line(vec![o + vec2(4.5, 9.0), o + vec2(7.8, 12.3), o + vec2(13.5, 5.5)], Stroke::new(1.9, INK)));
-        }
-        let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
-        let label = ui.add(egui::Label::new(RichText::new(text).size(12.5).color(if enabled { TEXT2 } else { DIM })).sense(Sense::click()));
-        if label.clicked() && enabled {
-            *on = !*on;
-            changed = true;
-        }
+        changed = check_label(ui, text, on, enabled);
         if let Some(h) = help {
             ui.add_space(-3.0);
             help_icon(ui, h);
         }
-        let _ = resp;
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             ui.scope(|ui| {
                 ui.set_max_width(88.0);
@@ -1039,6 +1055,24 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.rect_filled(side, CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 }, alpha(color, 110));
             p.rect_stroke(r, CornerRadius::same(2), s, StrokeKind::Middle);
             p.line_segment([at(0.62, 0.0), at(0.62, 1.0)], s);
+        }
+        "seed" => {
+            // a sprout: a stem with a leaf to each side
+            let leaf = |a: Pos2, b: Pos2| {
+                let d = b - a;
+                let (m, n) = (a + d * 0.5, vec2(-d.y, d.x) * 0.36);
+                let mut pts = Vec::with_capacity(18);
+                for (c, back) in [(m + n, false), (m - n, true)] {
+                    for i in 0..=8 {
+                        let t = if back { 1.0 - i as f32 / 8.0 } else { i as f32 / 8.0 };
+                        pts.push(a.lerp(c, t).lerp(c.lerp(b, t), t));
+                    }
+                }
+                p.add(egui::Shape::closed_line(pts, s));
+            };
+            p.line_segment([at(0.5, 1.0), at(0.5, 0.46)], s);
+            leaf(at(0.5, 0.62), at(0.04, 0.22));
+            leaf(at(0.5, 0.46), at(0.96, 0.02));
         }
         _ => {}
     }
