@@ -232,7 +232,7 @@ impl SlotSession for HacksawSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut b = json!({ "betAmount": bet.to_string() });
         if let Some(f) = feature {
@@ -264,10 +264,14 @@ impl SlotSession for HacksawSession {
             n.contains("fs") || n.contains("free") || n.contains("bonus")
         });
         let mut balance = res["accountBalance"]["balance"].as_str().and_then(|s| s.parse().ok());
+        // the bonus is decided already; an open round is left for the browser to show
+        let held = hold && free_spins && !(status_s == "completed" || status_s.is_empty());
+        // the browser shows the bonus and what it pays
+        let win = if held { 0 } else { win };
 
         // A winning round waits for the client to say the win presentation is over
         // before it is settled; the next bet is rejected until then.
-        if status_s == "wfwpc" && !round_id.is_empty() {
+        if status_s == "wfwpc" && !round_id.is_empty() && !held {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
             let confirm = json!({
                 "seq": seq,
@@ -289,7 +293,7 @@ impl SlotSession for HacksawSession {
         }
         // Some games pause for a player choice (pick a chest...). We cannot answer those.
         let choices = round["possibleActions"].as_array().map(|a| a.len()).unwrap_or(0);
-        if choices > 0 && status_s != "completed" {
+        if choices > 0 && status_s != "completed" && !held {
             return Err(SlotError::Provider("This round needs a player choice, which autoplay cannot make".into()));
         }
         Ok(SpinResult {
@@ -300,6 +304,7 @@ impl SlotSession for HacksawSession {
             balance,
             pending: !(status_s == "completed" || status_s.is_empty()),
             free_spins,
+            held,
             events: events.len(),
             ms,
         })
@@ -342,13 +347,13 @@ pub async fn self_test(game_id: u64, spins: usize) {
     println!("opened in {} ms: currency {} bets {:?} default {:?} features {:?} balance {:?}", t0.elapsed().as_millis(), s.info.currency, s.info.bet_levels.iter().map(|b| b.minor).collect::<Vec<_>>(), s.info.default_bet, s.info.features.iter().map(|f| format!("{}={}", f.id, f.cost_mult)).collect::<Vec<_>>(), s.info.balance);
     let bet = s.info.default_bet.unwrap_or(100);
     for i in 0..spins {
-        match s.spin(bet, None).await {
+        match s.spin(bet, None, false).await {
             Ok(r) => println!("spin {} round {} cost {} win {} x{:.2} balance {:?} pending {} fs {} events {} {:.0} ms", i + 1, r.round_id, r.cost, r.win, r.multiplier, r.balance, r.pending, r.free_spins, r.events, r.ms),
             Err(e) => println!("spin {} failed: {e}", i + 1),
         }
     }
     if let Some(f) = s.info.features.first().cloned() {
-        match s.spin(bet, Some(&f.id)).await {
+        match s.spin(bet, Some(&f.id), false).await {
             Ok(r) => println!("feature {} cost {} win {} x{:.2} balance {:?} pending {} events {}", f.id, r.cost, r.win, r.multiplier, r.balance, r.pending, r.events),
             Err(e) => println!("feature {} failed: {e}", f.id),
         }

@@ -1208,6 +1208,7 @@ impl App {
             stop_loss: money_field(&s.slot_stop_loss),
             delay_ms: 0,
             currency: self.active_currency(),
+            stop_before_fs: s.slot_stop_fs,
         };
         self.flash = None;
         self.engine.send(Command::StartSlot(cfg));

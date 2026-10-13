@@ -104,7 +104,7 @@ pub async fn open(launch_url: &str) -> Result<PragmaticSession, SlotError> {
     // a round left open by an earlier session is played out first
     if init.get("na").map(|n| n != "s").unwrap_or(false) {
         let coin = init.get("c").cloned().unwrap_or_else(|| s.coins.first().cloned().unwrap_or_default());
-        let _ = s.play_out(init, &coin, 0).await;
+        let _ = s.play_out(init, &coin, 0, false).await;
     }
     Ok(s)
 }
@@ -164,7 +164,9 @@ impl PragmaticSession {
         self.call("doSpin", &params).await
     }
 
-    async fn play_out(&self, mut r: HashMap<String, String>, coin: &str, bl: usize) -> Result<(i64, HashMap<String, String>, usize, bool), SlotError> {
+    /// Plays the round to its end; returns (win, last reply, steps, free spins seen, held). `hold`:
+    /// stop where the free spins would start, leaving them for the browser.
+    async fn play_out(&self, mut r: HashMap<String, String>, coin: &str, bl: usize, hold: bool) -> Result<(i64, HashMap<String, String>, usize, bool, bool), SlotError> {
         let mut win = 0i64;
         let mut steps = 1usize;
         let mut free = false;
@@ -174,13 +176,17 @@ impl PragmaticSession {
                 win = tw;
             }
             let na = r.get("na").cloned().unwrap_or_else(|| "s".into());
-            let pending = r.contains_key("rs_p") || (r.contains_key("fs") && !r.contains_key("fs_total"));
+            let fs_on = r.contains_key("fs") && !r.contains_key("fs_total");
+            if hold && (fs_on || na == "fso") {
+                return Ok((win, r, steps, true, true));
+            }
+            let pending = r.contains_key("rs_p") || fs_on;
             let next = match na.as_str() {
                 "s" if pending => self.do_spin(coin, bl, None).await?,
-                "s" => return Ok((win, r, steps, free)),
+                "s" => return Ok((win, r, steps, free, false)),
                 "c" => {
                     let c = self.call("doCollect", &[]).await?;
-                    return Ok((win, c, steps + 1, free));
+                    return Ok((win, c, steps + 1, free, false));
                 }
                 "cb" => self.call("doCollectBonus", &[]).await?,
                 // a pick or an option the player would choose: take the first one
@@ -204,7 +210,7 @@ impl SlotSession for PragmaticSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let level = self.info.bet_levels.iter().position(|b| b.minor == bet).ok_or_else(|| SlotError::Provider("That bet size isn't offered by this game".into()))?;
         let coin = self.coins[level].clone();
@@ -230,7 +236,7 @@ impl SlotSession for PragmaticSession {
             other => other?,
         };
         let round_id = first.get("rid").cloned().unwrap_or_default();
-        let (win, last, steps, free_spins) = self.play_out(first, &coin, bl).await?;
+        let (win, last, steps, free_spins, held) = self.play_out(first, &coin, bl, hold).await?;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         Ok(SpinResult {
             round_id,
@@ -238,8 +244,9 @@ impl SlotSession for PragmaticSession {
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance: last.get("balance").and_then(|b| money(b)),
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: steps,
             ms,
         })

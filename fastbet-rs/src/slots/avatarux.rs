@@ -208,7 +208,7 @@ impl SlotSession for AvataruxSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let scale = 10f64.powi(self.info.decimals as i32);
         let action = feature.unwrap_or("main");
         // feature modes have their own bet lists: the same index as the main level
@@ -278,9 +278,15 @@ impl SlotSession for AvataruxSession {
         };
         let round_id = res["roundId"].as_str().unwrap_or("").to_string();
         let mut balance = res["balance"].as_f64().map(|b| (b * scale).round() as i64);
+        // the bonus is decided already; left open, the browser shows it
+        let held = hold && free_spins && !round_id.is_empty();
+        if held {
+            // the browser shows the bonus and what it pays
+            win = 0;
+        }
         // The round stays open server-side until the client closes it; the next play is
         // rejected otherwise. The close reply carries the settled balance.
-        if !round_id.is_empty() {
+        if !round_id.is_empty() && !held {
             let close = json!({ "game": self.launch.game, "provider": self.launch.provider, "roundId": round_id });
             match self.bridge.post_json(&format!("{}/game/complete", self.launch.server), &[("x-session-id", &self.session_id), ("Authorization", &bearer)], &close).await {
                 Ok((200, c)) => {
@@ -302,8 +308,9 @@ impl SlotSession for AvataruxSession {
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance,
-            pending,
+            pending: pending || held,
             free_spins,
+            held,
             events: wager["data"].as_array().map(|d| d.len()).unwrap_or(1),
             ms,
         })

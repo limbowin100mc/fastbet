@@ -100,7 +100,7 @@ pub async fn open(launch_url: &str) -> Result<PlaysonSession, SlotError> {
     // a round left open by an earlier session is played out first
     if attr(&rc, "state", "current_state").map(|st| st != "idle").unwrap_or(false) {
         let stake = attr(&rc, "game", "line-bet").unwrap_or_else(|| s.stakes[0].to_string());
-        let _ = s.play_out(rc, &stake).await;
+        let _ = s.play_out(rc, &stake, false).await;
     }
     Ok(s)
 }
@@ -159,15 +159,19 @@ impl PlaysonSession {
         Ok(text)
     }
 
-    /// Plays the round to `idle`; returns (last reply, steps, free spins seen).
-    async fn play_out(&self, mut r: String, stake: &str) -> Result<(String, usize, bool), SlotError> {
+    /// Plays the round to `idle`; returns (last reply, steps, free spins seen, held). `hold`: stop
+    /// where the bonus would start, leaving it for the browser.
+    async fn play_out(&self, mut r: String, stake: &str, hold: bool) -> Result<(String, usize, bool, bool), SlotError> {
         let mut steps = 1usize;
         let mut bonus = false;
         loop {
             let state = attr(&r, "state", "current_state").unwrap_or_else(|| "idle".into());
             let status = attr(&r, "server", "status").unwrap_or_default();
             if state == "idle" {
-                return Ok((r, steps, bonus));
+                return Ok((r, steps, bonus, false));
+            }
+            if hold && state != "respin" {
+                return Ok((r, steps, true, true));
             }
             bonus |= state != "respin";
             let bet = format!(r#"<bet cash="{stake}"/>"#);
@@ -197,7 +201,7 @@ impl SlotSession for PlaysonSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         if bet % self.mult != 0 || !self.stakes.contains(&(bet / self.mult)) {
             return Err(SlotError::Provider("That bet size isn't offered by this game".into()));
@@ -218,7 +222,7 @@ impl SlotSession for PlaysonSession {
         }
         let first = self.send("bet", "", &inner).await?;
         let round_id = attr(&first, "roundnum", "value").unwrap_or_default();
-        let (_last, steps, bonus) = self.play_out(first, &stake).await?;
+        let (_last, steps, bonus, held) = self.play_out(first, &stake, hold).await?;
         let after = self.state.lock().balance;
         // the server reports the balance after each step; the round's win is what came back
         let win = match (before, after) {
@@ -232,8 +236,9 @@ impl SlotSession for PlaysonSession {
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance: after,
-            pending: false,
+            pending: held,
             free_spins: bonus || buy.is_some(),
+            held,
             events: steps,
             ms,
         })

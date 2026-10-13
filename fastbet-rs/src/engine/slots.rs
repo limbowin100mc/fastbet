@@ -24,6 +24,8 @@ pub struct SlotConfig {
     pub delay_ms: u64,
     /// Wallet currency used to launch real-money sessions (for reopening).
     pub currency: String,
+    /// Stop as soon as a spin triggers free spins, leaving them for the browser.
+    pub stop_before_fs: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +42,8 @@ pub struct SlotState {
     pub balance: Option<i64>,
     pub stop_on_win: bool,
     pub error: Option<String>,
+    /// The last spin left free spins open for the browser.
+    pub held: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +56,8 @@ pub struct SpinRecord {
     pub multiplier: f64,
     pub balance: Option<i64>,
     pub free_spins: bool,
+    /// Free spins left open for the browser.
+    pub held: bool,
     pub ms: f64,
     pub currency: String,
     pub decimals: u32,
@@ -244,7 +250,7 @@ impl Engine {
                 None => return self.stop_slot("Session closed"),
             };
             let info = session.info().clone();
-            let mut res = session.spin(cfg.bet, cfg.feature.as_deref()).await;
+            let mut res = session.spin(cfg.bet, cfg.feature.as_deref(), cfg.stop_before_fs).await;
             // transient trouble gets a few retries with backoff: a network hiccup in
             // the bridge, or the provider rate-limiting us for a moment
             let mut attempt = 0u32;
@@ -263,7 +269,7 @@ impl Engine {
                     return;
                 }
                 self.pause_slot(Some(false), Some("Running".into()));
-                res = session.spin(cfg.bet, cfg.feature.as_deref()).await;
+                res = session.spin(cfg.bet, cfg.feature.as_deref(), cfg.stop_before_fs).await;
             }
             if !self.slot_live(run) {
                 return;
@@ -288,6 +294,11 @@ impl Engine {
                     }
                     continue;
                 }
+                // most likely the free spins left for the browser, still waiting there
+                Err(e) if self.slot.lock().held => {
+                    tracing::warn!("spin failed after free spins were held: {e}");
+                    return self.stop_slot("The free spins are still open: play them in your browser, then start again");
+                }
                 Err(e) => {
                     tracing::warn!("spin failed: {e}");
                     return self.stop_slot(format!("Error: {e}"));
@@ -304,6 +315,7 @@ impl Engine {
                 multiplier: r.multiplier,
                 balance: r.balance,
                 free_spins: r.free_spins,
+                held: r.held,
                 ms: r.ms,
                 currency: info.currency.clone(),
                 decimals: info.decimals,
@@ -317,8 +329,12 @@ impl Engine {
                 if r.balance.is_some() {
                     s.balance = r.balance;
                 }
+                s.held = r.held;
                 (s.profit, s.done, s.stop_on_win)
             };
+            if cfg.stop_before_fs && r.free_spins {
+                return self.stop_slot(if r.held { "Free spins ready · play them in your browser" } else { "Free spins triggered" });
+            }
             if hit {
                 self.pause_slot(Some(true), Some(format!("Hit {:.2}× · paused", r.multiplier)));
                 continue;

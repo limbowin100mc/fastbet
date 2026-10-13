@@ -167,7 +167,7 @@ impl SlotSession for RelaxSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let mult = feature.and_then(|f| self.info.features.iter().find(|x| x.id == f)).map(|f| f.cost_mult).unwrap_or(1.0);
         let ba = (bet as f64 * mult).round() as i64;
@@ -178,12 +178,19 @@ impl SlotSession for RelaxSession {
         }
         let mut r = self.post("play", body).await?;
         let mut steps = 1usize;
+        let triggered = |r: &Value| r["subgameTriggered"].as_bool() == Some(true) || r["freespins"].is_object() || r["freeSpinAwardedCount"].as_i64().unwrap_or(0) > 0;
+        let mut held = false;
         // a round that isn't over goes on with more spins (respins, bonus rounds)
         while r["ended"].as_bool() == Some(false) && steps < 500 {
+            // free spins to play: leave them (and the round) for the browser
+            if hold && triggered(&r) {
+                held = true;
+                break;
+            }
             r = self.post("play", json!({ "g": self.game, "sid": self.sid, "ga": "spin", "ba": ba, "restoreState": "{}", "restoreVersion": self.next_version() })).await?;
             steps += 1;
         }
-        let finished = self.post("gamefinished", json!({ "g": self.game, "sid": self.sid, "restoreVersion": self.next_version() })).await.ok();
+        let finished = if held { None } else { self.post("gamefinished", json!({ "g": self.game, "sid": self.sid, "restoreVersion": self.next_version() })).await.ok() };
         let balance = finished.as_ref().and_then(|f| f["b"].as_i64()).or(r["stats"]["b"].as_i64());
         *self.balance.lock().await = balance;
         let reported = r["win"].as_i64().unwrap_or(0);
@@ -193,15 +200,16 @@ impl SlotSession for RelaxSession {
             (_, Some(b0), Some(b1)) => (b1 - b0 + ba).max(reported),
             _ => reported,
         };
-        let free_spins = feature.is_some() || steps > 1 || r["subgameTriggered"].as_bool() == Some(true) || r["freespins"].is_object() || r["freeSpinAwardedCount"].as_i64().unwrap_or(0) > 0;
+        let free_spins = feature.is_some() || steps > 1 || held || triggered(&r);
         Ok(SpinResult {
             round_id: r["roundId"].as_i64().filter(|i| *i > 0).map(|i| i.to_string()).unwrap_or_default(),
             cost: ba,
             win,
             multiplier: if ba > 0 { win as f64 / ba as f64 } else { 0.0 },
             balance,
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: steps,
             ms: t0.elapsed().as_secs_f64() * 1000.0,
         })

@@ -155,7 +155,7 @@ impl SlotSession for SpinomenalSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let level = self.info.bet_levels.iter().position(|b| b.minor == bet).ok_or_else(|| SlotError::Provider("That bet size isn't offered by this game".into()))?;
         let unit = self.units[level];
@@ -193,11 +193,17 @@ impl SlotSession for SpinomenalSession {
         let mut end = res["Result"]["CoinOut"].as_f64().filter(|c| *c > 0.0);
         let mut steps = 1usize;
         let mut free_spins = matches!(buy, Some(Buy::FreeSpins(_)));
+        let mut held = false;
         loop {
             let r = &res["Result"];
             let ft = &r["FreeTickets"];
             if ft["PendingAction"].as_bool().unwrap_or(false) {
                 free_spins = true;
+                // free spins to pick and play: leave them for the browser
+                if hold {
+                    held = true;
+                    break;
+                }
                 let mut b = self.common.clone();
                 b["ticketId"] = ft["Id"].clone();
                 // the pick reply is a free-spins ticket, not a spin: the round goes on
@@ -212,7 +218,12 @@ impl SlotSession for SpinomenalSession {
                 steps += 1;
                 break;
             } else if r["IsRoundFinished"].as_bool() == Some(false) {
-                free_spins |= ft["To"].as_i64().unwrap_or(0) > 0 || !r["BonusSpin"].is_null();
+                let fs = ft["To"].as_i64().unwrap_or(0) > 0 || !r["BonusSpin"].is_null();
+                free_spins |= fs;
+                if hold && fs {
+                    held = true;
+                    break;
+                }
                 res = self.post(&process, &self.process_body(unit)).await?;
             } else {
                 break;
@@ -240,8 +251,9 @@ impl SlotSession for SpinomenalSession {
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance: end.map(cents),
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: steps,
             ms,
         })

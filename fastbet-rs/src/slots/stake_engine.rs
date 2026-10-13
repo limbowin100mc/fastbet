@@ -329,7 +329,7 @@ impl SlotSession for StakeEngineSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let mode = feature.unwrap_or(&self.base);
         let body = json!({ "sessionID": self.rgs.launch.session, "amount": bet, "currency": self.info.currency, "mode": mode });
         let (res, mut took) = match self.rgs.timed("/wallet/play", &body).await {
@@ -342,9 +342,17 @@ impl SlotSession for StakeEngineSession {
         };
         let round = &res["round"];
         let mut balance = res["balance"]["amount"].as_i64();
-        let win = amount(&round["payout"]).unwrap_or(0);
+        let payout = amount(&round["payout"]).unwrap_or(0);
         let charged = (round["amount"].as_i64().unwrap_or(bet) as f64 * self.cost_mult(mode)).round() as i64;
-        if round["active"].as_bool() == Some(true) {
+        let state = round["state"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let free_spins = has_free_spins(state);
+        let active = round["active"].as_bool() == Some(true);
+        // the bonus is decided already; left active, the browser shows it (and our next play
+        // ends it if the browser never did)
+        let held = hold && free_spins && active;
+        // paid when the round ends, in the browser: don't show it here
+        let win = if held { 0 } else { payout };
+        if active && !held {
             let (settled, end_took) = self.rgs.end_round().await?;
             took += end_took;
             if let Some(b) = settled {
@@ -353,15 +361,15 @@ impl SlotSession for StakeEngineSession {
         }
         // server time only: the pacing between calls isn't latency
         let ms = took.as_secs_f64() * 1000.0;
-        let state = round["state"].as_array().map(Vec::as_slice).unwrap_or(&[]);
         Ok(SpinResult {
             round_id: round["betID"].as_i64().map(|i| i.to_string()).or_else(|| round["betID"].as_str().map(str::to_string)).unwrap_or_default(),
             cost: charged,
             win,
             multiplier: if charged > 0 { win as f64 / charged as f64 } else { 0.0 },
             balance,
-            pending: false,
-            free_spins: has_free_spins(state),
+            pending: held,
+            free_spins,
+            held,
             events: state.len(),
             ms,
         })

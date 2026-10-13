@@ -102,7 +102,7 @@ impl SlotSession for BgamingSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, _feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, _feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let mut body = json!({ "command": "spin", "options": { "bet": bet } });
         let mut total_win = 0i64;
@@ -110,6 +110,7 @@ impl SlotSession for BgamingSession {
         let mut round_id = String::new();
         let mut events = 0usize;
         let mut free_spins = false;
+        let mut held = false;
         for _ in 0..400 {
             let headers: Vec<(&str, &str)> = self.csrf.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let (status, res) = match self.bridge.post_json(&self.api, &headers, &body).await {
@@ -148,6 +149,12 @@ impl SlotSession for BgamingSession {
             // a round still open: continue with whatever the server offers next
             let next = ["freespin", "respin", "collect", "cascade", "bonus"].iter().find(|a| actions.iter().any(|x| x == *a)).map(|s| s.to_string());
             match next {
+                // free spins to play: leave them for the browser
+                Some(cmd) if hold && cmd == "freespin" => {
+                    free_spins = true;
+                    held = true;
+                    break;
+                }
                 Some(cmd) => {
                     free_spins |= cmd == "freespin";
                     body = json!({ "command": cmd });
@@ -162,8 +169,9 @@ impl SlotSession for BgamingSession {
             win: total_win,
             multiplier: if bet > 0 { total_win as f64 / bet as f64 } else { 0.0 },
             balance,
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events,
             ms,
         })

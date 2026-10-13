@@ -209,7 +209,7 @@ pub async fn self_test(producer: &str, launch_url: &str, spins: usize, feature: 
     let bet = info.default_bet.or(info.bet_levels.first().map(|b| b.minor)).unwrap_or(100);
     for i in 0..spins {
         let feat = if i + 1 == spins { feature } else { None };
-        match s.spin(bet, feat).await {
+        match s.spin(bet, feat, false).await {
             Ok(r) => println!(
                 "spin {}{} round {} cost {} win {} x{:.2} balance {:?} pending {} fs {} events {} {:.0} ms",
                 i + 1,
@@ -281,6 +281,11 @@ pub struct SpinResult {
     /// Round still open server-side (bonus in progress etc.).
     pub pending: bool,
     pub free_spins: bool,
+    /// The spin triggered free spins and, as asked, the round was left open for the game in the
+    /// browser: the free spins unplayed, or the bonus not yet shown and closed. `win` is then only
+    /// what was paid before the free spins (0 where the provider decides the whole bonus in the
+    /// spin: its result stays for the browser to show).
+    pub held: bool,
     pub events: usize,
     pub ms: f64,
 }
@@ -302,8 +307,9 @@ pub enum SlotError {
 #[async_trait]
 pub trait SlotSession: Send + Sync {
     fn info(&self) -> &SessionInfo;
-    /// One spin at `bet` minor units, optionally buying `feature`.
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError>;
+    /// One spin at `bet` minor units, optionally buying `feature`. `hold`: when the spin triggers
+    /// free spins, stop there and leave the round open for the browser (see [`SpinResult::held`]).
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError>;
     fn close(&self);
 }
 

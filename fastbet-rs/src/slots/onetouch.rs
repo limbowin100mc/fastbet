@@ -70,7 +70,7 @@ pub async fn open(launch_url: &str) -> Result<OneTouchSession, SlotError> {
     // a round left open (free spins in progress) is played out first
     if state["nextSceneState"]["sceneId"].as_str().is_some_and(|sc| sc != "main") {
         let bet = s.info.default_bet.unwrap_or(0);
-        let _ = s.finish(bet, "SPIN", std::time::Instant::now()).await?;
+        let _ = s.finish(bet, "SPIN", false, std::time::Instant::now()).await?;
     }
     Ok(s)
 }
@@ -130,7 +130,7 @@ impl OneTouchSession {
     }
 
     /// Plays `kind` and then the rest of the round; returns the last reply plus the first's cost.
-    async fn finish(&self, bet: i64, kind: &str, t0: std::time::Instant) -> Result<SpinResult, SlotError> {
+    async fn finish(&self, bet: i64, kind: &str, hold: bool, t0: std::time::Instant) -> Result<SpinResult, SlotError> {
         let path = format!("api/v2/slots/{}/play", self.game);
         let bet_units = bet as f64 / 100.0;
         let mut cost = 0i64;
@@ -144,7 +144,9 @@ impl OneTouchSession {
             }
             steps += 1;
             let scene = r["nextSceneState"]["sceneId"].as_str().unwrap_or("main");
-            if scene == "main" || steps > 500 {
+            // free spins to play: leave them for the browser
+            let held = hold && scene != "main";
+            if scene == "main" || steps > 500 || held {
                 let win = r["roundWin"].as_f64().map(minor).unwrap_or(0);
                 return Ok(SpinResult {
                     round_id: r["gameId"].as_str().unwrap_or("").to_string(),
@@ -153,7 +155,8 @@ impl OneTouchSession {
                     multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
                     balance: r["balance"].as_f64().map(minor),
                     pending: scene != "main",
-                    free_spins,
+                    free_spins: free_spins || held,
+                    held,
                     events: steps,
                     ms: t0.elapsed().as_secs_f64() * 1000.0,
                 });
@@ -171,8 +174,8 @@ impl SlotSession for OneTouchSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
-        self.finish(bet, feature.unwrap_or("SPIN"), std::time::Instant::now()).await
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
+        self.finish(bet, feature.unwrap_or("SPIN"), hold, std::time::Instant::now()).await
     }
 
     fn close(&self) {}

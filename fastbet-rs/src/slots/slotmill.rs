@@ -176,7 +176,7 @@ impl SlotSession for SlotmillSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let (amount, buy) = match feature {
             Some(f) => {
@@ -206,12 +206,20 @@ impl SlotSession for SlotmillSession {
         let steps = first["wager"]["bets"].as_array().map(|b| b.len()).unwrap_or(1);
         let free_spins = feature.is_some()
             || first["wager"]["bets"].as_array().is_some_and(|b| b.iter().any(|x| x["eventdata"]["freeSpinsTotal"].as_i64().unwrap_or(0) > 0 || x["eventdata"]["freeSpins"].as_i64().unwrap_or(0) > 0));
-        let last = if first["wager"]["status"].as_str() == Some("Pending") { self.collect(&first["wager"]).await? } else { first.clone() };
+        let open = first["wager"]["status"].as_str() == Some("Pending");
+        // the bonus is decided already; left uncollected, the browser shows it
+        let held = hold && free_spins && open;
+        let last = if open && !held { self.collect(&first["wager"]).await? } else { first.clone() };
         let balance = minor(&last["resultBal"]["cash"]).or(minor(&first["resultBal"]["cash"]));
         // the server's own balances: after the bet, and after the round paid out
-        let win = match (after_bet, balance) {
-            (Some(a), Some(b)) => (b - a).max(0),
-            _ => last["wager"]["bets"].as_array().map(|b| b.iter().filter_map(|x| minor(&x["wonamount"])).sum()).unwrap_or(0),
+        let win = if held {
+            // the browser shows the bonus and what it pays
+            0
+        } else {
+            match (after_bet, balance) {
+                (Some(a), Some(b)) => (b - a).max(0),
+                _ => last["wager"]["bets"].as_array().map(|b| b.iter().filter_map(|x| minor(&x["wonamount"])).sum()).unwrap_or(0),
+            }
         };
         Ok(SpinResult {
             round_id: first["wager"]["wagerid"].as_str().unwrap_or("").to_string(),
@@ -219,8 +227,9 @@ impl SlotSession for SlotmillSession {
             win,
             multiplier: if amount > 0 { win as f64 / amount as f64 } else { 0.0 },
             balance,
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: steps,
             ms: t0.elapsed().as_secs_f64() * 1000.0,
         })

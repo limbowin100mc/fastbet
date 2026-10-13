@@ -183,6 +183,18 @@ fn general(app: &mut App, ui: &mut Ui, w: f32) {
             app.mark_dirty();
         }
         ui.label(egui::RichText::new("Pauses the moment a round pays this many × the stake. Resume to carry on.").size(10.5).color(DIM));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let mut fs = app.settings.slot_stop_fs;
+            if widgets::checkbox(ui, "Stop before free spins", &mut fs, !locked) {
+                app.settings.slot_stop_fs = fs;
+                app.mark_dirty();
+            }
+            widgets::help_icon(
+                ui,
+                "Stops autoplay when a spin triggers free spins, before they are played, so you can play them in your                  browser: open the game on the casino site and it carries on with them. Some providers (Hacksaw, Stake                  Engine …) decide the whole bonus in the spin that triggers it; there the result is already set and the                  browser shows it.",
+            );
+        });
     });
 }
 
@@ -258,6 +270,11 @@ fn stage(app: &mut App, ui: &mut Ui) {
         }
     }
     match app.spins.front().cloned() {
+        Some(r) if r.held => {
+            p.text(center, Align2::CENTER_CENTER, "Free spins ready", theme::font_bold(34.0 * scale), GOLD);
+            let sub = format!("Bet {}   ·   play them in your browser", fmt_money(r.cost, &r.currency, r.decimals));
+            p.text(pos2(center.x, center.y + 34.0), Align2::CENTER_CENTER, sub, theme::font_semi(11.5), MUTED);
+        }
         Some(r) => {
             let c = kind_color(&r);
             if r.hit {
@@ -283,6 +300,8 @@ fn stage(app: &mut App, ui: &mut Ui) {
         (st.msg.clone(), GOLD)
     } else if st.running {
         (st.msg.clone(), GREEN)
+    } else if st.held {
+        (st.msg.clone(), GOLD)
     } else if st.info.is_some() {
         (if st.msg.is_empty() { "Ready".into() } else { st.msg.clone() }, MUTED)
     } else {
@@ -359,10 +378,13 @@ fn table(app: &mut App, ui: &mut Ui) {
             let cells: [(String, Color32); 7] = [
                 ((total as usize - i).to_string(), MUTED),
                 (clock(r.at), MUTED),
-                (r.feature.clone().unwrap_or_else(|| if r.free_spins { "free spins".into() } else { "–".into() }), if r.free_spins { GOLD } else { TEXT2 }),
+                (
+                    if r.held { "free spins ready · browser".into() } else { r.feature.clone().unwrap_or_else(|| if r.free_spins { "free spins".into() } else { "–".into() }) },
+                    if r.free_spins { GOLD } else { TEXT2 },
+                ),
                 (fmt_money(r.cost, &r.currency, r.decimals), TEXT2),
-                (fmt_multi(r.multiplier), c),
-                (fmt_money(r.win, &r.currency, r.decimals), if r.multiplier >= 1.0 { GREEN } else { TEXT2 }),
+                if r.held { ("–".into(), MUTED) } else { (fmt_multi(r.multiplier), c) },
+                if r.held { ("–".into(), MUTED) } else { (fmt_money(r.win, &r.currency, r.decimals), if r.multiplier >= 1.0 { GREEN } else { TEXT2 }) },
                 (r.balance.map(|b| fmt_money(b, &r.currency, r.decimals)).unwrap_or("–".into()), MUTED),
             ];
             let mut x = rr.left();

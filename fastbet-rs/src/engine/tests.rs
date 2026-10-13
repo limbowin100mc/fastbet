@@ -598,3 +598,48 @@ async fn restart_on_error_waits_when_errors_repeat_and_stop_ends_it() {
     let a = wait_stopped(&e).await;
     assert_eq!((a.msg.as_str(), a.restarts), ("Stopped", 0));
 }
+
+/// A slot whose third spin triggers free spins; it holds them when asked.
+struct MockSlot {
+    info: crate::slots::SessionInfo,
+    spins: AtomicU32,
+}
+
+#[async_trait]
+impl crate::slots::SlotSession for MockSlot {
+    fn info(&self) -> &crate::slots::SessionInfo {
+        &self.info
+    }
+    async fn spin(&self, bet: i64, _feature: Option<&str>, hold: bool) -> Result<crate::slots::SpinResult, crate::slots::SlotError> {
+        let fs = self.spins.fetch_add(1, Ordering::SeqCst) + 1 == 3;
+        Ok(crate::slots::SpinResult { cost: bet, free_spins: fs, held: fs && hold, pending: fs && hold, ..Default::default() })
+    }
+    fn close(&self) {}
+}
+
+async fn run_slot(stop_before_fs: bool) -> (slots::SlotState, u32) {
+    let (e, _rx) = engine_with(Mock::new(&[]));
+    let slot = Arc::new(MockSlot { info: crate::slots::SessionInfo { currency: "USD".into(), decimals: 2, ..Default::default() }, spins: AtomicU32::new(0) });
+    *e.slot_session.lock().await = Some(slot.clone());
+    e.slot.lock().info = Some(slot.info.clone());
+    let cfg = slots::SlotConfig { bet: 10, feature: None, stop_mult: None, limit: 6, stop_profit: None, stop_loss: None, delay_ms: 0, currency: "usd".into(), stop_before_fs };
+    e.start_slot(cfg);
+    for _ in 0..200 {
+        if !e.slot.lock().running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let st = e.slot.lock().clone();
+    (st, slot.spins.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn slot_stops_before_free_spins_when_asked() {
+    let (st, spins) = run_slot(true).await;
+    assert_eq!((spins, st.done, st.held, st.running), (3, 3, true, false));
+    assert_eq!(st.msg, "Free spins ready · play them in your browser");
+    // off: free spins are just another spin
+    let (st, spins) = run_slot(false).await;
+    assert_eq!((spins, st.done, st.held, st.msg.as_str()), (6, 6, false, "Done"));
+}

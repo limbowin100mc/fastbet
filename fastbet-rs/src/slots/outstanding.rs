@@ -216,7 +216,7 @@ impl SlotSession for OutstandingSession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         let mut extra = json!({ "bet": { "slot": units(bet) } });
         if let Some(f) = feature {
@@ -235,7 +235,15 @@ impl SlotSession for OutstandingSession {
         let mut win = g["win"]["total"].as_str().map(minor).unwrap_or(0);
         let mut balance = r["user"]["balance"]["afterSettle"]["cash"].as_str().map(minor);
         let round_id = r["round"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
-        if r["round"]["delayed"].as_bool() == Some(true) {
+        let free_spins = g["win"].get("freeSpin").is_some() || g["spins"].as_array().is_some_and(|a| a.len() > 1) || r["round"]["type"].as_str() == Some("buy-feature");
+        let delayed = r["round"]["delayed"].as_bool() == Some(true);
+        // the bonus is decided already; left unsettled, the browser shows it
+        let held = hold && free_spins && delayed;
+        if held {
+            // the browser shows the bonus and what it pays
+            win = 0;
+        }
+        if delayed && !held {
             let s = self.post("settle", json!({ "roundId": r["round"]["id"] })).await?;
             if let Some(b) = s["user"]["balance"]["afterSettle"]["cash"].as_str().or(s["user"]["balance"]["cash"].as_str()) {
                 balance = Some(minor(b));
@@ -244,15 +252,15 @@ impl SlotSession for OutstandingSession {
                 win = minor(w);
             }
         }
-        let free_spins = g["win"].get("freeSpin").is_some() || g["spins"].as_array().is_some_and(|a| a.len() > 1) || r["round"]["type"].as_str() == Some("buy-feature");
         Ok(SpinResult {
             round_id,
             cost,
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance,
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: g["spins"].as_array().map(|a| a.len()).unwrap_or(1),
             ms: t0.elapsed().as_secs_f64() * 1000.0,
         })

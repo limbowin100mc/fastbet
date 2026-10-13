@@ -115,7 +115,7 @@ impl SlotSession for OnlyplaySession {
         &self.info
     }
 
-    async fn spin(&self, bet: i64, feature: Option<&str>) -> Result<SpinResult, SlotError> {
+    async fn spin(&self, bet: i64, feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
         let t0 = std::time::Instant::now();
         // the bet goes by its index in the game's list
         let index = self
@@ -139,8 +139,10 @@ impl SlotSession for OnlyplaySession {
         let before = *self.balance.lock().await;
         let mut r = self.call("game_request", first).await?;
         let mut steps = 1usize;
-        let mut free_spins = false;
-        while in_free_spins(&r) && steps < 500 {
+        // free spins to play: leave them for the browser
+        let held = hold && in_free_spins(&r);
+        let mut free_spins = held;
+        while !held && in_free_spins(&r) && steps < 500 {
             free_spins = true;
             r = self.call("game_request", json!({ "ver": "1.0", "id": "spin", "betIndex": index, "spinLevel": null })).await?;
             steps += 1;
@@ -161,8 +163,9 @@ impl SlotSession for OnlyplaySession {
             win,
             multiplier: if cost > 0 { win as f64 / cost as f64 } else { 0.0 },
             balance,
-            pending: false,
+            pending: held,
             free_spins,
+            held,
             events: steps,
             ms: t0.elapsed().as_secs_f64() * 1000.0,
         })

@@ -140,6 +140,8 @@ pub struct Settings {
     pub slot_demo: bool,
     pub slot_stop_mult_on: bool,
     pub slot_stop_mult: String,
+    /// Stop autoplay when a spin triggers free spins, leaving them for the browser.
+    pub slot_stop_fs: bool,
     pub slot_count: String,
     pub slot_stop_profit: String,
     pub slot_stop_loss: String,
@@ -383,6 +385,7 @@ impl Default for Settings {
             slot_demo: true,
             slot_stop_mult_on: false,
             slot_stop_mult: "100".into(),
+            slot_stop_fs: false,
             slot_count: "0".into(),
             slot_stop_profit: String::new(),
             slot_stop_loss: String::new(),
