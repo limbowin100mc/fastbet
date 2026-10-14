@@ -339,6 +339,10 @@ const COLS: &[Col] = &[
 
 fn table(app: &mut App, ui: &mut Ui) {
     let width = ui.available_width();
+    if super::hits::tabs(app, ui, width) {
+        super::hits::table(app, ui, width);
+        return;
+    }
     let sum: f32 = COLS.iter().map(|c| c.weight).sum();
     let widths: Vec<f32> = COLS.iter().map(|c| width * c.weight / sum).collect();
     let (hr, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
@@ -359,11 +363,18 @@ fn table(app: &mut App, ui: &mut Ui) {
         ui.painter().text(r.center(), Align2::CENTER_CENTER, "No spins yet", theme::font(12.0), DIM);
         return;
     }
-    let total = app.slot_stats.bets;
+    let total = app.spins_total;
+    let mut open_hit = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, n.min(200), |ui, range| {
         for i in range {
             let r = &app.spins[i];
-            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+            // a win's row opens its card
+            let opens = r.hit || (!r.held && r.multiplier >= 1.0);
+            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), if opens { Sense::click() } else { Sense::hover() });
+            let resp = if opens { resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card") } else { resp };
+            if opens && resp.clicked() {
+                open_hit = Some(total.saturating_sub(i as u64));
+            }
             if !r.round_id.is_empty() {
                 resp.on_hover_text(format!("round {}", r.round_id));
             }
@@ -396,5 +407,8 @@ fn table(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+    if let Some(n) = open_hit {
+        super::hits::open_spin(app, n);
+    }
     let _ = StrokeKind::Inside;
 }

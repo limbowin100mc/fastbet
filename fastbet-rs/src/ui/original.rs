@@ -239,6 +239,10 @@ fn table(app: &mut App, ui: &mut Ui, game: Game) {
     let ui = &mut tui;
     ui.spacing_mut().item_spacing.y = 0.0;
     let width = inner.width();
+    if super::hits::tabs(app, ui, width) {
+        super::hits::table(app, ui, width);
+        return;
+    }
     let sum: f32 = COLS.iter().map(|c| c.weight).sum();
     let widths: Vec<f32> = COLS.iter().map(|c| (width - 8.0) * c.weight / sum).collect();
     let cell_pos = |cell: Rect, right: bool| if right { (pos2(cell.right() - 12.0, cell.center().y), Align2::RIGHT_CENTER) } else { (pos2(cell.left() + 12.0, cell.center().y), Align2::LEFT_CENTER) };
@@ -269,11 +273,17 @@ fn table(app: &mut App, ui: &mut Ui, game: Game) {
         ui.painter().text(r.center(), Align2::CENTER_CENTER, "No rounds yet", theme::font_semi(13.0), MUTED);
         return;
     }
+    let mut open_hit = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for i in range {
             let (n, rec) = &rows[i];
-            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+            // a win's row opens its card
+            let opens = rec.win || rec.hit;
+            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), if opens { Sense::click() } else { Sense::hover() });
+            if opens && resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card").clicked() {
+                open_hit = Some(*n);
+            }
             let p = ui.painter();
             if resp.hovered() {
                 p.rect_filled(rr, CornerRadius::same(6), alpha(Color32::WHITE, 7));
@@ -309,4 +319,7 @@ fn table(app: &mut App, ui: &mut Ui, game: Game) {
             }
         }
     });
+    if let Some(n) = open_hit {
+        super::hits::open_bet(app, n);
+    }
 }

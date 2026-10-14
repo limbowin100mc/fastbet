@@ -66,7 +66,9 @@ pub enum Provider {
 impl Provider {
     pub fn for_producer(producer: &str) -> Option<Provider> {
         match producer {
-            "hacksawgaming" => Some(Provider::Hacksaw),
+            // Hacksaw's own studios and the ones it hosts (Shuffle's names) launch on its RGS
+            "hacksawgaming" | "bullsharkgames" | "nownow" | "trustygaming" | "kitsunegaming" | "aceroll" | "goodtimesstudios"
+            | "pineappleplay" | "alohagaming" => Some(Provider::Hacksaw),
             // studios on AvatarUX's RGS (Hub88's b2b platform)
             "avatarux" | "peter&sons" | "shadylady" | "wickedgames" => Some(Provider::Avatarux),
             // Popiplay runs on BGaming's platform
@@ -86,6 +88,14 @@ impl Provider {
     pub fn display_producer(producer: &str) -> &str {
         match producer {
             "hacksawgaming" => "Hacksaw Gaming",
+            "bullsharkgames" => "Bullshark Games",
+            "nownow" => "Nownow",
+            "trustygaming" => "Trusty Gaming",
+            "kitsunegaming" => "Kitsune Gaming",
+            "aceroll" => "Aceroll",
+            "goodtimesstudios" => "Goodtimes Studios",
+            "pineappleplay" => "Pineapple Play",
+            "alohagaming" => "Aloha Gaming",
             "avatarux" => "AvatarUX",
             "peter&sons" => "Peter & Sons",
             "shadylady" => "Shady Lady",

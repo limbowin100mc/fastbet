@@ -19,7 +19,7 @@ pub struct TopMulti {
     pub multi: f64,
     /// What that bet won or lost.
     pub profit: Units,
-    /// The bet's number in the session.
+    /// The bet's number in the history (a slot spin's in the slot session), to open its card.
     pub n: u64,
 }
 
@@ -91,7 +91,8 @@ impl Stats {
         *self = Self::fresh(cur, decimals);
     }
 
-    pub fn settle(&mut self, r: &BetRecord, decimals: u32) {
+    /// Books bet number `n` (its history number; a spin's number for slot stats).
+    pub fn settle(&mut self, r: &BetRecord, decimals: u32, n: u64) {
         if self.cur != r.currency {
             *self = Self::fresh(&r.currency, decimals);
         }
@@ -132,7 +133,7 @@ impl Stats {
         self.hi_loss = self.hi_loss.max(-r.profit);
         self.hi_bet = self.hi_bet.max(r.amount);
         if r.win && r.target.is_finite() {
-            push_top(&mut self.top_multi, TopMulti { multi: r.target, profit: r.profit, n: self.bets }, |m| m.multi);
+            push_top(&mut self.top_multi, TopMulti { multi: r.target, profit: r.profit, n }, |m| m.multi);
         }
         self.latency = if self.latency > 0.0 { self.latency * 0.8 + r.ms * 0.2 } else { r.ms };
         self.times.push_back(now);
@@ -229,6 +230,11 @@ pub struct History {
 }
 
 impl History {
+    /// The number the next bet will get.
+    pub fn next_n(&self) -> u64 {
+        self.bets + 1
+    }
+
     pub fn push_bet(&mut self, rec: BetRecord) -> u64 {
         self.bets += 1;
         self.push(HistEntry::Bet { n: self.bets, rec });
@@ -252,16 +258,6 @@ impl History {
         self.version += 1;
     }
 
-    pub fn recent_bets(&self, n: usize) -> impl Iterator<Item = &BetRecord> {
-        self.entries
-            .iter()
-            .filter_map(|e| match e {
-                HistEntry::Bet { rec, .. } => Some(rec),
-                _ => None,
-            })
-            .take(n)
-    }
-
     /// The latest bet on `game` (`None`: Limbo).
     pub fn latest_for(&self, game: Option<Game>) -> Option<(u64, &BetRecord)> {
         self.entries.iter().find_map(|e| match e {
@@ -270,10 +266,6 @@ impl History {
         })
     }
 
-    /// The latest `n` bets on `game` (`None`: Limbo), newest first.
-    pub fn recent_for(&self, game: Option<Game>, n: usize) -> impl Iterator<Item = &BetRecord> {
-        self.recent_bets(usize::MAX).filter(move |r| r.game == game).take(n)
-    }
 }
 
 pub fn clock(at: SystemTime) -> String {
@@ -281,6 +273,37 @@ pub fn clock(at: SystemTime) -> String {
     let local = secs as i64 + local_offset_secs();
     let s = local.rem_euclid(86_400);
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// "14 Oct 2026 · 16:30", local time.
+pub fn date_time(at: SystemTime) -> String {
+    let (y, m, d, s) = local_civil(at);
+    format!("{d} {} {y} · {:02}:{:02}", MONTHS[(m - 1) as usize], s / 3600, (s / 60) % 60)
+}
+
+/// "2026-10-14 16-30-05", local time, for file names.
+pub fn file_stamp(at: SystemTime) -> String {
+    let (y, m, d, s) = local_civil(at);
+    format!("{y}-{m:02}-{d:02} {:02}-{:02}-{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// Local (year, month, day, seconds into the day).
+fn local_civil(at: SystemTime) -> (i64, i64, i64, i64) {
+    let secs = at.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64 + local_offset_secs();
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // civil from days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d, sod)
 }
 
 /// Local UTC offset in seconds, read once from the OS.
@@ -357,8 +380,8 @@ mod tests {
         let mut s = Stats::fresh("btc", 8);
         // W2 (+200), L3 (-300), W1 (+100), then a loss run still going (L1, -100)
         let bets = [(2.0, 3211.0, true, 100), (3.0, 3.5, true, 200), (100.0, 99.0, false, -100), (2.0, 1.0, false, -100), (2.0, 1.5, false, -100), (2.5, 2.5, true, 150), (2.0, 1.1, false, -100)];
-        for (target, roll, win, p) in bets {
-            s.settle(&bet(target, roll, win, p), 8);
+        for (i, (target, roll, win, p)) in bets.into_iter().enumerate() {
+            s.settle(&bet(target, roll, win, p), 8, i as u64 + 1);
         }
         let wins: Vec<_> = s.win_streaks_now().iter().map(|st| (st.len, st.profit)).collect();
         assert_eq!(wins, vec![(2, 300), (1, 150)]);

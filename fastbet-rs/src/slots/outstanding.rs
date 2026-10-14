@@ -30,7 +30,12 @@ struct Offer {
 
 struct Turn {
     token: String,
+    /// The earliest next bet, on the server's clock.
     next_at: Option<std::time::SystemTime>,
+    /// How far the server's clock is ahead of ours, in ms (never more than it really is: the
+    /// largest of the `Date` headers' lower bounds). A PC clock 1.3 s fast sent every second
+    /// bet too early, and the server refused it ("A technical error has occurred").
+    skew_ms: Option<i64>,
 }
 
 pub struct OutstandingSession {
@@ -66,7 +71,7 @@ pub async fn open(launch_url: &str) -> Result<OutstandingSession, SlotError> {
         base["brand"] = json!(b);
     }
     let http = reqwest::Client::builder().user_agent(UA).build().map_err(|e| SlotError::Bridge(e.to_string()))?;
-    let mut s = OutstandingSession { http, api: api.trim_end_matches('/').to_string(), base, offers: vec![], turn: Mutex::new(Turn { token, next_at: None }), info: SessionInfo::default() };
+    let mut s = OutstandingSession { http, api: api.trim_end_matches('/').to_string(), base, offers: vec![], turn: Mutex::new(Turn { token, next_at: None, skew_ms: None }), info: SessionInfo::default() };
 
     let r = s.post("init", json!({})).await?;
     let user = &r["user"];
@@ -138,10 +143,11 @@ fn js_string(html: &str, key: &str) -> Option<String> {
 impl OutstandingSession {
     async fn post(&self, path: &str, extra: Value) -> Result<Value, SlotError> {
         let mut turn = self.turn.lock().await;
-        // the server says when the next bet may go
+        // the server says when the next bet may go, on its clock
         if let Some(at) = turn.next_at {
-            if let Ok(wait) = at.duration_since(std::time::SystemTime::now()) {
-                tokio::time::sleep(wait.min(std::time::Duration::from_secs(10)) + std::time::Duration::from_millis(20)).await;
+            let wait = epoch_ms(at) - turn.skew_ms.unwrap_or(0) - epoch_ms(std::time::SystemTime::now());
+            if wait > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait.min(10_000) as u64 + 20)).await;
             }
         }
         let mut body = self.base.clone();
@@ -161,6 +167,11 @@ impl OutstandingSession {
             .await
             .map_err(|e| SlotError::Bridge(format!("Penguin King: {e}")))?;
         let status = res.status().as_u16();
+        // the server's time is at least its `Date` (whole seconds) when the reply arrives
+        if let Some(date) = res.headers().get("date").and_then(|v| v.to_str().ok()).and_then(parse_http_date) {
+            let low = epoch_ms(date) - epoch_ms(std::time::SystemTime::now());
+            turn.skew_ms = Some(turn.skew_ms.map_or(low, |s| s.max(low)));
+        }
         let text = res.text().await.unwrap_or_default();
         if status == 429 {
             return Err(SlotError::RateLimited);
@@ -208,6 +219,18 @@ fn parse_time(s: &str) -> Option<std::time::SystemTime> {
         return None;
     }
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64))
+}
+
+/// "Tue, 14 Oct 2026 14:20:23 GMT" -> SystemTime
+fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
+    let mut f = s.split_whitespace().skip(1);
+    let (day, mon, year, time) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    let m = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|x| *x == mon)? + 1;
+    parse_time(&format!("{year}-{m:02}-{day}T{time}Z"))
+}
+
+fn epoch_ms(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 #[async_trait]
@@ -277,6 +300,7 @@ mod tests {
     fn times_and_names() {
         let t = parse_time("1970-01-02T00:00:01.500Z").unwrap();
         assert_eq!(t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), 86_401_500);
+        assert_eq!(parse_http_date("Fri, 02 Jan 1970 00:00:01 GMT"), parse_time("1970-01-02T00:00:01Z"));
         assert_eq!(offer_name("free-spins-140", true, 1.4), "Free spins chance (×1.4)");
         assert_eq!(offer_name("picker-bonus-50", false, 50.0), "Buy picker bonus (×50)");
         assert_eq!(units(140), "1.40");

@@ -131,12 +131,21 @@ fn stage(app: &mut App, ui: &mut Ui) {
         }
     }
     let center = pos2(rect.center().x, rect.center().y - 22.0);
+    let mut open_card = None;
     match &latest {
         Some((n, r)) => {
             let color = kind_color(r);
             widgets::glow(&ui.painter_at(rect.shrink(1.0)), center, (h * 0.75).min(260.0), alpha(color, if r.hit { 46 } else { 22 }));
             let fg = if paused { alpha(color, 120) } else { color };
             p.text(center, Align2::CENTER_CENTER, fmt_multi(r.outcome), theme::font_bold(80.0 * scale), fg);
+            // a win's number opens its card
+            if r.win {
+                let hot = Rect::from_center_size(center, vec2(460.0, 110.0)).intersect(rect);
+                let resp = ui.interact(hot, ui.id().with("stage-card"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card");
+                if resp.clicked() {
+                    open_card = Some(*n);
+                }
+            }
 
             // the bet behind the number: four labelled values
             let items = [
@@ -164,7 +173,11 @@ fn stage(app: &mut App, ui: &mut Ui) {
             }
             p.text(pos2(rect.left() + 18.0, rect.top() + 20.0), Align2::LEFT_CENTER, id_txt, theme::font_semi(11.0), DIM);
             if app.hit_badge_n == Some(*n) {
-                badge(&p, pos2(rect.right() - 18.0, rect.top() + 20.0), "HIT", GOLD);
+                let b = badge(&p, pos2(rect.right() - 18.0, rect.top() + 20.0), "HIT", GOLD);
+                let resp = ui.interact(b, ui.id().with("hit-badge"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card");
+                if resp.clicked() {
+                    open_card = Some(*n);
+                }
             }
         }
         None => {
@@ -195,13 +208,22 @@ fn stage(app: &mut App, ui: &mut Ui) {
         clip.galley(pos2(br.left() + 24.0, br.center().y - g.size().y / 2.0), g, c);
     }
     // recent results along the bottom, newest first, fading out to the right
-    let recent: Vec<BetRecord> = app.history.recent_for(None, 60).cloned().collect();
+    let recent: Vec<(u64, BetRecord)> = app
+        .history
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            HistEntry::Bet { n, rec } if rec.game.is_none() => Some((*n, rec.clone())),
+            _ => None,
+        })
+        .take(60)
+        .collect();
     if !recent.is_empty() {
         let y = rect.bottom() - 24.0;
         let x_end = rect.right() - 18.0;
         let fade_from = x_end - 160.0;
         let mut x = rect.left() + 18.0;
-        for (i, r) in recent.iter().enumerate() {
+        for (i, (n, r)) in recent.iter().enumerate() {
             let c = kind_color(r);
             let g = p.layout_no_wrap(fmt_multi(r.outcome), theme::font_semi(11.0), c);
             let w = g.size().x + 14.0;
@@ -213,16 +235,27 @@ fn stage(app: &mut App, ui: &mut Ui) {
             let strong = if i == 0 { 46.0 } else { 22.0 };
             p.rect_filled(cr, CornerRadius::same(6), alpha(c, (strong * fade) as u8));
             p.galley_with_override_text_color(pos2(cr.left() + 7.0, cr.center().y - g.size().y / 2.0), g, alpha(c, (255.0 * fade) as u8));
+            // a win's pill opens its card
+            if r.win || r.hit {
+                let resp = ui.interact(cr, ui.id().with(("recent-card", *n)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card");
+                if resp.clicked() {
+                    open_card = Some(*n);
+                }
+            }
             x += w + 5.0;
         }
     }
+    if let Some(n) = open_card {
+        super::hits::open_bet(app, n);
+    }
 }
 
-fn badge(p: &egui::Painter, right_center: egui::Pos2, text: &str, color: Color32) {
+fn badge(p: &egui::Painter, right_center: egui::Pos2, text: &str, color: Color32) -> Rect {
     let g = p.layout_no_wrap(text.to_string(), theme::font_bold(11.0), color);
     let r = Rect::from_min_size(pos2(right_center.x - g.size().x - 20.0, right_center.y - 11.0), vec2(g.size().x + 20.0, 22.0));
     p.rect(r, CornerRadius::same(11), alpha(color, 30), Stroke::new(1.0, alpha(color, 150)), StrokeKind::Inside);
     p.galley(pos2(r.left() + 10.0, r.center().y - g.size().y / 2.0), g, color);
+    r
 }
 
 struct Col {
@@ -264,6 +297,10 @@ fn table(app: &mut App, ui: &mut Ui) {
     let ui = &mut tui;
     ui.spacing_mut().item_spacing.y = 0.0;
     let width = inner.width();
+    if super::hits::tabs(app, ui, width) {
+        super::hits::table(app, ui, width);
+        return;
+    }
     // the last 30px hold the clear-history button
     let widths = col_widths(width - 8.0 - 30.0);
 
@@ -301,10 +338,21 @@ fn table(app: &mut App, ui: &mut Ui) {
         return;
     }
 
+    let mut open_hit = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, entries.len(), |ui, range| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for i in range {
-            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+            // a win's row opens its card
+            let hit_n = match &entries[i] {
+                HistEntry::Bet { n, rec } if rec.win || rec.hit => Some(*n),
+                _ => None,
+            };
+            let (rr, resp) = ui.allocate_exact_size(vec2(width, ROW_H), if hit_n.is_some() { Sense::click() } else { Sense::hover() });
+            if let Some(n) = hit_n {
+                if resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the card").clicked() {
+                    open_hit = Some(n);
+                }
+            }
             let p = ui.painter();
             if resp.hovered() {
                 p.rect_filled(rr, CornerRadius::same(6), alpha(Color32::WHITE, 7));
@@ -355,4 +403,7 @@ fn table(app: &mut App, ui: &mut Ui) {
             }
         }
     });
+    if let Some(n) = open_hit {
+        super::hits::open_bet(app, n);
+    }
 }

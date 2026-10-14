@@ -278,14 +278,14 @@ fn numbers_after(s: &str, tag: &str) -> Vec<u64> {
     s.match_indices(tag).filter_map(|(i, _)| s[i + tag.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()).collect()
 }
 
-/// `gameInfo={rtps:{regular:"96.52",ante_a1:"96.49",…}}` -> {"regular": 0.9652, …}.
+/// `gameInfo={rtps:{regular:"96.52",ante_a1:"96.49",…}}` -> {"regular": 96.52, …}, in percent like every driver.
 fn rtp_map(game_info: &str) -> HashMap<String, f64> {
     let Some(start) = game_info.find("rtps:{") else { return HashMap::new() };
     let body = &game_info[start + 6..];
     let body = &body[..body.find('}').unwrap_or(body.len())];
     body.split(',')
         .filter_map(|kv| kv.split_once(':'))
-        .filter_map(|(k, v)| v.trim_matches('"').parse::<f64>().ok().map(|r| (k.trim().to_string(), (r * 100.0).round() / 10_000.0)))
+        .filter_map(|(k, v)| v.trim_matches('"').parse::<f64>().ok().map(|r| (k.trim().to_string(), r)))
         .collect()
 }
 
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(money(&r["tw"]), Some(150));
         assert_eq!(numbers_after(r#"[{bet:2000,type:"default"},{bet:10000,type:"default"}]"#, "bet:"), vec![2000, 10000]);
         let rtps = rtp_map(r#"{rtps:{ante_a3:"96.50",regular:"96.52",purchase_0:"96.50"},props:{max:"1"}}"#);
-        assert_eq!(rtps.get("regular"), Some(&0.9652));
-        assert_eq!(rtps.get("purchase_0"), Some(&0.965));
+        assert_eq!(rtps.get("regular"), Some(&96.52));
+        assert_eq!(rtps.get("purchase_0"), Some(&96.5));
     }
 }

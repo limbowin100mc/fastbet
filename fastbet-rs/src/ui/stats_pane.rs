@@ -292,15 +292,23 @@ fn body(app: &mut App, ui: &mut Ui, max_h: Option<f32>) {
         if s.retries > 0 {
             grid(ui, full, vec![[cell("Busy retries", fmt_int(s.retries as i128), GOLD, "server said wait"), cell("", String::new(), TEXT, "")]]);
         }
-        let multis: Vec<Ranked> = s.top_multi.iter().map(|m| Ranked { value: fmt_multi(m.multi), amount: prim(m.profit, true), tip: Some(format!("Bet #{}", fmt_int(m.n as i128))) }).collect();
+        let multis: Vec<Ranked> = s.top_multi.iter().map(|m| Ranked { value: fmt_multi(m.multi), amount: prim(m.profit, true), tip: Some("Open the card".into()) }).collect();
+        let multi_ns: Vec<u64> = s.top_multi.iter().map(|m| m.n).collect();
         let streak_rows = |list: Vec<super::stats::Streak>, mark: &str| -> Vec<Ranked> {
             list.iter().map(|st| Ranked { value: format!("{mark}{}", st.len), amount: prim(st.profit, true), tip: None }).collect()
         };
         let wins = streak_rows(s.win_streaks_now(), "W");
         let losses = streak_rows(s.loss_streaks_now(), "L");
-        list_card(ui, full, "Top multipliers", &multis, TEXT);
-        list_card(ui, full, "Best win streaks", &wins, GREEN);
-        list_card(ui, full, "Worst loss streaks", &losses, RED);
+        let clicked = list_card(ui, full, "Top multipliers", &multis, TEXT, true);
+        list_card(ui, full, "Best win streaks", &wins, GREEN, false);
+        list_card(ui, full, "Worst loss streaks", &losses, RED, false);
+        if let Some(n) = clicked.and_then(|i| multi_ns.get(i).copied()) {
+            if slots {
+                super::hits::open_spin(app, n);
+            } else {
+                super::hits::open_bet(app, n);
+            }
+        }
     });
 }
 
@@ -370,8 +378,10 @@ struct Ranked {
 }
 
 /// A captioned card listing `rows` best first, one under the other. Past `LIST_ROWS` it
-/// scrolls on its own, with the edge that has more to show fading out.
-fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32) {
+/// scrolls on its own, with the edge that has more to show fading out. With `clickable`, the
+/// row clicked is returned.
+fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32, clickable: bool) -> Option<usize> {
+    let mut clicked = None;
     card_frame().inner_margin(Margin { left: 14, right: 10, top: 11, bottom: 8 }).show(ui, |ui| {
         ui.set_width(width - 26.0);
         ui.spacing_mut().item_spacing.y = 4.0;
@@ -392,8 +402,11 @@ fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32
         let out = egui::ScrollArea::vertical().id_salt(cap).max_height(ROW_H * LIST_ROWS).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, r) in rows.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), if clickable { Sense::click() } else { Sense::hover() });
                 let p = ui.painter();
+                if clickable && resp.hovered() {
+                    p.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(6), alpha(Color32::WHITE, 8));
+                }
                 if i > 0 {
                     p.hline(rect.left()..=(rect.right() - 6.0), rect.top(), Stroke::new(1.0, LINE));
                 }
@@ -405,6 +418,10 @@ fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32
                 let right = rect.right() - 10.0;
                 let room = right - (rect.left() + 26.0 + value_w + 12.0);
                 widgets::fit_text(p, pos2(right, rect.center().y), Align2::RIGHT_CENTER, &r.amount, theme::font(11.5), MUTED, room);
+                let resp = if clickable { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
+                if clickable && resp.clicked() {
+                    clicked = Some(i);
+                }
                 if let Some(tip) = &r.tip {
                     resp.on_hover_text(tip);
                 }
@@ -419,6 +436,7 @@ fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32
             fade(p, Rect::from_min_max(pos2(view.left(), view.bottom() - 14.0), pos2(view.right() - 8.0, view.bottom())), BG2, false);
         }
     });
+    clicked
 }
 
 /// `color` fading to clear across `rect`: from its top edge when `from_top`, else from its bottom.

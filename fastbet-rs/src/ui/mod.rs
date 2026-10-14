@@ -4,6 +4,8 @@
 pub mod accounts;
 pub mod coins;
 pub mod controls;
+pub mod hitcard;
+pub mod hits;
 pub mod images;
 pub mod limbo;
 pub mod lobby;
@@ -112,6 +114,13 @@ pub struct App {
     pub history: History,
     /// History number of the bet that ended the last auto run with a hit.
     pub hit_badge_n: Option<u64>,
+    /// Every hit this session, newest first, and how many the Hits tab has shown.
+    pub hits: Vec<hits::Hit>,
+    pub hits_seen: usize,
+    /// The history tables show the hits instead of the bets.
+    pub hits_tab: bool,
+    /// The hit card window.
+    pub card: Option<hits::CardView>,
 
     flash: Option<(String, Instant)>,
     /// Short neutral message for the status line (e.g. "Session reset").
@@ -151,6 +160,8 @@ pub struct App {
     pub catalog: slots_lobby::Catalog,
     pub slot: SlotState,
     pub spins: VecDeque<SpinRecord>,
+    /// Spins in the list so far: the newest one's number (the slot table counts down from it).
+    pub spins_total: u64,
     pub slot_stats: Stats,
     pub slot_pop: Option<Instant>,
 
@@ -234,6 +245,10 @@ impl App {
             stats: Stats::fresh("", 8),
             history: History::default(),
             hit_badge_n: None,
+            hits: Vec::new(),
+            hits_seen: 0,
+            hits_tab: false,
+            card: None,
             flash: None,
             notice: None,
             sound: sound::Sound::new(),
@@ -260,6 +275,7 @@ impl App {
             catalog: slots_lobby::Catalog::default(),
             slot: SlotState::default(),
             spins: VecDeque::new(),
+            spins_total: 0,
             slot_stats: Stats::fresh("USD", 2),
             slot_pop: None,
             orig: originals::State::default(),
@@ -272,6 +288,26 @@ impl App {
         app.open_casino = app.settings.accounts.iter().any(|a| a.casino == last).then_some(last);
         if let Some(n) = preview {
             app.load_preview(n);
+        }
+        // FASTBET_HITS=tab: the history tables open on their Hits; =card: the latest hit's card
+        // opens; =win: the latest winning bet's card, the way a click on its row opens it (UI work)
+        match std::env::var("FASTBET_HITS").as_deref() {
+            Ok("tab") => app.hits_tab = true,
+            Ok("card") => {
+                if let Some(h) = app.hits.first().cloned() {
+                    hits::open(&mut app, h);
+                }
+            }
+            Ok("win") => {
+                let won = app.history.entries.iter().find_map(|e| match e {
+                    stats::HistEntry::Bet { n, rec } if rec.win => Some(*n),
+                    _ => None,
+                });
+                if let Some(n) = won {
+                    hits::open_bet(&mut app, n);
+                }
+            }
+            _ => {}
         }
         // FASTBET_MIRRORS=<search>: account settings open with the mirror picker (UI work)
         if let Ok(q) = std::env::var("FASTBET_MIRRORS") {
@@ -332,8 +368,12 @@ impl App {
                 game: None,
                 round: None,
             };
-            self.stats.settle(&rec, 6);
-            self.history.push_bet(rec);
+            self.stats.settle(&rec, 6, self.history.next_n());
+            let hit_rec = hits::is_hit_bet(&rec).then(|| rec.clone());
+            let n = self.history.push_bet(rec);
+            if let Some(r) = hit_rec {
+                hits::record_bet(self, n, &r);
+            }
         }
         self.provable.client_seed = Some("d0a5a47351e87030faeb9675".into());
         self.provable.nonce = Some(n as u64);
@@ -753,6 +793,7 @@ impl App {
             self.stop_slot();
         }
         self.spins.clear();
+        self.spins_total = 0;
         self.slot_stats = Stats::fresh(&self.slot_stats.cur.clone(), self.slot_stats.decimals);
         self.slot_pop = None;
         self.engine.send(Command::SeedPolicy { every: self.settings.seed_every() });
@@ -1177,6 +1218,7 @@ impl App {
         }
         self.screen = Screen::Slot;
         self.spins.clear();
+        self.spins_total = 0;
         self.slot_stats = Stats::fresh("USD", 2);
         self.slot_pop = None;
         let (currency, fiat) = (self.active_currency(), self.fiat());
@@ -1195,6 +1237,7 @@ impl App {
         self.mark_dirty();
         if let Some(game) = self.slot.game.clone() {
             self.spins.clear();
+        self.spins_total = 0;
             self.slot_stats = Stats::fresh("USD", 2);
             let (currency, fiat) = (self.active_currency(), self.fiat());
             self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency, fiat });
@@ -1277,7 +1320,12 @@ impl App {
         if self.slot_stats.cur != rec.currency || self.slot_stats.decimals != rec.decimals {
             self.slot_stats = Stats::fresh(&rec.currency, rec.decimals);
         }
-        self.slot_stats.settle(&bet, rec.decimals);
+        self.spins_total += 1;
+        let n = self.spins_total;
+        self.slot_stats.settle(&bet, rec.decimals, n);
+        if hits::is_hit_spin(&rec) {
+            hits::record_spin(self, n, &rec);
+        }
         if rec.hit && self.settings.hit_sound {
             self.sound.ding();
         }
@@ -1414,12 +1462,16 @@ impl App {
                 }
                 Event::Bet(rec) => {
                     let dec = self.info(&rec.currency).map(|i| i.decimals).unwrap_or(8);
-                    self.stats.settle(&rec, dec);
+                    self.stats.settle(&rec, dec, self.history.next_n());
                     if let Some(n) = rec.nonce {
                         self.provable.nonce = Some(n);
                     }
                     let hit = rec.hit;
+                    let hit_rec = hits::is_hit_bet(&rec).then(|| rec.clone());
                     let n = self.history.push_bet(rec);
+                    if let Some(r) = hit_rec {
+                        hits::record_bet(self, n, &r);
+                    }
                     if hit {
                         self.hit_badge_n = Some(n);
                         if self.settings.hit_sound {
@@ -1861,6 +1913,7 @@ impl eframe::App for App {
             }
         }
         prefs::show(self, ui.ctx());
+        hits::show(self, ui.ctx());
         update::show(self, ui.ctx());
         titlebar::resize_grips(ui);
     }

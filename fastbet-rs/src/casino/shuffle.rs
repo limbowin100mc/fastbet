@@ -16,6 +16,12 @@
 //! GraphQL mutations too. Every reply is a `Bet` with one action per step; it is
 //! turned into the state shape of Stake's game, so the same boards draw it
 //! (Waifu Tower plays exactly like Stake's Dragon Tower). Blitz is Shuffle's own.
+//!
+//! Slots: the catalog is `cachedGames` (public), and `gameCreateSession` opens a game, real or
+//! demo, through Shuffle's SoftSwiss integration. Its `gameUrl` is the provider's own launch
+//! link (Hacksaw's launcher, BGaming's interlayer, the fh8labs launcher that redirects to the
+//! Peter & Sons / Shady Lady / Penguin King / OneTouch game …), which the slot drivers take
+//! from there as they do chips.gg's.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -92,6 +98,38 @@ const ORIGINAL_SLUGS: &[(&str, &str)] = &[
 ];
 /// Lobby tile size (2x the tile), as JPEG for the image decoder.
 const THUMB: &str = "w=264&h=346&fit=crop&fm=jpg&q=85";
+const SLOTS: &str = "query FastbetSlots($skip: Int, $first: Int, $providers: [String!], $search: String) { \
+    cachedGames(skip: $skip, first: $first, providers: $providers, search: $search, categories: [SLOTS], sortBy: POPULAR) { \
+    nodes { slug name demoMode edge image { key } provider { id name } } } }";
+const LAUNCH: &str = "mutation FastbetLaunch($clientType: ClientType!, $cryptoCurrency: Currency!, $demoMode: Boolean!, \
+    $fiatCurrency: FiatCurrency!, $gameSlug: String!, $locale: String!) { gameCreateSession(clientType: $clientType, \
+    cryptoCurrency: $cryptoCurrency, demoMode: $demoMode, fiatCurrency: $fiatCurrency, gameSlug: $gameSlug, locale: $locale) \
+    { gameUrl launchOptions } }";
+/// Most games `cachedGames` returns at once.
+const SLOTS_PAGE: usize = 40;
+/// Shuffle's provider ids for the slot drivers' producer keys (chips.gg's names).
+const PROVIDERS: &[(&str, &str)] = &[
+    ("hacksawgaming", "hacksaw"),
+    ("bgaming", "bgmng"),
+    ("peter&sons", "peter-sons"),
+    ("shadylady", "shady-lady"),
+    ("penguinking", "penguin-king"),
+    ("onetouch", "one-touch"),
+    ("relaxgaming", "relax"),
+    ("pragmaticplay", "pragmaticplay"),
+    ("avatarux", "avatarux"),
+    ("nolimitcity", "nolimit"),
+    ("wickedgames", "wickedgames"),
+    // studios on Hacksaw's RGS: the same ids here and in the drivers
+    ("bullsharkgames", "bullsharkgames"),
+    ("nownow", "nownow"),
+    ("trustygaming", "trustygaming"),
+    ("kitsunegaming", "kitsunegaming"),
+    ("aceroll", "aceroll"),
+    ("goodtimesstudios", "goodtimesstudios"),
+    ("pineappleplay", "pineappleplay"),
+    ("alohagaming", "alohagaming"),
+];
 
 const EXPIRED: &str = "Your Shuffle login has expired. Log in again in Settings.";
 /// Sweepstakes coins of Shuffle's US site, not money.
@@ -716,12 +754,49 @@ impl Casino for Shuffle {
         self.seeds().await
     }
 
-    async fn list_slots(&self, _filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
-        Ok(vec![])
+    async fn list_slots(&self, f: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        let search = f.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
+        let providers = f.producer.as_deref().map(|p| vec![PROVIDERS.iter().find(|(ours, _)| *ours == p).map_or(p, |(_, theirs)| *theirs)]);
+        // a provider's own list (the lobby's Tested section) is its 40 most played: one request each
+        let want = if providers.is_some() { f.limit.clamp(1, SLOTS_PAGE) } else { f.limit.max(1) };
+        let mut games = Vec::new();
+        // Shuffle hands out at most 40 at a time
+        while games.len() < want {
+            let first = (want - games.len()).min(SLOTS_PAGE);
+            let vars = json!({ "skip": f.skip + games.len(), "first": first, "providers": providers, "search": search });
+            let data = self.gql(SLOTS, vars, false).await?;
+            let nodes = data.pointer("/cachedGames/nodes").and_then(Value::as_array).cloned().unwrap_or_default();
+            let got = nodes.len();
+            games.extend(nodes.iter().filter_map(slot_game));
+            if got < first {
+                break;
+            }
+        }
+        Ok(games)
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str, _fiat: &str) -> Result<String, CasinoError> {
-        Err(CasinoError::Server("Slots aren't available on Shuffle yet".into()))
+    async fn launch_slot(&self, slug: &str, demo: bool, currency: &str, fiat: &str) -> Result<String, CasinoError> {
+        let logged_in = self.creds.lock().is_some();
+        if !demo && !logged_in {
+            return Err(CasinoError::Server("Log in to play for real".into()));
+        }
+        let fiat = if fiat.is_empty() { "USD".to_string() } else { fiat.to_ascii_uppercase() };
+        let vars = json!({
+            "clientType": "DESKTOP",
+            "cryptoCurrency": currency.to_ascii_uppercase(),
+            "demoMode": demo,
+            "fiatCurrency": fiat,
+            "gameSlug": slug,
+            "locale": "en",
+        });
+        let data = self.gql(LAUNCH, vars, logged_in).await?;
+        let session = &data["gameCreateSession"];
+        session["gameUrl"]
+            .as_str()
+            .or_else(|| session.pointer("/launchOptions/game_url").and_then(Value::as_str))
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| CasinoError::BadReply(data.to_string().chars().take(200).collect()))
     }
 
     async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: Value, auto: bool) -> Result<Round, CasinoError> {
@@ -1048,9 +1123,28 @@ fn error_of(code: &str) -> CallError {
     }
 }
 
+/// A `cachedGames` node as a slot tile. Producers the drivers know take their keys, so the
+/// right driver opens them; the rest keep Shuffle's id and show Shuffle's name.
+fn slot_game(n: &Value) -> Option<crate::slots::SlotGame> {
+    let theirs = n.pointer("/provider/id")?.as_str()?;
+    let known = PROVIDERS.iter().find(|(_, t)| *t == theirs).map(|(ours, _)| *ours);
+    let key = n.pointer("/image/key").and_then(Value::as_str);
+    Some(crate::slots::SlotGame {
+        id: n.get("slug")?.as_str()?.to_string(),
+        name: n.get("name")?.as_str()?.to_string(),
+        producer: known.unwrap_or(theirs).to_string(),
+        image: key.map(|k| format!("https://shuffle-com.imgix.net/{k}?{THUMB}")).unwrap_or_default(),
+        demo: n.get("demoMode").and_then(Value::as_bool).unwrap_or(false),
+        rtp: n.get("edge").and_then(f64_from_json).map_or(0.0, |e| 100.0 - e),
+        provider_game_id: None,
+        studio: if known.is_some() { None } else { n.pointer("/provider/name").and_then(Value::as_str).map(str::to_string) },
+    })
+}
+
 /// The site's own English for the codes a bet can meet; any other code reads as words.
 fn readable(code: &str) -> String {
     let text = match code {
+        "GAME_NOT_AVAILABLE_IN_COUNTRY" => "This game isn't available from your region",
         "BALANCE_NOT_ENOUGH" => "Insufficient balance",
         "INVALID_AMOUNT" => "Enter a valid amount",
         "AMOUNT_TOO_LARGE" => "Amount too large",
@@ -1222,5 +1316,21 @@ mod tests {
         assert_eq!(base32(0), "0");
         assert_eq!(base32(1_791_740_000_000), "1k4m0ddo0");
         assert!(random_id().chars().all(|c| c.is_ascii_digit() || ('a'..='v').contains(&c)));
+    }
+
+    #[test]
+    fn slot_tiles_take_the_drivers_names() {
+        let n = json!({ "slug": "hacksaw-le-vampire", "name": "Le Vampire", "demoMode": true, "edge": "3.64", "image": { "key": "k" }, "provider": { "id": "hacksaw", "name": "Hacksaw Gaming" } });
+        let g = slot_game(&n).unwrap();
+        assert_eq!((g.id.as_str(), g.producer.as_str(), g.studio, g.demo), ("hacksaw-le-vampire", "hacksawgaming", None, true));
+        assert!((g.rtp - 96.36).abs() < 1e-9);
+        assert!(g.image.starts_with("https://shuffle-com.imgix.net/k?"));
+        // a studio no driver plays keeps Shuffle's id and shows Shuffle's name
+        let n = json!({ "slug": "x", "name": "X", "demoMode": false, "edge": "4", "provider": { "id": "redtiger", "name": "Red Tiger" } });
+        let g = slot_game(&n).unwrap();
+        assert_eq!((g.producer.as_str(), g.studio.as_deref()), ("redtiger", Some("Red Tiger")));
+        assert!(crate::slots::Provider::for_producer(&g.producer).is_none());
+        let n = json!({ "slug": "y", "name": "Y", "provider": { "id": "bullsharkgames", "name": "Bullshark Games" } });
+        assert_eq!(crate::slots::Provider::for_producer(&slot_game(&n).unwrap().producer), Some(crate::slots::Provider::Hacksaw));
     }
 }

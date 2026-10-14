@@ -142,7 +142,26 @@ impl CasinoId {
                 "wickedgames",
             ],
             CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
-            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls => &[],
+            CasinoId::Shuffle => &[
+                "hacksawgaming",
+                "shadylady",
+                "peter&sons",
+                "bgaming",
+                "pragmaticplay",
+                "avatarux",
+                "penguinking",
+                "onetouch",
+                "relaxgaming",
+                "bullsharkgames",
+                "nownow",
+                "trustygaming",
+                "kitsunegaming",
+                "aceroll",
+                "goodtimesstudios",
+                "pineappleplay",
+                "alohagaming",
+            ],
+            CasinoId::Goated | CasinoId::Gambulls => &[],
         }
     }
 

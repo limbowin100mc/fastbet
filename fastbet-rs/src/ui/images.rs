@@ -28,7 +28,7 @@ const MAX_W: u32 = 320;
 impl ImageCache {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        let dir = directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.cache_dir().join("images"));
+        let dir = cache_dir();
         if let Some(d) = &dir {
             let _ = std::fs::create_dir_all(d);
         }
@@ -97,7 +97,30 @@ fn cache_name(url: &str) -> String {
     format!("{:016x}.bin", h.finish())
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.cache_dir().join("images"))
+}
+
+/// The image's file, from the disk cache or downloaded (and then cached). Blocks: call it off
+/// the UI thread.
+pub fn bytes(url: &str) -> Option<Vec<u8>> {
+    let dir = cache_dir();
+    if let Some(d) = &dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    load_bytes(url, dir.as_deref()).ok()
+}
+
 fn load(url: &str, dir: Option<&std::path::Path>) -> Result<ColorImage, String> {
+    let bytes = load_bytes(url, dir)?;
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let img = if img.width() > MAX_W { img.resize(MAX_W, MAX_W * 4, image::imageops::FilterType::Triangle) } else { img };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok(ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+}
+
+fn load_bytes(url: &str, dir: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
     let path = dir.map(|d| d.join(cache_name(url)));
     let bytes = match path.as_ref().and_then(|p| std::fs::read(p).ok()) {
         Some(b) => b,
@@ -118,9 +141,5 @@ fn load(url: &str, dir: Option<&std::path::Path>) -> Result<ColorImage, String> 
             b
         }
     };
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    let img = if img.width() > MAX_W { img.resize(MAX_W, MAX_W * 4, image::imageops::FilterType::Triangle) } else { img };
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Ok(ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
+    Ok(bytes)
 }

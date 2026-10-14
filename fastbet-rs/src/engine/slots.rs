@@ -139,9 +139,9 @@ impl Engine {
                 }
             };
             match provider {
-                // Hacksaw's demo needs no launch from the casino
-                Provider::Hacksaw if mode == PlayMode::Demo => {
-                    let gid = game.provider_game_id.as_deref().and_then(|s| s.parse().ok()).ok_or("No provider game id for this game")?;
+                // Hacksaw's demo needs no launch from the casino, when the catalog names Hacksaw's game id
+                Provider::Hacksaw if mode == PlayMode::Demo && game.provider_game_id.as_deref().is_some_and(|s| s.parse::<u64>().is_ok()) => {
+                    let gid = game.provider_game_id.as_deref().and_then(|s| s.parse().ok()).unwrap_or_default();
                     let s = HacksawSession::open(Launch::demo(gid)).await.map_err(|e| e.to_string())?;
                     Ok(Arc::new(s) as Arc<dyn SlotSession>)
                 }
@@ -333,7 +333,8 @@ impl Engine {
                 s.held = r.held;
                 (s.profit, s.done, s.stop_on_win)
             };
-            if cfg.stop_before_fs && r.free_spins {
+            // a held round also stops a run that didn't ask: the driver left a bonus it can't play for the browser
+            if (cfg.stop_before_fs && r.free_spins) || r.held {
                 return self.stop_slot(if r.held { "Free spins ready · play them in your browser" } else { "Free spins triggered" });
             }
             if hit {

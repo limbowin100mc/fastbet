@@ -278,8 +278,12 @@ impl SlotSession for AvataruxSession {
         };
         let round_id = res["roundId"].as_str().unwrap_or("").to_string();
         let mut balance = res["balance"].as_f64().map(|b| (b * scale).round() as i64);
+        // A round the server still wants played (a bonus going step by step, as Delulu's and
+        // Just Slots' do) is never closed: that forfeits it. It's left for the game in the browser.
+        let unfinished = pending && !round_id.is_empty();
+        let free_spins = free_spins || unfinished;
         // the bonus is decided already; left open, the browser shows it
-        let held = hold && free_spins && !round_id.is_empty();
+        let held = (hold && free_spins && !round_id.is_empty()) || unfinished;
         if held {
             // the browser shows the bonus and what it pays
             win = 0;

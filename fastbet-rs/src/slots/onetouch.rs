@@ -9,6 +9,11 @@
 //! A round goes on (free spins) with type "SPIN" until `nextSceneState.sceneId` is "main"
 //! again. Amounts are in currency units (floats); <game> is the game category in lower case
 //! without underscores (GRAB_ME_GOLD -> grabmegold). Plain HTTPS, no browser needed.
+//! Some casinos' setups (Shuffle's) price a spin in coins: `betSizes` are coin counts and
+//! `coinValues` what a coin is worth, a spin costing betSize × coinValue; they also name a
+//! `config_id` in the launch URL, which every call carries as `configId`.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -21,6 +26,9 @@ pub struct OneTouchSession {
     base: String,
     game: String,
     token: Mutex<String>,
+    config_id: Option<String>,
+    /// (betSize, coinValue) to send for each bet level, by its minor units.
+    combos: HashMap<i64, (f64, f64)>,
     info: SessionInfo,
 }
 
@@ -32,18 +40,39 @@ pub async fn open(launch_url: &str) -> Result<OneTouchSession, SlotError> {
     };
     let http = reqwest::Client::builder().user_agent(UA).build().map_err(|e| SlotError::Bridge(e.to_string()))?;
     let base = base.trim_end_matches('/').to_string();
-    let mut s = OneTouchSession { http, base, game: String::new(), token: Mutex::new(String::new()), info: SessionInfo::default() };
+    let config_id = map.get("config_id").cloned().filter(|c| !c.is_empty());
+    let mut s = OneTouchSession { http, base, game: String::new(), token: Mutex::new(String::new()), config_id, combos: HashMap::new(), info: SessionInfo::default() };
 
-    let login = s.call("POST", "api/v2/login/platform", Some(json!({ "sessionId": session }))).await?;
+    let mut login_body = json!({ "sessionId": session });
+    if let Some(c) = &s.config_id {
+        login_body["configId"] = json!(c);
+    }
+    let login = s.call("POST", "api/v2/login/platform", Some(login_body)).await?;
     let category = login["userSession"]["gameCategory"].as_str().unwrap_or_default();
     s.game = category.to_ascii_lowercase().replace('_', "");
     if s.game.is_empty() {
         return Err(SlotError::Provider("OneTouch didn't say which game this is".into()));
     }
-    let state = s.call("GET", &format!("api/v2/slots/{}/get_state", s.game), None).await?;
+    let query = s.config_id.as_ref().map(|c| format!("?configId={c}")).unwrap_or_default();
+    let state = s.call("GET", &format!("api/v2/slots/{}/get_state{query}", s.game), None).await?;
     let cfg = &state["config"];
-    let bet_levels: Vec<BetLevel> = cfg["betSizes"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).map(|b| BetLevel { raw: b.to_string(), minor: minor(b) }).collect()).unwrap_or_default();
-    let default_bet = cfg["betSizeIndex"].as_u64().and_then(|i| bet_levels.get(i as usize)).map(|b| b.minor);
+    let floats = |k: &str| cfg[k].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<f64>>()).unwrap_or_default();
+    let sizes = floats("betSizes");
+    let mut coins = floats("coinValues");
+    if coins.is_empty() {
+        coins.push(1.0);
+    }
+    let pick = |list: &[f64], k: &str| cfg[k].as_u64().and_then(|i| list.get(i as usize).copied());
+    let default_coin = pick(&coins, "coinValueIndex").unwrap_or(coins[0]);
+    let default_bet = pick(&sizes, "betSizeIndex").map(|b| minor(b * default_coin));
+    // the game's own coin value first, so a bet it can make keeps it
+    for coin in std::iter::once(default_coin).chain(coins.iter().copied()) {
+        for size in &sizes {
+            s.combos.entry(minor(size * coin)).or_insert((*size, coin));
+        }
+    }
+    let mut bet_levels: Vec<BetLevel> = s.combos.keys().map(|m| BetLevel { raw: format!("{:.2}", *m as f64 / 100.0), minor: *m }).collect();
+    bet_levels.sort_by_key(|b| b.minor);
     let mut features: Vec<Feature> = cfg["featureBuyInData"]
         .as_object()
         .map(|o| {
@@ -132,13 +161,17 @@ impl OneTouchSession {
     /// Plays `kind` and then the rest of the round; returns the last reply plus the first's cost.
     async fn finish(&self, bet: i64, kind: &str, hold: bool, t0: std::time::Instant) -> Result<SpinResult, SlotError> {
         let path = format!("api/v2/slots/{}/play", self.game);
-        let bet_units = bet as f64 / 100.0;
+        let (size, coin) = *self.combos.get(&bet).ok_or_else(|| SlotError::Provider("Pick one of the game's bet sizes".into()))?;
         let mut cost = 0i64;
         let mut steps = 0usize;
         let mut kind = kind.to_string();
         let mut free_spins = false;
         loop {
-            let r = self.call("POST", &path, Some(json!({ "betSize": bet_units, "coinValue": 1, "type": kind }))).await?;
+            let mut body = json!({ "betSize": size, "coinValue": coin, "type": kind });
+            if let Some(c) = &self.config_id {
+                body["configId"] = json!(c);
+            }
+            let r = self.call("POST", &path, Some(body)).await?;
             if steps == 0 {
                 cost = r["totalBet"].as_f64().map(minor).unwrap_or(bet);
             }
