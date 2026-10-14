@@ -9,7 +9,27 @@ use crate::originals::Game;
 
 pub const HISTORY_MAX: usize = 500;
 const SERIES_MAX: usize = 4000;
-const TOP_N: usize = 8;
+/// Top multipliers and streaks kept per list (the pane's cards scroll through them).
+const TOP_N: usize = 50;
+
+/// One of the session's best wins, by the multiplier it paid.
+#[derive(Clone, Copy, Debug)]
+pub struct TopMulti {
+    /// What the bet paid out at: Limbo's target, not the roll (a 3,211× roll on a 100× target is 100×).
+    pub multi: f64,
+    /// What that bet won or lost.
+    pub profit: Units,
+    /// The bet's number in the session.
+    pub n: u64,
+}
+
+/// A run of wins, or of losses.
+#[derive(Clone, Copy, Debug)]
+pub struct Streak {
+    pub len: u32,
+    /// What its bets won or lost together.
+    pub profit: Units,
+}
 
 #[derive(Clone, Debug)]
 pub enum HistEntry {
@@ -36,9 +56,11 @@ pub struct Stats {
     pub hi_bet: Units,
     /// >0 wins in a row, <0 losses in a row
     pub streak: i64,
-    pub win_streaks: Vec<u32>,
-    pub loss_streaks: Vec<u32>,
-    pub top_multi: Vec<f64>,
+    /// What the current streak won or lost so far.
+    streak_profit: Units,
+    pub win_streaks: Vec<Streak>,
+    pub loss_streaks: Vec<Streak>,
+    pub top_multi: Vec<TopMulti>,
     /// Profit after every `step` bets, as coin value, for the chart.
     pub series: Vec<f64>,
     step: usize,
@@ -49,8 +71,10 @@ pub struct Stats {
     pub last_at: Option<Instant>,
 }
 
-fn push_top<T: PartialOrd + Copy>(list: &mut Vec<T>, v: T) {
-    let i = list.iter().position(|x| v > *x).unwrap_or(list.len());
+/// Keeps `list` the best `TOP_N` by `key`, highest first (a tie goes after the older one).
+fn push_top<T, K: PartialOrd>(list: &mut Vec<T>, v: T, key: impl Fn(&T) -> K) {
+    let k = key(&v);
+    let i = list.iter().position(|x| k > key(x)).unwrap_or(list.len());
     if i >= TOP_N {
         return;
     }
@@ -81,16 +105,21 @@ impl Stats {
         if r.win {
             self.wins += 1;
             if self.streak < 0 {
-                push_top(&mut self.loss_streaks, (-self.streak) as u32);
+                let ended = self.current_streak();
+                push_top(&mut self.loss_streaks, ended, |s| s.len);
+                self.streak_profit = 0;
             }
             self.streak = if self.streak > 0 { self.streak + 1 } else { 1 };
         } else {
             self.losses += 1;
             if self.streak > 0 {
-                push_top(&mut self.win_streaks, self.streak as u32);
+                let ended = self.current_streak();
+                push_top(&mut self.win_streaks, ended, |s| s.len);
+                self.streak_profit = 0;
             }
             self.streak = if self.streak < 0 { self.streak - 1 } else { -1 };
         }
+        self.streak_profit += r.profit;
         if r.hit {
             self.hits += 1;
         }
@@ -102,8 +131,8 @@ impl Stats {
         self.hi_win = self.hi_win.max(r.profit);
         self.hi_loss = self.hi_loss.max(-r.profit);
         self.hi_bet = self.hi_bet.max(r.amount);
-        if r.outcome.is_finite() {
-            push_top(&mut self.top_multi, r.outcome);
+        if r.win && r.target.is_finite() {
+            push_top(&mut self.top_multi, TopMulti { multi: r.target, profit: r.profit, n: self.bets }, |m| m.multi);
         }
         self.latency = if self.latency > 0.0 { self.latency * 0.8 + r.ms * 0.2 } else { r.ms };
         self.times.push_back(now);
@@ -155,27 +184,31 @@ impl Stats {
         (self.wagered > 0).then(|| ((self.wagered + self.profit) * 1_000_000 / self.wagered) as f64 / 10_000.0)
     }
 
+    fn current_streak(&self) -> Streak {
+        Streak { len: self.streak.unsigned_abs() as u32, profit: self.streak_profit }
+    }
+
     pub fn best_win_streak(&self) -> u32 {
-        self.win_streaks.first().copied().unwrap_or(0).max(if self.streak > 0 { self.streak as u32 } else { 0 })
+        self.win_streaks_now().first().map_or(0, |s| s.len)
     }
 
     pub fn worst_loss_streak(&self) -> u32 {
-        self.loss_streaks.first().copied().unwrap_or(0).max(if self.streak < 0 { (-self.streak) as u32 } else { 0 })
+        self.loss_streaks_now().first().map_or(0, |s| s.len)
     }
 
     /// Win streak list including the current one.
-    pub fn win_streaks_now(&self) -> Vec<u32> {
+    pub fn win_streaks_now(&self) -> Vec<Streak> {
         let mut v = self.win_streaks.clone();
         if self.streak > 0 {
-            push_top(&mut v, self.streak as u32);
+            push_top(&mut v, self.current_streak(), |s| s.len);
         }
         v
     }
 
-    pub fn loss_streaks_now(&self) -> Vec<u32> {
+    pub fn loss_streaks_now(&self) -> Vec<Streak> {
         let mut v = self.loss_streaks.clone();
         if self.streak < 0 {
-            push_top(&mut v, (-self.streak) as u32);
+            push_top(&mut v, self.current_streak(), |s| s.len);
         }
         v
     }
@@ -295,4 +328,45 @@ fn local_offset_secs() -> i64 {
         #[allow(unreachable_code)]
         0
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bet(target: f64, outcome: f64, win: bool, profit: Units) -> BetRecord {
+        BetRecord {
+            at: SystemTime::now(),
+            nonce: None,
+            currency: "btc".into(),
+            target,
+            outcome,
+            win,
+            hit: false,
+            amount: 100,
+            payout: 100 + profit,
+            profit,
+            ms: 0.0,
+            game: None,
+            round: None,
+        }
+    }
+
+    #[test]
+    fn streaks_and_multipliers_keep_what_they_won() {
+        let mut s = Stats::fresh("btc", 8);
+        // W2 (+200), L3 (-300), W1 (+100), then a loss run still going (L1, -100)
+        let bets = [(2.0, 3211.0, true, 100), (3.0, 3.5, true, 200), (100.0, 99.0, false, -100), (2.0, 1.0, false, -100), (2.0, 1.5, false, -100), (2.5, 2.5, true, 150), (2.0, 1.1, false, -100)];
+        for (target, roll, win, p) in bets {
+            s.settle(&bet(target, roll, win, p), 8);
+        }
+        let wins: Vec<_> = s.win_streaks_now().iter().map(|st| (st.len, st.profit)).collect();
+        assert_eq!(wins, vec![(2, 300), (1, 150)]);
+        let losses: Vec<_> = s.loss_streaks_now().iter().map(|st| (st.len, st.profit)).collect();
+        assert_eq!(losses, vec![(3, -300), (1, -100)], "the run still going counts too");
+        assert_eq!((s.best_win_streak(), s.worst_loss_streak()), (2, 3));
+        // the multiplier each win paid (not the roll), and losses not at all
+        let top: Vec<_> = s.top_multi.iter().map(|m| (m.multi, m.profit, m.n)).collect();
+        assert_eq!(top, vec![(3.0, 200, 2), (2.5, 150, 6), (2.0, 100, 1)]);
+    }
 }

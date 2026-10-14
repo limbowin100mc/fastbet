@@ -1,6 +1,6 @@
 [package]
 name = "fastbet"
-version = "3.11.0"
+version = "3.12.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false
@@ -46,6 +46,10 @@ rodio = { version = "0.20", default-features = false }
 # logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+# the app icon inside the Windows exe (build.rs)
+embed-resource = "3.0"
 
 [target.'cfg(unix)'.dependencies]
 # local time zone for bet history times

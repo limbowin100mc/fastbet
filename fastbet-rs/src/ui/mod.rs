@@ -642,12 +642,13 @@ impl App {
         Ok((cur, amount))
     }
 
-    /// The stop-on-hit line for originals: only when a multiplier is set.
+    /// The stop-on-hit line for originals: the multiplier set, or any winning round when it is
+    /// empty (Limbo's empty line is its target, so a win there too).
     fn orig_hit_line(&self) -> Option<f64> {
         if !self.settings.stop_on_hit {
             return None;
         }
-        money::num(&self.settings.hit_multi).filter(|h| *h > 0.0)
+        Some(money::num(&self.settings.hit_multi).filter(|h| *h > 0.0).unwrap_or(1.0))
     }
 
     /// FASTBET_ORIG_PLAY="next {json}; next {json}; cashout": steps played into the open round
@@ -1260,7 +1261,8 @@ impl App {
             at: rec.at,
             nonce: None,
             currency: rec.currency.clone(),
-            target: 1.0,
+            // what the spin paid out at, for the top multipliers
+            target: rec.multiplier,
             outcome: rec.multiplier,
             // a round only counts as a win when it pays back at least the stake
             win: rec.multiplier >= 1.0,

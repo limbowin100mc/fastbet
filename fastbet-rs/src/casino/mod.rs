@@ -575,6 +575,15 @@ impl CasinoError {
             _ => false,
         }
     }
+
+    /// "Insufficient balance" and friends (`BALANCE_NOT_ENOUGH`, "Not enough funds" …): the
+    /// account can't pay for the bet, and no retry helps until the user deposits.
+    pub fn is_balance(&self) -> bool {
+        let CasinoError::Server(m) = self else { return false };
+        let m = m.to_ascii_lowercase().replace('_', " ");
+        let money = ["balance", "funds", "money"].iter().any(|k| m.contains(k));
+        money && ["insufficient", "not enough", "too low", "low balance"].iter().any(|k| m.contains(k))
+    }
 }
 
 /// Which slots to list.

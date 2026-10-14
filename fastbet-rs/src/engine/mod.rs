@@ -40,6 +40,7 @@ pub enum Command {
     StopAuto,
     /// Force restart betting. `always`: a run that ends by itself starts again from the base bet.
     /// `on_error`: an error doesn't end the run, it bets on with the same bet size and counters.
+    /// Neither restarts a run that ran out of balance.
     ForceRestart { always: bool, on_error: bool },
     /// Finish the run after the next winning bet.
     StopOnNextWin,
@@ -221,12 +222,18 @@ pub struct AutoState {
 #[derive(Debug)]
 enum BetError {
     Cancelled,
+    /// The account can't pay for the bet: an auto run stops for good, force restart or not.
+    Balance(String),
     Other(String),
 }
 
 impl From<CasinoError> for BetError {
     fn from(e: CasinoError) -> Self {
-        BetError::Other(e.to_string())
+        if e.is_balance() {
+            BetError::Balance(e.to_string())
+        } else {
+            BetError::Other(e.to_string())
+        }
     }
 }
 
@@ -252,7 +259,8 @@ enum Ending {
     Stopped,
     /// The run ended by itself (a stop, its number of bets, an error): force restart starts it again.
     Over(String),
-    /// The casino kept a round open: only the user can finish it, on the board.
+    /// Only the user can sort it out (a round the casino kept open, no money left for the bet):
+    /// force restart leaves it stopped.
     Stuck(String),
 }
 
@@ -393,7 +401,7 @@ impl Engine {
                         let keep: KeepGoing = Arc::new(|| true);
                         match me.place_bet(Wager::Limbo(req), hit_line, keep).await {
                             Ok(_) | Err(BetError::Cancelled) => {}
-                            Err(BetError::Other(e)) => {
+                            Err(BetError::Balance(e) | BetError::Other(e)) => {
                                 tracing::warn!("bet failed: {e}");
                                 me.flash(e);
                             }
@@ -415,7 +423,7 @@ impl Engine {
                         match me.place_bet(Wager::Original(bet), hit_line, keep).await {
                             Ok(_) => {}
                             Err(BetError::Cancelled) => me.emit(Event::RoundFailed { game }),
-                            Err(BetError::Other(e)) => me.original_failed(game, e).await,
+                            Err(BetError::Balance(e) | BetError::Other(e)) => me.original_failed(game, e).await,
                         }
                     });
                 }
@@ -964,6 +972,14 @@ impl Engine {
                     break Ending::Stopped;
                 }
                 Err(BetError::Cancelled) => continue,
+                // no money left: betting on, or starting again, would only wait for the next deposit
+                Err(BetError::Balance(e)) => {
+                    tracing::warn!("auto bet failed: {e}");
+                    if !self.auto_live(run) {
+                        break Ending::Stopped;
+                    }
+                    break Ending::Stuck(format!("Error: {e}"));
+                }
                 Err(BetError::Other(e)) => {
                     tracing::warn!("auto bet failed: {e}");
                     if !self.auto_live(run) {
@@ -1014,12 +1030,14 @@ impl Engine {
             };
             if hit && self.auto_live(run) {
                 self.auto.lock().last_hit = Some(r.outcome);
-                break Ending::Over(format!("HIT {}", fmt_multi(r.outcome)));
             }
-            // asked for, like Stop: force restart leaves it stopped
+            // asked for, like Stop: force restart leaves it stopped, even when the win is also a hit
             if stop_on_win && r.win && self.auto_live(run) {
-                self.stop_auto("Stopped on win");
+                self.stop_auto(if hit { format!("HIT {} · stopped on win", fmt_multi(r.outcome)) } else { "Stopped on win".into() });
                 break Ending::Stopped;
+            }
+            if hit && self.auto_live(run) {
+                break Ending::Over(format!("HIT {}", fmt_multi(r.outcome)));
             }
             if !self.auto_live(run) {
                 break Ending::Stopped;

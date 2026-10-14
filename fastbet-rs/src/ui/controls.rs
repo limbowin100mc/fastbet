@@ -243,7 +243,7 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
         }
     }
     if s.stop_on_hit {
-        parts.push(format!("Hit {}×", s.hit_multi.trim()));
+        parts.push(if s.hit_multi.trim().is_empty() { "Hit on win".to_string() } else { format!("Hit {}×", s.hit_multi.trim()) });
     }
     let summary = if parts.is_empty() { "Off".to_string() } else { parts.join(" · ") };
     let mut open = app.settings.open.stops;
@@ -269,12 +269,12 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
         if field(ui, "Max bet", &mut app.settings.max_bet, "off", Some(&unit), !locked).changed() {
             app.mark_dirty();
         }
-        // on Limbo an empty hit line means the target; the other games have none
+        // an empty hit line stops on a win: Limbo's target, any winning round elsewhere
         let help = if app.screen == super::Screen::Limbo {
             let target = app.target().map(|t| format!(" ({})", fmt_multi(t))).unwrap_or_default();
             format!("Stops the run on a bet that rolls at least this multiplier. Empty: the target{target}.")
         } else {
-            "Stops the run on a round that pays at least this many times the stake.".into()
+            "Stops the run on a round that pays at least this many times the stake. Empty: any winning round.".into()
         };
         let mut on = app.settings.stop_on_hit;
         if check_field_help(ui, "Stop on hit  ≥", Some(&help), &mut on, &mut app.settings.hit_multi, Some("×"), !locked) {
@@ -302,12 +302,13 @@ pub(super) fn force_restart(app: &mut App, ui: &mut Ui, w: f32) {
     fold(ui, w, "Force restart betting", summary, active, &mut open, |ui| {
         let (mut always, mut on_error) = (app.settings.force_restart, app.settings.restart_on_error);
         let help_always = "When the run ends by itself (stop profit or loss, a hit, the number of bets, max bet, an error), it starts \
-                           again at once from the base bet, with its counters back at zero. Stop and Stop on next win still end it.";
+                           again at once from the base bet, with its counters back at zero. Stop, Stop on next win and \
+                           running out of balance still end it.";
         if toggle_help(ui, "Restart always", Some(help_always), &mut always, true) {
             app.set_force_restart(always, on_error);
         }
         let help_errors = "An error doesn't stop the run: it bets again at once, with the same bet size and counters. When errors \
-                           keep coming, it waits 1, 2, 4, then 8 s between tries.";
+                           keep coming, it waits 1, 2, 4, then 8 s between tries. Insufficient balance still stops it.";
         if toggle_help(ui, "Restart on errors", Some(help_errors), &mut on_error, true) {
             app.set_force_restart(always, on_error);
         }

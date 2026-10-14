@@ -13,6 +13,8 @@ struct Mock {
     busy_once: AtomicBool,
     /// Every Limbo bet fails (the casino is down).
     down: AtomicBool,
+    /// Every bet fails for want of money.
+    broke: AtomicBool,
     /// This Limbo bet attempt (1-based, failed ones included) fails; 0 = none.
     fail_at: AtomicU32,
     attempts: AtomicU32,
@@ -33,6 +35,7 @@ impl Mock {
             rotations: AtomicU32::new(0),
             busy_once: AtomicBool::new(false),
             down: AtomicBool::new(false),
+            broke: AtomicBool::new(false),
             fail_at: AtomicU32::new(0),
             attempts: AtomicU32::new(0),
             delay_ms: AtomicU32::new(0),
@@ -53,6 +56,10 @@ impl Casino for Mock {
     async fn bet_limbo(&self, req: &BetRequest) -> Result<BetReply, CasinoError> {
         if self.down.load(Ordering::SeqCst) {
             return Err(CasinoError::ConnectionLost);
+        }
+        if self.broke.load(Ordering::SeqCst) {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(CasinoError::Server("Insufficient balance".into()));
         }
         if self.attempts.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at.load(Ordering::SeqCst) {
             return Err(CasinoError::Timeout);
@@ -97,6 +104,10 @@ impl Casino for Mock {
     }
     /// Originals: the scripted outcome is the round's payout multiplier; `{"open": true}` keeps it open.
     async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: serde_json::Value, _auto: bool) -> Result<Round, CasinoError> {
+        if self.broke.load(Ordering::SeqCst) {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(CasinoError::Server("BALANCE_NOT_ENOUGH".into()));
+        }
         self.calls.fetch_add(1, Ordering::SeqCst);
         let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak_inflight.fetch_max(now, Ordering::SeqCst);
@@ -533,6 +544,69 @@ async fn force_restart_leaves_stop_on_next_win_stopped() {
     assert_eq!((a.msg.as_str(), a.restarts), ("Stopped on win", 0));
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert!(!e.auto.lock().running, "it stays stopped");
+}
+
+#[tokio::test]
+async fn stop_on_next_win_beats_a_hit_under_force_restart() {
+    // every win is also a hit (the hit line is the target): Stop on next win must still end it
+    let (e, _rx) = engine_with(Mock::new(&[1.0, 3.0, 3.0, 3.0]));
+    e.force_restart.store(true, Ordering::SeqCst);
+    let mut c = cfg(100, 2.0);
+    c.hit_line = Some(2.0);
+    c.delay_ms = 5;
+    e.start_auto(c);
+    e.auto.lock().stop_on_win = true;
+    let a = wait_stopped(&e).await;
+    assert_eq!((a.msg.as_str(), a.restarts, a.last_hit), ("HIT 3.00× · stopped on win", 0, Some(3.0)));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!e.auto.lock().running, "it stays stopped");
+}
+
+#[tokio::test]
+async fn stop_on_next_win_ends_a_dice_run() {
+    let (e, _rx) = engine_with(Mock::new(&[0.0, 0.0, 1.98, 0.0, 1.98]));
+    e.force_restart.store(true, Ordering::SeqCst);
+    let mut c = cfg(100, 0.0);
+    c.original = Some((Game::Dice, serde_json::json!({ "target": 50.5, "condition": "above" })));
+    c.delay_ms = 5;
+    e.start_auto(c);
+    e.auto.lock().stop_on_win = true;
+    let a = wait_stopped(&e).await;
+    assert_eq!((a.msg.as_str(), a.done, a.restarts), ("Stopped on win", 3, 0));
+}
+
+#[test]
+fn balance_errors_are_told_apart() {
+    for m in ["Insufficient balance", "BALANCE_NOT_ENOUGH", "insufficient_funds", "Not enough balance", "Your balance is too low"] {
+        assert!(CasinoError::Server(m.into()).is_balance(), "{m}");
+    }
+    for m in ["Please wait and try again later", "Amount too low", "Max payout exceeded. Reduce stake.", "Insufficient permissions"] {
+        assert!(!CasinoError::Server(m.into()).is_balance(), "{m}");
+    }
+    assert!(!CasinoError::Timeout.is_balance());
+}
+
+#[tokio::test]
+async fn no_balance_ends_the_run_even_with_force_restart() {
+    // Limbo and an original, with both kinds of force restart on: the first refusal ends it for good
+    for original in [None, Some((Game::Dice, serde_json::json!({ "target": 50.5, "condition": "above" })))] {
+        let mock = Mock::new(&[]);
+        mock.broke.store(true, Ordering::SeqCst);
+        let (e, _rx) = engine_with(mock.clone());
+        e.force_restart.store(true, Ordering::SeqCst);
+        e.restart_on_error.store(true, Ordering::SeqCst);
+        let mut c = cfg(100, 2.0);
+        c.original = original;
+        e.start_auto(c);
+        let a = wait_stopped(&e).await;
+        assert!(a.msg.starts_with("Error: ") && a.msg.to_ascii_lowercase().contains("balance"), "{}", a.msg);
+        assert_eq!((a.restarts, a.errors), (0, 0));
+        // a deposit now must not bring it back
+        mock.broke.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!e.auto.lock().running, "it stays stopped");
+        assert_eq!(mock.attempts.load(Ordering::SeqCst), 1, "one bet tried, no retries");
+    }
 }
 
 #[tokio::test]

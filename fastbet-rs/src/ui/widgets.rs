@@ -794,28 +794,6 @@ pub fn check_field_help(ui: &mut Ui, text: &str, help: Option<&str>, on: &mut bo
 
 // ----------------------------------------------------------------- stats
 
-/// Row of small values, e.g. top multipliers. Wraps to the given width.
-pub fn value_chips(ui: &mut Ui, width: f32, values: &[String], color: Color32) {
-    if values.is_empty() {
-        ui.label(RichText::new("–").color(DIM).size(11.5));
-        return;
-    }
-    ui.scope(|ui| {
-        ui.set_max_width(width);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
-            for v in values {
-                let galley = ui.painter().layout_no_wrap(v.clone(), theme::font_semi(11.0), color);
-                let size = galley.size() + vec2(14.0, 6.0);
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(rect, CornerRadius::same(RADIUS_SM), alpha(color, 22));
-                p.galley(rect.min + vec2(7.0, 3.0), galley, color);
-            }
-        });
-    });
-}
-
 pub fn hsep(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, LINE));

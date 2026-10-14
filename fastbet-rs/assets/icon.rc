@@ -1,0 +1,2 @@
+// The app icon inside the Windows exe (see build.rs).
+1 ICON "icon.ico"

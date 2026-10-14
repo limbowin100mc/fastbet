@@ -756,6 +756,7 @@ fn parse_rgs(status: u16, body: &str) -> Result<Value, CallError> {
         "bet_limit_exceeded" => format!("Above Gambulls' maximum bet{}", money("maxBet").map(|m| format!(" of {m}")).unwrap_or_default()),
         "win_limit_exceeded" => "The win would be above Gambulls' maximum win".into(),
         "game_param_out_of_range" => "Gambulls refused the bet: a setting is out of range".into(),
+        c if c.contains("insufficient") || c.contains("not_enough") => "Insufficient balance".into(),
         _ => v
             .pointer("/error/message")
             .and_then(Value::as_str)

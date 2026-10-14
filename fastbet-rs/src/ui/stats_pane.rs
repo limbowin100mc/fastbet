@@ -8,7 +8,7 @@ use egui::{
 };
 
 use super::theme::{self, alpha, BG1, BG2, DIM, G1, GOLD, GREEN, LINE, LINE2, MUTED, RED, TEXT};
-use super::widgets::{self, semi, value_chips};
+use super::widgets::{self, semi};
 use super::{titlebar, App, Screen};
 use crate::money::{fmt_int, fmt_ms, fmt_multi};
 
@@ -24,6 +24,10 @@ const TOP_BAR: f32 = 56.0;
 const EDGE: f32 = 8.0;
 const DRAG: &str = "session-drag";
 const FLOAT: &str = "session-float";
+/// Height of a row in the ranked lists.
+const ROW_H: f32 = 26.0;
+/// Rows a ranked list shows before it scrolls.
+const LIST_ROWS: f32 = 5.0;
 
 struct Cell {
     cap: &'static str,
@@ -288,9 +292,15 @@ fn body(app: &mut App, ui: &mut Ui, max_h: Option<f32>) {
         if s.retries > 0 {
             grid(ui, full, vec![[cell("Busy retries", fmt_int(s.retries as i128), GOLD, "server said wait"), cell("", String::new(), TEXT, "")]]);
         }
-        chips_card(ui, full, "Top multipliers", &s.top_multi.iter().map(|m| fmt_multi(*m)).collect::<Vec<_>>(), GOLD);
-        chips_card(ui, full, "Best win streaks", &s.win_streaks_now().iter().map(|v| v.to_string()).collect::<Vec<_>>(), GREEN);
-        chips_card(ui, full, "Worst loss streaks", &s.loss_streaks_now().iter().map(|v| v.to_string()).collect::<Vec<_>>(), RED);
+        let multis: Vec<Ranked> = s.top_multi.iter().map(|m| Ranked { value: fmt_multi(m.multi), amount: prim(m.profit, true), tip: Some(format!("Bet #{}", fmt_int(m.n as i128))) }).collect();
+        let streak_rows = |list: Vec<super::stats::Streak>, mark: &str| -> Vec<Ranked> {
+            list.iter().map(|st| Ranked { value: format!("{mark}{}", st.len), amount: prim(st.profit, true), tip: None }).collect()
+        };
+        let wins = streak_rows(s.win_streaks_now(), "W");
+        let losses = streak_rows(s.loss_streaks_now(), "L");
+        list_card(ui, full, "Top multipliers", &multis, TEXT);
+        list_card(ui, full, "Best win streaks", &wins, GREEN);
+        list_card(ui, full, "Worst loss streaks", &losses, RED);
     });
 }
 
@@ -352,13 +362,76 @@ fn grid(ui: &mut Ui, width: f32, rows: Vec<[Cell; 2]>) {
     }
 }
 
-fn chips_card(ui: &mut Ui, width: f32, cap: &str, values: &[String], color: Color32) {
-    card_frame().inner_margin(Margin { left: 14, right: 14, top: 11, bottom: 12 }).show(ui, |ui| {
-        ui.set_width(width - 30.0);
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.label(semi(cap, 11.0, MUTED));
-        value_chips(ui, width - 30.0, values, color);
+/// A row of a ranked list: the value in the list's colour, what it won or lost, and a hover note.
+struct Ranked {
+    value: String,
+    amount: String,
+    tip: Option<String>,
+}
+
+/// A captioned card listing `rows` best first, one under the other. Past `LIST_ROWS` it
+/// scrolls on its own, with the edge that has more to show fading out.
+fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32) {
+    card_frame().inner_margin(Margin { left: 14, right: 10, top: 11, bottom: 8 }).show(ui, |ui| {
+        ui.set_width(width - 26.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            ui.label(semi(cap, 11.0, MUTED));
+            if rows.len() as f32 > LIST_ROWS {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    ui.label(semi(fmt_int(rows.len() as i128), 11.0, DIM));
+                });
+            }
+        });
+        if rows.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+            ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, "None yet", theme::font(11.5), DIM);
+            return;
+        }
+        let out = egui::ScrollArea::vertical().id_salt(cap).max_height(ROW_H * LIST_ROWS).auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, r) in rows.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+                let p = ui.painter();
+                if i > 0 {
+                    p.hline(rect.left()..=(rect.right() - 6.0), rect.top(), Stroke::new(1.0, LINE));
+                }
+                p.text(pos2(rect.left() + 9.0, rect.center().y), Align2::CENTER_CENTER, (i + 1).to_string(), theme::font_semi(10.5), DIM);
+                let value = p.layout_no_wrap(r.value.clone(), theme::font_semi(12.5), color);
+                let value_w = value.size().x;
+                p.galley(pos2(rect.left() + 26.0, rect.center().y - value.size().y / 2.0), value, color);
+                // clear of the scroll bar, which floats over the right edge
+                let right = rect.right() - 10.0;
+                let room = right - (rect.left() + 26.0 + value_w + 12.0);
+                widgets::fit_text(p, pos2(right, rect.center().y), Align2::RIGHT_CENTER, &r.amount, theme::font(11.5), MUTED, room);
+                if let Some(tip) = &r.tip {
+                    resp.on_hover_text(tip);
+                }
+            }
+        });
+        let (view, top, content) = (out.inner_rect, out.state.offset.y, out.content_size.y);
+        let p = ui.painter();
+        if top > 0.5 {
+            fade(p, Rect::from_min_size(view.min, vec2(view.width() - 8.0, 14.0)), BG2, true);
+        }
+        if top + view.height() < content - 0.5 {
+            fade(p, Rect::from_min_max(pos2(view.left(), view.bottom() - 14.0), pos2(view.right() - 8.0, view.bottom())), BG2, false);
+        }
     });
+}
+
+/// `color` fading to clear across `rect`: from its top edge when `from_top`, else from its bottom.
+fn fade(p: &egui::Painter, rect: Rect, color: Color32, from_top: bool) {
+    let (top, bottom) = if from_top { (color, Color32::TRANSPARENT) } else { (Color32::TRANSPARENT, color) };
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
 }
 
 /// Profit curve: line with a gradient fill, green above zero and red below.
