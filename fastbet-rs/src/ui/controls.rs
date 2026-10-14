@@ -397,7 +397,7 @@ pub(super) fn notifications(app: &mut App, ui: &mut Ui, w: f32) {
     let mut open = app.settings.open.keys;
     fold(ui, w, "Sound & hotkeys", summary, app.settings.hit_sound || app.settings.hotkeys, &mut open, |ui| {
         let mut snd = app.settings.hit_sound;
-        if toggle_help(ui, "Sound on hit", None, &mut snd, true) {
+        if toggle_help(ui, "Sound on hit", Some("Pick the sound, or your own file, in Settings → Sound."), &mut snd, true) {
             app.settings.hit_sound = snd;
             app.mark_dirty();
         }

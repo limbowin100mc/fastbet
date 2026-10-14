@@ -1,6 +1,6 @@
 [package]
 name = "fastbet"
-version = "3.13.1"
+version = "3.14.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false
@@ -40,8 +40,11 @@ resvg = { version = "0.48", default-features = false, features = ["text"] }
 wry = "0.57"
 tao = "0.37"
 
-# sound
+# sound: the hit ding, or the user's own sound file (or a video's sound), decoded by symphonia
 rodio = { version = "0.20", default-features = false }
+symphonia = { version = "0.5", default-features = false, features = ["aac", "adpcm", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+# file picker (Settings → Sound)
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 
 # logging
 tracing = "0.1"

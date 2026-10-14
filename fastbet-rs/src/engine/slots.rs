@@ -342,7 +342,7 @@ impl Engine {
                 continue;
             }
             if stop_on_win && r.win > 0 {
-                return self.stop_slot("Stopped on win");
+                return self.stop_slot(super::STOPPED_ON_WIN);
             }
             if let Some(sp) = cfg.stop_profit {
                 if profit >= sp {

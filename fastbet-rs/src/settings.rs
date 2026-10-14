@@ -120,6 +120,8 @@ pub struct Settings {
     pub stop_on_hit: bool,
     pub hit_multi: String,
     pub hit_sound: bool,
+    /// Settings → Sound: the file a hit plays; empty for the ding.
+    pub hit_sound_file: String,
     pub seed_enabled: bool,
     pub seed_every: String,
     /// Settings → Seed: every seed change uses `seed_name` as the client seed, not a random one.
@@ -375,6 +377,7 @@ impl Default for Settings {
             stop_on_hit: false,
             hit_multi: String::new(),
             hit_sound: true,
+            hit_sound_file: String::new(),
             seed_enabled: false,
             seed_every: "100".into(),
             own_seed: false,
@@ -612,6 +615,11 @@ impl Settings {
         } else {
             0
         }
+    }
+
+    /// The file a hit plays; `None` = the ding.
+    pub fn hit_sound_file(&self) -> Option<PathBuf> {
+        Some(self.hit_sound_file.trim()).filter(|s| !s.is_empty()).map(PathBuf::from)
     }
 
     /// The client seed every seed change uses; `None` = a random one.

@@ -237,6 +237,9 @@ impl From<CasinoError> for BetError {
     }
 }
 
+/// How a run that Stop on next win ended reads (the UI plays the hit sound on it).
+pub const STOPPED_ON_WIN: &str = "Stopped on win";
+
 /// What the UI holds: a command sender and an event receiver.
 pub struct EngineHandle {
     pub tx: mpsc::UnboundedSender<Command>,
@@ -1033,7 +1036,7 @@ impl Engine {
             }
             // asked for, like Stop: force restart leaves it stopped, even when the win is also a hit
             if stop_on_win && r.win && self.auto_live(run) {
-                self.stop_auto(if hit { format!("HIT {} · stopped on win", fmt_multi(r.outcome)) } else { "Stopped on win".into() });
+                self.stop_auto(if hit { format!("HIT {} · stopped on win", fmt_multi(r.outcome)) } else { STOPPED_ON_WIN.into() });
                 break Ending::Stopped;
             }
             if hit && self.auto_live(run) {

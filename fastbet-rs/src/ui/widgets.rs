@@ -1052,6 +1052,20 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             leaf(at(0.5, 0.62), at(0.04, 0.22));
             leaf(at(0.5, 0.46), at(0.96, 0.02));
         }
+        "sound" => {
+            // a speaker and two waves
+            let cone = [at(0.0, 0.36), at(0.22, 0.36), at(0.5, 0.1), at(0.5, 0.9), at(0.22, 0.64), at(0.0, 0.64)];
+            p.add(egui::Shape::closed_line(cone.to_vec(), s));
+            for k in [0.2, 0.38] {
+                let c = at(0.54, 0.5);
+                let rad = r.width() * k;
+                let pts = (0..=10).map(|i| {
+                    let a = (-50.0 + 10.0 * i as f32).to_radians();
+                    pos2(c.x + rad * a.cos(), c.y + rad * a.sin())
+                });
+                p.add(egui::Shape::line(pts.collect(), s));
+            }
+        }
         _ => {}
     }
 }

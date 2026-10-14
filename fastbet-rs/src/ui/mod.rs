@@ -140,6 +140,7 @@ pub struct App {
     pub prefs_tab: prefs::Tab,
     /// Settings → Storage: sizes on disk, and clearing.
     pub storage: prefs::StorageView,
+    pub sound_view: prefs::SoundView,
     /// The seed name field has the focus: the name is only used once typing is done.
     pub seed_name_editing: bool,
     /// The client seed the engine was last given.
@@ -263,9 +264,14 @@ impl App {
             update_open: false,
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
-            // FASTBET_PREFS=storage opens it on Storage
-            prefs_tab: if std::env::var("FASTBET_PREFS").as_deref() == Ok("storage") { prefs::Tab::Storage } else { prefs::Tab::default() },
+            // FASTBET_PREFS=storage / sound opens it on that page
+            prefs_tab: match std::env::var("FASTBET_PREFS").as_deref() {
+                Ok("storage") => prefs::Tab::Storage,
+                Ok("sound") => prefs::Tab::Sound,
+                _ => prefs::Tab::default(),
+            },
             storage: prefs::StorageView::default(),
+            sound_view: prefs::SoundView::default(),
             seed_name_editing: false,
             seed_sent: None,
             seed_applied: None,
@@ -559,6 +565,13 @@ impl App {
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// A hit, or Stop on next win ending a run: the ding or the user's file (Settings → Sound).
+    fn hit_sound(&self) {
+        if self.settings.hit_sound {
+            self.sound.play(self.settings.hit_sound_file());
+        }
     }
 
     pub fn ready(&self) -> bool {
@@ -1330,8 +1343,8 @@ impl App {
         if hits::is_hit_spin(&rec) {
             hits::record_spin(self, n, &rec);
         }
-        if rec.hit && self.settings.hit_sound {
-            self.sound.ding();
+        if rec.hit {
+            self.hit_sound();
         }
         self.spins.push_front(rec);
         if self.spins.len() > 500 {
@@ -1478,9 +1491,7 @@ impl App {
                     }
                     if hit {
                         self.hit_badge_n = Some(n);
-                        if self.settings.hit_sound {
-                            self.sound.ding();
-                        }
+                        self.hit_sound();
                     }
                     self.pop_at = Some(Instant::now());
                 }
@@ -1491,6 +1502,10 @@ impl App {
                 Event::Auto(a) => {
                     if a.running && !self.auto.running {
                         self.hit_badge_n = None;
+                    }
+                    // a win that was also a hit played it with the bet
+                    if self.auto.running && !a.running && a.msg == engine::STOPPED_ON_WIN {
+                        self.hit_sound();
                     }
                     self.auto = a;
                 }
@@ -1522,6 +1537,9 @@ impl App {
                 Event::Slot(st) => {
                     // FASTBET_SLOT_RUN=1: start spinning as soon as the session is up (UI work)
                     let auto = std::env::var("FASTBET_SLOT_RUN").is_ok() && st.info.is_some() && !st.running && self.slot.info.is_none() && st.done == 0;
+                    if self.slot.running && !st.running && st.msg == engine::STOPPED_ON_WIN {
+                        self.hit_sound();
+                    }
                     self.slot = st;
                     if auto {
                         self.settings.slot_demo = true;

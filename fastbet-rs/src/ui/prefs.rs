@@ -1,13 +1,15 @@
 //! The Settings window (account menu → Settings): app-wide options, one category at a time
 //! from the list on the left.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use egui::{pos2, vec2, Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, Ui};
 
 use super::theme::{self, alpha, BG1, DIM, G1, G2, GOLD, LINE, MUTED, TEXT, TEXT2};
 use super::widgets::{self, Btn};
-use super::App;
+use super::{sound, App};
 use crate::settings::{clean_seed_name, SeedChars, RANDOM_SEED_DEFAULT, RANDOM_SEED_LEN, SEED_NAME_MAX};
 use crate::storage::{self, fmt_bytes, Part, Report};
 
@@ -20,15 +22,17 @@ const BODY_H: f32 = 500.0;
 pub enum Tab {
     #[default]
     Seed,
+    Sound,
     Storage,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Tab::Seed, Tab::Storage];
+    const ALL: [Tab; 3] = [Tab::Seed, Tab::Sound, Tab::Storage];
 
     fn name(self) -> &'static str {
         match self {
             Tab::Seed => "Seed",
+            Tab::Sound => "Sound",
             Tab::Storage => "Storage",
         }
     }
@@ -36,9 +40,18 @@ impl Tab {
     fn icon(self) -> &'static str {
         match self {
             Tab::Seed => "seed",
+            Tab::Sound => "sound",
             Tab::Storage => "stack",
         }
     }
+}
+
+/// Settings → Sound: the file picker while it's open, and what the last check of the picked file found.
+#[derive(Default)]
+pub struct SoundView {
+    pick: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// The file checked, and whether it plays (with its length, when the file says).
+    checked: Option<(PathBuf, Result<Option<Duration>, String>)>,
 }
 
 /// Settings → Storage: the last sizes measured, a measure or clear running, and what it did.
@@ -52,8 +65,11 @@ pub struct StorageView {
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
+    take_picked_sound(app);
     if !app.prefs_open {
         app.seed_name_editing = false;
+        // checked again when the page opens: the file may have moved meanwhile
+        app.sound_view.checked = None;
         return;
     }
     let mut close = false;
@@ -96,6 +112,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     ui.set_width(w);
                     match app.prefs_tab {
                         Tab::Seed => seed(app, ui, w),
+                        Tab::Sound => sound_page(app, ui, w),
                         Tab::Storage => storage_page(app, ui, w),
                     }
                 });
@@ -263,6 +280,131 @@ fn open_folder(dir: &std::path::Path) {
     let _ = std::process::Command::new("open").arg(dir).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
+/// Opens the system's file picker on a worker thread; `take_picked_sound` picks up the answer.
+fn pick_sound(app: &mut App) {
+    let (tx, rx) = mpsc::channel();
+    let repaint = app.repaint.clone();
+    let dir = app.settings.hit_sound_file().and_then(|p| p.parent().map(Path::to_path_buf));
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose the hit sound")
+            .add_filter("Sound or video", sound::EXTENSIONS)
+            .add_filter("All files", &["*"]);
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let _ = tx.send(dialog.pick_file());
+        repaint();
+    });
+    app.sound_view.pick = Some(rx);
+}
+
+/// A file chosen in the picker becomes the hit sound (and turns it on).
+fn take_picked_sound(app: &mut App) {
+    let Some(rx) = &app.sound_view.pick else { return };
+    let picked = match rx.try_recv() {
+        Ok(picked) => picked,
+        Err(mpsc::TryRecvError::Empty) => return,
+        Err(mpsc::TryRecvError::Disconnected) => None,
+    };
+    app.sound_view.pick = None;
+    if let Some(path) = picked {
+        app.sound.stop();
+        app.settings.hit_sound_file = path.to_string_lossy().into_owned();
+        app.settings.hit_sound = true;
+        app.mark_dirty();
+    }
+}
+
+fn sound_page(app: &mut App, ui: &mut Ui, w: f32) {
+    heading(ui, "Sound", "What plays when a bet hits, or when Stop on next win ends a run.");
+    let file = app.settings.hit_sound_file();
+    if let Some(path) = &file {
+        if app.sound_view.checked.as_ref().is_none_or(|(p, _)| p != path) {
+            app.sound_view.checked = Some((path.clone(), sound::check(path)));
+        }
+    }
+    let checked = file.as_ref().and(app.sound_view.checked.as_ref()).map(|(_, r)| r.clone());
+    let playing = app.sound.playing();
+    if playing {
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+    let picking = app.sound_view.pick.is_some();
+    let help = "Plays when a bet reaches Stop on hit (on slots: Stop on multiplier) and when Stop on next win ends a run. \
+                Pick a sound file, or a video to play its sound. FastBet plays it from where it is on your PC, so leave \
+                the file there.";
+    let state = if app.settings.hit_sound { widgets::semi("On", 11.5, G2) } else { widgets::semi("Off", 11.5, DIM) };
+    widgets::card(ui, w, "Hit sound", Some(help), Some(state), |ui| {
+        let mut on = app.settings.hit_sound;
+        if widgets::toggle(ui, "Sound on hit", &mut on, true) {
+            app.settings.hit_sound = on;
+            app.mark_dirty();
+        }
+        let mut reset = false;
+        widgets::row(ui, 18.0, |ui| {
+            widgets::caption(ui, "Sound");
+            if file.is_some() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let link = ui.add(egui::Label::new(widgets::semi("Use the ding", 12.0, G1)).sense(Sense::click()));
+                    reset = link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                });
+            }
+        });
+        let mut play = false;
+        let mut choose = false;
+        widgets::row(ui, widgets::FIELD_H, |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                choose = widgets::button(ui, if picking { "Choosing…" } else { "Choose file" }, Btn::Ghost, !picking, Some(108.0)).clicked();
+                play = widgets::button(ui, if playing { "Stop" } else { "Play" }, Btn::Ghost, true, Some(72.0)).clicked();
+                let name = match &file {
+                    Some(p) => p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy()).into_owned(),
+                    None => "Ding".to_string(),
+                };
+                let len = checked.clone().and_then(Result::ok).flatten();
+                let path = file.as_ref().map(|p| p.display().to_string());
+                sound_name(ui, &name, len, path.as_deref());
+            });
+        });
+        if let Some(Err(why)) = &checked {
+            widgets::readout(ui, format!("Can't play this file: {why}. Hits play the ding instead."), TEXT2, GOLD);
+        }
+        if reset {
+            app.sound.stop();
+            app.settings.hit_sound_file.clear();
+            app.mark_dirty();
+        } else if choose {
+            pick_sound(app);
+        } else if play {
+            if playing {
+                app.sound.stop();
+            } else {
+                app.sound.play(file.clone());
+            }
+        }
+    });
+}
+
+/// The sound's name in a recessed box like the fields, its length on the right.
+fn sound_name(ui: &mut Ui, name: &str, len: Option<Duration>, path: Option<&str>) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), widgets::FIELD_H), Sense::hover());
+    let p = ui.painter();
+    p.rect(rect, CornerRadius::same(theme::RADIUS), theme::BG, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+    let mut right = rect.right() - 12.0;
+    if let Some(d) = len {
+        let secs = (d.as_secs_f32().round() as u64).max(1);
+        let g = p.layout_no_wrap(format!("{}:{:02}", secs / 60, secs % 60), theme::font_semi(11.5), DIM);
+        right -= g.size().x;
+        p.galley(pos2(right, rect.center().y - g.size().y / 2.0), g, DIM);
+        right -= 10.0;
+    }
+    let color = if path.is_some() { TEXT } else { TEXT2 };
+    widgets::fit_text(p, pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, name, theme::font_semi(13.0), color, right - rect.left() - 12.0);
+    if let Some(path) = path {
+        resp.on_hover_text(path);
+    }
 }
 
 fn heading(ui: &mut Ui, title: &str, sub: &str) {
