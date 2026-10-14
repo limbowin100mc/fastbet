@@ -18,7 +18,9 @@ pub enum Mode {
 #[serde(rename_all = "lowercase")]
 pub enum Unit {
     Coin,
-    Usd,
+    /// Amounts in fiat: `Settings::fiat` where the casino offers it, else USD.
+    #[serde(rename = "usd")]
+    Fiat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +104,8 @@ pub struct Settings {
     /// Empty = follow the currency selected on the site.
     pub currency: String,
     pub unit: Unit,
+    /// The fiat amounts are shown and typed in ("usd", "eur" …); casinos that only know USD use USD.
+    pub fiat: String,
     pub amount: String,
     pub target: String,
     pub count: String,
@@ -356,6 +360,7 @@ impl Default for Settings {
             mode: Mode::Manual,
             currency: String::new(),
             unit: Unit::Coin,
+            fiat: "usd".into(),
             amount: String::new(),
             target: "2".into(),
             count: "0".into(),

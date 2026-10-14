@@ -53,7 +53,8 @@ pub enum Command {
     SetConcurrency(u32),
     /// Slot catalog query; answered with `Event::Slots`.
     ListSlots { kind: SlotListKind, filter: crate::casino::SlotFilter },
-    OpenSlot { game: crate::slots::SlotGame, mode: crate::slots::PlayMode, currency: String },
+    /// `currency` pays for real spins; `fiat` is the money the game shows, where the casino lets us pick.
+    OpenSlot { game: crate::slots::SlotGame, mode: crate::slots::PlayMode, currency: String, fiat: String },
     CloseSlot,
     StartSlot(slots::SlotConfig),
     StopSlot,
@@ -501,8 +502,8 @@ impl Engine {
                         me.emit(Event::Slots { kind, skip, games, error });
                     });
                 }
-                Command::OpenSlot { game, mode, currency } => {
-                    tokio::spawn(self.clone().open_slot(game, mode, currency));
+                Command::OpenSlot { game, mode, currency, fiat } => {
+                    tokio::spawn(self.clone().open_slot(game, mode, currency, fiat));
                 }
                 Command::CloseSlot => {
                     let me = self.clone();

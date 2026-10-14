@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::*;
 use crate::bridge::{Bridge, BridgeRequest};
+use crate::currency::is_fiat;
 use crate::money::{f64_from_json, format_units, parse_units, to_f64};
 use crate::originals::{mines_state, Game, Round, Step, Tables};
 use super::creds::Creds;
@@ -65,7 +66,9 @@ pub const MIRRORS: &[&str] = &[
     "disorder6.com", "disorder7.com", "disorder8.com", "disorder9.com", "disorder10.com", "disorder11.com",
 ];
 
-const PRICES: &str = "query FastbetPrices { cryptoPrices(currency: USD) { name price } }";
+// Like the site's GetPrices: coin prices in USD, and `fiatPrices`, how many of each fiat Shuffle
+// shows amounts in buy one USD (EUR 0.89, JPY 158 …).
+const PRICES: &str = "query FastbetPrices { cryptoPrices(currency: USD) { name price } fiatPrices { name price } }";
 const ME: &str = "query FastbetMe { me { id username account { balances { currency amount: availableAmount } } } }";
 const SEEDS: &str = "query FastbetSeeds { currentGameSeeds { id clientSeed hashedSeed status currentNonce } }";
 const ROTATE: &str = "mutation FastbetSeed($clientSeed: String!) { gameSeedChangeAndReveal(newClientSeed: $clientSeed) { \
@@ -429,14 +432,36 @@ impl Shuffle {
 
     fn apply_rates(&self, data: &Value) {
         let Some(list) = data.get("cryptoPrices").and_then(Value::as_array) else { return };
+        let per_usd: Vec<(String, f64)> = data
+            .get("fiatPrices")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| Some((f.get("name")?.as_str()?.to_ascii_lowercase(), f.get("price").and_then(f64_from_json)?)))
+            .filter(|(_, r)| *r > 0.0)
+            .collect();
         {
             let mut m = self.market.lock();
+            // the coins, and the fiat wallets (CAD, BRL …) Shuffle prices next to them
             for c in list {
                 let Some(name) = c.get("name").and_then(Value::as_str) else { continue };
                 let name = name.to_ascii_lowercase();
                 let price = c.get("price").and_then(f64_from_json).unwrap_or(0.0);
                 let hidden = HIDDEN.contains(&name.as_str());
-                m.currencies.insert(name, CurrencyInfo { decimals: DECIMALS, price, hidden });
+                let fiat = is_fiat(&name) || per_usd.iter().any(|(f, _)| *f == name);
+                m.currencies.insert(name, CurrencyInfo { decimals: DECIMALS, price, hidden, fiat });
+            }
+            // the fiats amounts can be shown in, at the site's own rates
+            for (name, rate) in &per_usd {
+                let info = CurrencyInfo { decimals: DECIMALS, price: 1.0 / rate, hidden: false, fiat: true };
+                m.currencies.insert(name.clone(), info);
+            }
+            if !per_usd.is_empty() {
+                // the site's picker lists them alphabetically
+                let mut fiats: Vec<String> = per_usd.into_iter().map(|(f, _)| f).collect();
+                fiats.sort();
+                m.fiats = fiats;
             }
         }
         self.publish();
@@ -695,7 +720,7 @@ impl Casino for Shuffle {
         Ok(vec![])
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str, _fiat: &str) -> Result<String, CasinoError> {
         Err(CasinoError::Server("Slots aren't available on Shuffle yet".into()))
     }
 

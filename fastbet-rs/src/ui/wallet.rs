@@ -1,53 +1,23 @@
 //! The balance pill on the top bar and its wallet dropdown: pick the coin to
-//! bet with, show balances in fiat or crypto, hide empty wallets.
+//! bet with, show balances in fiat or crypto (and which fiat), hide empty wallets.
 
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Frame, Margin, Rect, Sense, Stroke, StrokeKind, Ui};
 
-use super::theme::{self, alpha, mix, BG, BG1, BG2, BG3, DIM, G1, LINE, LINE2, MUTED, TEXT, TEXT2};
+use super::theme::{self, alpha, BG, BG1, BG2, BG3, DIM, G1, LINE, LINE2, MUTED, TEXT, TEXT2};
 use super::widgets::{self, semi};
-use super::App;
-use crate::money::{format_units, fmt_usd};
+use super::{coins, App};
+use crate::currency;
+use crate::money::{self, format_units};
 use crate::settings::Unit;
-
-/// Brand-ish colour for a coin symbol, grey for unknown ones.
-fn coin_color(sym: &str) -> Color32 {
-    match sym.to_ascii_lowercase().as_str() {
-        "btc" => Color32::from_rgb(0xf7, 0x93, 0x1a),
-        "eth" => Color32::from_rgb(0x62, 0x7e, 0xea),
-        "ltc" => Color32::from_rgb(0xbf, 0xbb, 0xbb),
-        "bnb" => Color32::from_rgb(0xf3, 0xba, 0x2f),
-        "xrp" => Color32::from_rgb(0xd0, 0xd4, 0xdc),
-        "usdt" => Color32::from_rgb(0x26, 0xa1, 0x7b),
-        "usdc" => Color32::from_rgb(0x27, 0x75, 0xca),
-        "dai" => Color32::from_rgb(0xf5, 0xac, 0x37),
-        "doge" => Color32::from_rgb(0xc2, 0xa6, 0x33),
-        "trx" => Color32::from_rgb(0xef, 0x00, 0x27),
-        "sol" => Color32::from_rgb(0x9b, 0x5d, 0xe5),
-        "matic" | "pol" => Color32::from_rgb(0x82, 0x47, 0xe5),
-        "shib" => Color32::from_rgb(0xf0, 0x6b, 0x25),
-        "ton" => Color32::from_rgb(0x00, 0x98, 0xea),
-        "chips" => G1,
-        _ => Color32::from_rgb(0x7c, 0x86, 0x9c),
-    }
-}
-
-fn coin_icon(p: &egui::Painter, center: egui::Pos2, radius: f32, sym: &str) {
-    let c = coin_color(sym);
-    p.circle_filled(center, radius, c);
-    let letter: String = sym.chars().next().map(|ch| ch.to_ascii_uppercase().to_string()).unwrap_or_default();
-    p.text(center, Align2::CENTER_CENTER, letter, theme::font_bold(radius * 1.15), Color32::WHITE);
-}
 
 /// One line for a wallet amount, following the display mode.
 fn amount_text(app: &App, cur: &str, units: i128) -> String {
-    match (app.usd_mode(), app.info(cur)) {
-        (true, Some(i)) if i.price > 0.0 => fmt_usd(app.usd_value(units, cur).unwrap_or(0.0)),
-        (_, Some(i)) => format_units(units, i.decimals, 8),
-        _ => "–".into(),
+    let Some(info) = app.info(cur) else { return "–".into() };
+    match app.fiat_value(units, cur) {
+        // dust shows as zero, not as "$0.0000"
+        Some(v) if app.fiat_mode() => money::fmt_fiat(if v.abs() < 0.00005 { 0.0 } else { v }, &app.fiat()),
+        _ => format_units(units, info.decimals, 8),
     }
-    .replace("0.00000000", "0")
-    .replace("$0.0000", "$0.00")
-    .replace("$0.000", "$0.00")
 }
 
 /// The pill. Toggles the dropdown.
@@ -55,8 +25,7 @@ pub fn pill(app: &mut App, ui: &mut Ui) {
     let cur = app.active_currency();
     let bal = app.market.balance(&cur).unwrap_or(0);
     let main = if cur.is_empty() { "—".to_string() } else { amount_text(app, &cur, bal) };
-    let crypto_mode = !app.usd_mode();
-    let label = if crypto_mode && !cur.is_empty() { format!("{main} {}", cur.to_uppercase()) } else { main };
+    let label = if !app.fiat_mode() && !cur.is_empty() { format!("{main} {}", cur.to_uppercase()) } else { main };
 
     let font = theme::font_bold(13.5);
     let tw = ui.painter().layout_no_wrap(label.clone(), font.clone(), TEXT).size().x;
@@ -67,7 +36,7 @@ pub fn pill(app: &mut App, ui: &mut Ui) {
     p.rect(rect, CornerRadius::same(16), if hovered { BG2 } else { BG1 }, Stroke::new(1.0, if app.wallet_open { alpha(G1, 140) } else { LINE }), StrokeKind::Inside);
     p.text(pos2(rect.left() + 16.0, rect.center().y), Align2::LEFT_CENTER, label, font, TEXT);
     if !cur.is_empty() {
-        coin_icon(p, pos2(rect.left() + 16.0 + tw + 14.0, rect.center().y), 8.0, &cur);
+        coins::paint(p, pos2(rect.left() + 16.0 + tw + 14.0, rect.center().y), 16.0, app.casino(), &cur);
     }
     let c = pos2(rect.right() - 16.0, rect.center().y + (if app.wallet_open { -1.0 } else { 1.0 }));
     let dir = if app.wallet_open { -1.0 } else { 1.0 };
@@ -98,7 +67,11 @@ fn dropdown(app: &mut App, ui: &mut Ui, anchor: Rect) {
                 .show(ui, |ui| {
                     ui.set_width(width - 24.0);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    contents(app, ui, width - 24.0);
+                    if app.wallet_fiats {
+                        fiat_picker(app, ui, width - 24.0);
+                    } else {
+                        contents(app, ui, width - 24.0);
+                    }
                 });
         });
     // click outside closes it
@@ -111,8 +84,7 @@ fn dropdown(app: &mut App, ui: &mut Ui, anchor: Rect) {
     }
 }
 
-fn contents(app: &mut App, ui: &mut Ui, width: f32) {
-    // search
+fn search(app: &mut App, ui: &mut Ui, width: f32) {
     Frame::new()
         .fill(BG)
         .stroke(Stroke::new(1.0, alpha(G1, 140)))
@@ -138,32 +110,47 @@ fn contents(app: &mut App, ui: &mut Ui, width: f32) {
                 }
             });
         });
+}
 
-    // coin list
+fn contents(app: &mut App, ui: &mut Ui, width: f32) {
+    search(app, ui, width);
+
+    // coin list: the casino's coins, plus fiat wallets that hold money (Stake has ~150 fiats)
     let site = app.market.site_currency.clone().unwrap_or_default();
     let active = app.active_currency();
     let q = app.wallet_search.trim().to_ascii_lowercase();
-    let mut coins: Vec<(String, i128, f64)> = app
+    let mut list: Vec<(String, i128, f64)> = app
         .market
         .currencies
         .iter()
         .filter(|(_, c)| !c.hidden)
-        .map(|(k, _)| {
+        .map(|(k, c)| {
             let b = app.market.balance(k).unwrap_or(0);
-            (k.clone(), b, app.usd_value(b, k).unwrap_or(0.0))
+            (k.clone(), b, c.fiat)
+        })
+        .filter(|(k, b, fiat)| !fiat || *b > 0 || *k == active)
+        .map(|(k, b, _)| {
+            let usd = app.usd_value(b, &k).unwrap_or(0.0);
+            (k, b, usd)
         })
         .filter(|(k, b, _)| (q.is_empty() || k.contains(&q)) && (!app.settings.hide_empty || *b > 0 || *k == active))
         .collect();
-    coins.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    // richest first; empty wallets in Stake's order
+    list.sort_by(|a, b| {
+        let (ra, rb) = (currency::rank(&a.0), currency::rank(&b.0));
+        b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then(ra.cmp(&rb)).then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut pick: Option<String> = None;
-    let row_h = 30.0;
-    egui::ScrollArea::vertical().max_height(row_h * 6.5).auto_shrink([false, true]).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        if coins.is_empty() {
+    let (row_h, gap) = (30.0, 2.0);
+    // sized from the list itself: a size remembered from an emptier frame would clip it
+    let height = (list.len().max(1) as f32 * (row_h + gap) - gap).min(row_h * 6.5);
+    egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = gap;
+        if list.is_empty() {
             ui.label(semi("No wallets match", 11.5, DIM));
         }
-        for (k, b, _) in &coins {
+        for (k, b, _) in &list {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
             let on = *k == active;
             let p = ui.painter();
@@ -172,7 +159,7 @@ fn contents(app: &mut App, ui: &mut Ui, width: f32) {
             } else if resp.hovered() {
                 p.rect_filled(rect, CornerRadius::same(8), BG3);
             }
-            coin_icon(p, pos2(rect.left() + 18.0, rect.center().y), 8.0, k);
+            coins::paint(p, pos2(rect.left() + 18.0, rect.center().y), 16.0, app.casino(), k);
             p.text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, k.to_uppercase(), theme::font_bold(12.5), if on { G1 } else { TEXT });
             let amt = amount_text(app, k, *b);
             p.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, amt, theme::font_semi(12.5), if *b > 0 { TEXT } else { MUTED });
@@ -182,23 +169,111 @@ fn contents(app: &mut App, ui: &mut Ui, width: f32) {
         }
     });
     if let Some(k) = pick {
+        let changed = k != active;
         app.settings.currency = if k == site { String::new() } else { k };
         app.mark_dirty();
         app.wallet_open = false;
+        if changed {
+            app.slot_money_changed();
+        }
     }
 
     widgets::hsep(ui);
 
     // toggles
     let locked = app.auto.running;
-    let mut fiat = app.usd_mode();
+    let mut fiat = app.fiat_mode();
     if widgets::toggle(ui, "Display in fiat", &mut fiat, !locked) {
-        app.set_unit(if fiat { Unit::Usd } else { Unit::Coin });
+        app.set_unit(if fiat { Unit::Fiat } else { Unit::Coin });
+    }
+    if app.market.fiats.len() > 1 {
+        fiat_row(app, ui, !locked);
     }
     let mut hide = app.settings.hide_empty;
     if widgets::toggle(ui, "Hide empty balances", &mut hide, true) {
         app.settings.hide_empty = hide;
         app.mark_dirty();
     }
-    let _ = (mix(TEXT2, DIM, 0.5), BG2);
+}
+
+/// "Fiat currency  [flag] EUR ›": opens the fiat picker.
+fn fiat_row(app: &mut App, ui: &mut Ui, enabled: bool) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), if enabled { Sense::click() } else { Sense::hover() });
+    let fiat = app.fiat();
+    let p = ui.painter();
+    let text = if enabled { TEXT2 } else { DIM };
+    p.text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, "Fiat currency", theme::font(12.5), text);
+    let c = pos2(rect.right() - 4.0, rect.center().y);
+    let edge = if enabled && resp.hovered() { TEXT } else { MUTED };
+    p.line_segment([c + vec2(-3.0, -4.0), c], Stroke::new(1.6, edge));
+    p.line_segment([c, c + vec2(-3.0, 4.0)], Stroke::new(1.6, edge));
+    let code = p.text(pos2(rect.right() - 14.0, rect.center().y), Align2::RIGHT_CENTER, fiat.to_uppercase(), theme::font_bold(12.5), if enabled { TEXT } else { DIM });
+    coins::paint(p, pos2(code.left() - 12.0, rect.center().y), 16.0, app.casino(), &fiat);
+    if enabled && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        app.wallet_fiats = true;
+        app.wallet_search.clear();
+        app.wallet_search_focused = false;
+    }
+}
+
+/// The casino's fiats in a grid, in its own order; picking one also shows amounts in fiat.
+fn fiat_picker(app: &mut App, ui: &mut Ui, width: f32) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
+    let p = ui.painter();
+    let c = pos2(rect.left() + 5.0, rect.center().y);
+    let edge = if resp.hovered() { TEXT } else { MUTED };
+    p.line_segment([c + vec2(3.0, -4.0), c], Stroke::new(1.6, edge));
+    p.line_segment([c, c + vec2(3.0, 4.0)], Stroke::new(1.6, edge));
+    p.text(pos2(rect.left() + 18.0, rect.center().y), Align2::LEFT_CENTER, "Fiat currency", theme::font_bold(13.0), TEXT);
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        app.wallet_fiats = false;
+        app.wallet_search.clear();
+        app.wallet_search_focused = false;
+        return;
+    }
+
+    search(app, ui, width);
+
+    let q = app.wallet_search.trim().to_ascii_lowercase();
+    let current = app.fiat();
+    let fiats: Vec<String> = app.market.fiats.iter().filter(|f| q.is_empty() || f.contains(&q)).cloned().collect();
+    let locked = app.auto.running;
+    let (cols, gap, row_h) = (3usize, 4.0, 30.0);
+    let mut pick: Option<String> = None;
+    let rows = fiats.len().div_ceil(cols).max(1) as f32;
+    let height = (rows * (row_h + gap) - gap).min((row_h + gap) * 7.5);
+    egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        if fiats.is_empty() {
+            ui.label(semi("No currency matches", 11.5, DIM));
+        }
+        let cell_w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32).floor();
+        for row in fiats.chunks(cols) {
+            ui.horizontal(|ui| {
+                for f in row {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(cell_w, row_h), if locked { Sense::hover() } else { Sense::click() });
+                    let on = *f == current;
+                    let p = ui.painter();
+                    if on {
+                        p.rect_filled(rect, CornerRadius::same(8), alpha(G1, 28));
+                    } else if resp.hovered() && !locked {
+                        p.rect_filled(rect, CornerRadius::same(8), BG3);
+                    }
+                    coins::paint(p, pos2(rect.left() + 18.0, rect.center().y), 18.0, app.casino(), f);
+                    let color = if on { G1 } else if locked { DIM } else { TEXT };
+                    p.text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, f.to_uppercase(), theme::font_bold(12.5), color);
+                    if !locked && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        pick = Some(f.clone());
+                    }
+                }
+            });
+        }
+    });
+    if let Some(f) = pick {
+        app.set_fiat(&f);
+        app.set_unit(Unit::Fiat);
+        app.wallet_fiats = false;
+        app.wallet_search.clear();
+        app.wallet_search_focused = false;
+    }
 }

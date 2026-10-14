@@ -427,8 +427,12 @@ impl CasinoId {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CurrencyInfo {
     pub decimals: u32,
+    /// USD value of one unit.
     pub price: f64,
+    /// Not money (points, sweepstakes coins): never listed in the wallet.
     pub hidden: bool,
+    /// A fiat currency: the wallet lists it only while it holds money.
+    pub fiat: bool,
 }
 
 /// Everything the UI needs from the casino's live state.
@@ -438,6 +442,9 @@ pub struct Market {
     pub wallets: BTreeMap<String, Units>,
     /// Currency the user has selected on the site.
     pub site_currency: Option<String>,
+    /// Fiat currencies the casino can show amounts in, in its own order (none: USD only).
+    /// Their USD rates are in `currencies`, like the coins'.
+    pub fiats: Vec<String>,
     pub username: Option<String>,
 }
 
@@ -595,8 +602,9 @@ pub trait Casino: Send + Sync {
     async fn provable_state(&self) -> Result<ProvableState, CasinoError>;
     /// Slot catalog.
     async fn list_slots(&self, filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError>;
-    /// Launch URL for a slot session (real money needs a logged-in token).
-    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError>;
+    /// Launch URL for a slot session (real money needs a logged-in token). `currency` pays for the
+    /// spins; `fiat` is the money the game shows, where the casino lets the player pick it.
+    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str, fiat: &str) -> Result<String, CasinoError>;
 
     /// See [`CasinoId::auto_settles`].
     fn auto_settles(&self, game: Game) -> bool {

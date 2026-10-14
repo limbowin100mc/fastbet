@@ -244,7 +244,7 @@ impl Gambulls {
         let user = if self.demo { None } else { Some(user_of(&rsc).ok_or(CallError::LoggedOut)?) };
         {
             let mut m = self.market.lock();
-            m.currencies.insert(CURRENCY.into(), CurrencyInfo { decimals: DECIMALS, price: 1.0, hidden: false });
+            m.currencies.insert(CURRENCY.into(), CurrencyInfo { decimals: DECIMALS, price: 1.0, hidden: false, fiat: false });
             m.site_currency = Some(CURRENCY.into());
             m.username = if self.demo { Some("Demo".into()) } else { user.as_ref().and_then(|u| u.name.clone()) };
         }
@@ -584,7 +584,7 @@ impl Casino for Gambulls {
         Ok(vec![])
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str, _fiat: &str) -> Result<String, CasinoError> {
         Err(CasinoError::Server("Slots aren't available on Gambulls yet".into()))
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fastbet"
-version = "3.10.0"
+version = "3.11.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false

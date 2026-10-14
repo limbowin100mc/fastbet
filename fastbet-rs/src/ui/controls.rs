@@ -50,13 +50,14 @@ pub(super) fn bet_card(app: &mut App, ui: &mut Ui, w: f32) {
     card(ui, w, "Bet", None, right, |ui| bet_size(app, ui));
 }
 
-/// Bet size with ½ / 2× and the coin / USD unit switch.
+/// Bet size with ½ / 2× and the coin / fiat unit switch.
 fn bet_size(app: &mut App, ui: &mut Ui) {
     let locked = app.auto.running;
     let cur = app.active_currency();
     let cur_up = cur.to_uppercase();
     {
-        let unit_sfx = if app.usd_mode() { "USD".to_string() } else { cur_up.clone() };
+        let fiat_up = app.fiat().to_uppercase();
+        let unit_sfx = if app.fiat_mode() { fiat_up.clone() } else { cur_up.clone() };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let w = ui.available_width() - 2.0 * (40.0 + 6.0);
@@ -82,9 +83,9 @@ fn bet_size(app: &mut App, ui: &mut Ui) {
                     ui.set_min_width(132.0);
                     ui.set_max_width(132.0);
                     let coin_label = if cur_up.is_empty() { "COIN".to_string() } else { cur_up.clone() };
-                    let sel = if app.usd_mode() { 1 } else { 0 };
-                    if let Some(i) = segmented(ui, &[&coin_label, "USD"], sel, !locked) {
-                        app.set_unit(if i == 1 { Unit::Usd } else { Unit::Coin });
+                    let sel = if app.fiat_mode() { 1 } else { 0 };
+                    if let Some(i) = segmented(ui, &[&coin_label, &fiat_up], sel, !locked) {
+                        app.set_unit(if i == 1 { Unit::Fiat } else { Unit::Coin });
                     }
                 });
             });
@@ -234,7 +235,7 @@ pub(super) fn stops(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let s = &app.settings;
     let active = [&s.stop_profit, &s.stop_loss, &s.max_bet].iter().any(|v| !v.trim().is_empty()) || s.stop_on_hit;
-    let unit = if app.usd_mode() { "USD".to_string() } else { app.active_currency().to_uppercase() };
+    let unit = if app.fiat_mode() { app.fiat().to_uppercase() } else { app.active_currency().to_uppercase() };
     let mut parts = vec![];
     for (name, v) in [("Profit", &s.stop_profit), ("Loss", &s.stop_loss), ("Max", &s.max_bet)] {
         if !v.trim().is_empty() {

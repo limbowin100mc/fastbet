@@ -329,12 +329,10 @@ pub fn fmt_money(v: i64, currency: &str, decimals: u32) -> String {
     };
     let sign = if v < 0 { "-" } else { "" };
     let _ = Units::MAX;
-    match currency.to_ascii_uppercase().as_str() {
-        "USD" => format!("{sign}${body}"),
-        "EUR" => format!("{sign}€{body}"),
-        "GBP" => format!("{sign}£{body}"),
-        "FUN" | "XXX" => format!("{sign}FUN {body}"),
-        c => format!("{sign}{body} {c}"),
+    match (crate::money::fiat_sign(&currency.to_ascii_lowercase()), currency.to_ascii_uppercase().as_str()) {
+        (Some(s), _) => format!("{sign}{s}{body}"),
+        (None, "FUN" | "XXX") => format!("{sign}FUN {body}"),
+        (None, c) => format!("{sign}{body} {c}"),
     }
 }
 
@@ -349,7 +347,8 @@ mod tests {
         assert_eq!(fmt_money(100_000, "USD", 6), "$0.10");
         assert_eq!(fmt_money(35_000, "USD", 6), "$0.035");
         assert_eq!(fmt_money(1_234_567_891, "USD", 6), "$1,234.567891");
-        assert_eq!(fmt_money(1_000, "JPY", 0), "1,000 JPY");
+        assert_eq!(fmt_money(1_000, "JPY", 0), "¥1,000");
+        assert_eq!(fmt_money(1_000, "PLN", 0), "1,000 PLN");
         assert_eq!(fmt_money(15, "XYZ", 1), "1.5 XYZ");
     }
 }

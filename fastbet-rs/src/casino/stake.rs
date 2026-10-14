@@ -28,6 +28,7 @@ use super::*;
 use crate::bridge::{Bridge, BridgeCookie, BridgeRequest, BridgeSetup};
 use crate::originals::{Game, Resume, Round, Step, Tables};
 use crate::cloudflare::Clearance;
+use crate::currency::is_fiat;
 use crate::money::{f64_from_json, parse_units, to_f64};
 
 /// Stake sends every amount as a float with at most 8 decimals.
@@ -74,7 +75,12 @@ pub const MIRRORS: &[&str] = &[
 
 const ME: &str = "query FastbetMe { user { id name balances { available { amount currency } } \
     activeClientSeed { seed } activeServerSeed { seedHash nonce } } }";
-const RATES: &str = "query FastbetRates { info { currencies { name usd: value(fiatCurrency: usd) } } }";
+// The site's own currency setup: the USD rate of every coin and fiat (`baseRate`), the fiats it can
+// show amounts in, and the fiats it has launched as wallets.
+const RATES: &str = "query FastbetRates { currencyConfiguration(isAcp: false) { baseRates { currency baseRate } \
+    launchedFiatCurrencies displayFiatCurrencies } }";
+/// Stake.us sweepstakes coins: in the rates, but not money on stake.com.
+const SOCIAL: &[&str] = &["gold", "sweeps"];
 const LIMBO: &str = "mutation FastbetLimbo($amount: Float!, $multiplierTarget: Float!, $currency: CurrencyEnum!, $identifier: String!) { \
     limboBet(amount: $amount, currency: $currency, multiplierTarget: $multiplierTarget, identifier: $identifier) { \
     id nonce payoutMultiplier amount payout currency state { ... on CasinoGameLimbo { result multiplierTarget } } } }";
@@ -95,6 +101,7 @@ const START_SLOT: &str = "mutation FastbetStartSlot($slug: String!, $source: Cur
     startThirdPartySession(slug: $slug, source: $source, target: $target) { config } }";
 const START_DEMO: &str = "mutation FastbetStartDemo($slug: String!) { startThirdPartyDemoSession(slug: $slug) { config } }";
 /// Stake Engine games run in fiat; Stake converts the bets from the coin the session is started with.
+/// The player's display fiat (Stake takes any of its own: EUR, JPY and RUB measured), else USD.
 const SLOT_FIAT: &str = "usd";
 /// Thumbnail size for the lobby tiles (2x the tile), as JPEG for the image decoder.
 const THUMB: &str = "w=264&h=346&fit=min&fm=jpg&q=85";
@@ -474,13 +481,25 @@ impl Stake {
     }
 
     fn apply_rates(&self, data: &Value) {
-        let Some(list) = data.pointer("/info/currencies").and_then(Value::as_array) else { return };
+        let Some(cfg) = data.get("currencyConfiguration") else { return };
+        let Some(list) = cfg.get("baseRates").and_then(Value::as_array) else { return };
+        let codes = |key: &str| -> Vec<String> {
+            let list = cfg.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+            sorted(list.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect())
+        };
+        let (launched, display) = (codes("launchedFiatCurrencies"), codes("displayFiatCurrencies"));
         {
             let mut m = self.market.lock();
             for c in list {
-                let Some(name) = c.get("name").and_then(Value::as_str) else { continue };
-                let price = c.get("usd").and_then(f64_from_json).unwrap_or(0.0);
-                m.currencies.insert(name.to_string(), CurrencyInfo { decimals: DECIMALS, price, hidden: false });
+                let Some(name) = c.get("currency").and_then(Value::as_str) else { continue };
+                let price = c.get("baseRate").and_then(f64_from_json).unwrap_or(0.0);
+                // the rates cover ~150 fiats; the wallet lists only coins, and fiats the player holds
+                let fiat = is_fiat(name) || launched.iter().chain(&display).any(|f| f == name);
+                let hidden = SOCIAL.contains(&name);
+                m.currencies.insert(name.to_string(), CurrencyInfo { decimals: DECIMALS, price, hidden, fiat });
+            }
+            if !display.is_empty() {
+                m.fiats = display;
             }
         }
         self.publish();
@@ -836,7 +855,7 @@ impl Casino for Stake {
         Ok(list.iter().filter(in_group).filter_map(slot_game).collect())
     }
 
-    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str, fiat: &str) -> Result<String, CasinoError> {
         let ready = self.ready.load(Ordering::SeqCst);
         let (key, data) = if demo {
             // demo sessions need no account; signed in, Stake ties them to it
@@ -849,7 +868,10 @@ impl Casino for Stake {
             if source.is_empty() {
                 return Err(CasinoError::Server("Pick a currency first".into()));
             }
-            let vars = json!({ "slug": catalog_id, "source": source, "target": SLOT_FIAT });
+            // like the site: the game shows the fiat picked for display
+            let fiat = fiat.trim().to_ascii_lowercase();
+            let target = if fiat.is_empty() { SLOT_FIAT.to_string() } else { fiat };
+            let vars = json!({ "slug": catalog_id, "source": source, "target": target });
             ("startThirdPartySession", self.gql(START_SLOT, vars, true).await?)
         };
         data.get(key)
@@ -1064,6 +1086,12 @@ fn coin_units(v: &Value) -> Option<Units> {
     parse_units(&format!("{f:.8}"), DECIMALS)
 }
 
+/// Currency codes in Stake's order; the ones it doesn't rank keep their order after them.
+fn sorted(mut codes: Vec<String>) -> Vec<String> {
+    codes.sort_by_key(|c| crate::currency::rank(c));
+    codes
+}
+
 /// The coin holding the most value, else BTC.
 fn richest(m: &Market) -> Option<String> {
     let usd = |cur: &str, v: Units| to_f64(v, DECIMALS) * m.info(cur).map(|i| i.price).unwrap_or(0.0);
@@ -1102,6 +1130,12 @@ mod tests {
         }
         assert_eq!(MIRRORS[0], DEFAULT_MIRROR);
         assert_eq!(normalize_mirror(" https://Stake.BET/ "), "stake.bet");
+    }
+
+    #[test]
+    fn currency_lists_follow_stakes_order() {
+        let got = sorted(["ars", "pkr", "usd", "rub", "eur", "nzd"].map(String::from).to_vec());
+        assert_eq!(got, ["usd", "eur", "rub", "ars", "pkr", "nzd"]);
     }
 
     #[test]

@@ -257,7 +257,7 @@ impl Goated {
             for (name, price) in list {
                 let name = name.to_ascii_lowercase();
                 let hidden = HIDDEN.contains(&name.as_str());
-                m.currencies.insert(name, CurrencyInfo { decimals: DECIMALS, price: f64_from_json(price).unwrap_or(0.0), hidden });
+                m.currencies.insert(name, CurrencyInfo { decimals: DECIMALS, price: f64_from_json(price).unwrap_or(0.0), hidden, fiat: false });
             }
         }
         self.publish();
@@ -450,7 +450,7 @@ impl Casino for Goated {
         Ok(vec![])
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str, _fiat: &str) -> Result<String, CasinoError> {
         Err(CasinoError::Server("Slots aren't available on Goated yet".into()))
     }
 

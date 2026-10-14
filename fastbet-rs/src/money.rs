@@ -131,13 +131,48 @@ pub fn fmt_int(n: impl Into<i128>) -> String {
 
 /// "$1,234.56", "-$0.0042"
 pub fn fmt_usd(usd: f64) -> String {
-    let abs = usd.abs();
+    fmt_fiat(usd, "usd")
+}
+
+/// How a fiat is written in front of an amount, where it has a well-known sign.
+pub fn fiat_sign(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "usd" => "$",
+        "eur" => "€",
+        "gbp" => "£",
+        "jpy" => "¥",
+        "cny" => "CN¥",
+        "inr" => "₹",
+        "krw" => "₩",
+        "rub" => "₽",
+        "try" => "₺",
+        "php" => "₱",
+        "vnd" => "₫",
+        "ngn" => "₦",
+        "ils" => "₪",
+        "uah" => "₴",
+        "kzt" => "₸",
+        "brl" => "R$",
+        "cad" => "CA$",
+        "aud" => "A$",
+        "nzd" => "NZ$",
+        "mxn" => "MX$",
+        "hkd" => "HK$",
+        "twd" => "NT$",
+        _ => return None,
+    })
+}
+
+/// "€1,234.56", "-¥0.0042", "PLN 12.50": an amount in a fiat currency (code in any case).
+pub fn fmt_fiat(v: f64, code: &str) -> String {
+    let abs = v.abs();
     let d = if abs != 0.0 && abs < 0.01 { 4 } else { 2 };
     let body = group_thousands(&format!("{abs:.d$}"));
-    if usd < 0.0 {
-        format!("-${body}")
-    } else {
-        format!("${body}")
+    let minus = if v < 0.0 { "-" } else { "" };
+    let code = code.to_ascii_lowercase();
+    match fiat_sign(&code) {
+        Some(sign) => format!("{minus}{sign}{body}"),
+        None => format!("{minus}{} {body}", code.to_uppercase()),
     }
 }
 
@@ -198,6 +233,10 @@ mod tests {
     fn formatting() {
         assert_eq!(group_thousands("1234567.89"), "1,234,567.89");
         assert_eq!(fmt_usd(1234.5), "$1,234.50");
+        assert_eq!(fmt_fiat(1234.5, "EUR"), "€1,234.50");
+        assert_eq!(fmt_fiat(-0.004, "jpy"), "-¥0.0040");
+        assert_eq!(fmt_fiat(12.5, "pln"), "PLN 12.50");
+        assert_eq!(fmt_fiat(-3.0, "brl"), "-R$3.00");
         assert_eq!(fmt_usd(-0.0042), "-$0.0042");
         assert_eq!(fmt_multi(2.0), "2.00×");
         assert_eq!(fmt_multi(12345.6), "12,345×");

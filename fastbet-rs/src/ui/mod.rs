@@ -2,6 +2,7 @@
 //! (left rail, top bar, stats panel) around the lobby and the Limbo page.
 
 pub mod accounts;
+pub mod coins;
 pub mod controls;
 pub mod images;
 pub mod limbo;
@@ -140,6 +141,8 @@ pub struct App {
     pub update_close_at: Option<Instant>,
     pub wallet_search: String,
     pub wallet_search_focused: bool,
+    /// The wallet dropdown shows the fiat picker instead of the coins.
+    pub wallet_fiats: bool,
 
     pub logos: logos::Logos,
 
@@ -193,7 +196,7 @@ impl App {
             let (id, pid, name) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string(), it.next().unwrap_or("Slot").to_string());
             let producer = it.next().unwrap_or("hacksawgaming").to_string();
             let game = SlotGame { id, name, producer, image: String::new(), demo: true, rtp: 96.3, provider_game_id: Some(pid), studio: None };
-            engine.send(Command::OpenSlot { game, mode: PlayMode::Demo, currency: "usdt".into() });
+            engine.send(Command::OpenSlot { game, mode: PlayMode::Demo, currency: "usdt".into(), fiat: "usd".into() });
             screen = Screen::Slot;
         }
 
@@ -251,6 +254,7 @@ impl App {
             update_close_at: None,
             wallet_search: String::new(),
             wallet_search_focused: false,
+            wallet_fiats: std::env::var("FASTBET_WALLET").is_ok_and(|v| v == "fiat"),
             logos: logos::Logos::default(),
             images: images::ImageCache::new(),
             catalog: slots_lobby::Catalog::default(),
@@ -292,8 +296,8 @@ impl App {
     fn load_preview(&mut self, n: usize) {
         use rand::Rng;
         let cur = "usdt".to_string();
-        self.market.currencies.insert(cur.clone(), CurrencyInfo { decimals: 6, price: 1.0, hidden: false });
-        self.market.currencies.insert("btc".into(), CurrencyInfo { decimals: 8, price: 62_000.0, hidden: false });
+        self.market.currencies.insert(cur.clone(), CurrencyInfo { decimals: 6, price: 1.0, hidden: false, fiat: false });
+        self.market.currencies.insert("btc".into(), CurrencyInfo { decimals: 8, price: 62_000.0, hidden: false, fiat: false });
         self.market.wallets.insert(cur.clone(), 48_250_000);
         self.market.wallets.insert("btc".into(), 12_000);
         self.market.site_currency = Some(cur.clone());
@@ -381,25 +385,44 @@ impl App {
         self.market.info(cur)
     }
 
-    pub fn usd_mode(&self) -> bool {
-        self.settings.unit == Unit::Usd
+    /// Amounts are shown and typed in fiat (see [`App::fiat`]) rather than in the coin.
+    pub fn fiat_mode(&self) -> bool {
+        self.settings.unit == Unit::Fiat
     }
 
-    /// Amount typed in the panel (coin or USD) -> base units.
+    /// The fiat amounts are in: the one picked in the wallet when this casino offers it, else USD.
+    pub fn fiat(&self) -> String {
+        let f = self.settings.fiat.trim().to_ascii_lowercase();
+        if self.market.fiats.contains(&f) && self.fiat_rate(&f).is_some() {
+            f
+        } else {
+            "usd".into()
+        }
+    }
+
+    /// USD value of one unit of a fiat.
+    fn fiat_rate(&self, fiat: &str) -> Option<f64> {
+        if fiat == "usd" {
+            return Some(1.0);
+        }
+        self.info(fiat).map(|i| i.price).filter(|p| *p > 0.0)
+    }
+
+    /// Amount typed in the panel (coin or fiat) -> base units.
     pub fn to_base(&self, s: &str, cur: &str) -> Option<Units> {
         let info = self.info(cur)?;
         if s.trim().is_empty() {
             return None;
         }
-        if self.usd_mode() {
-            let usd = money::num(s)?;
-            if usd == 0.0 {
+        if self.fiat_mode() {
+            let fiat = money::num(s)?;
+            if fiat == 0.0 {
                 return Some(0);
             }
-            if usd < 0.0 || info.price <= 0.0 {
+            if fiat < 0.0 || info.price <= 0.0 {
                 return None;
             }
-            let coins = usd / info.price;
+            let coins = fiat * self.fiat_rate(&self.fiat())? / info.price;
             parse_units(&format!("{:.*}", info.decimals.min(20) as usize, coins), info.decimals)
         } else {
             parse_units(s, info.decimals)
@@ -418,8 +441,13 @@ impl App {
         (info.price > 0.0).then(|| to_f64(v, info.decimals) * info.price)
     }
 
-    pub fn fmt_usd(&self, v: Units, cur: &str) -> String {
-        self.usd_value(v, cur).map(money::fmt_usd).unwrap_or_default()
+    /// Worth of `v` in the fiat amounts are shown in.
+    pub fn fiat_value(&self, v: Units, cur: &str) -> Option<f64> {
+        Some(self.usd_value(v, cur)? / self.fiat_rate(&self.fiat())?)
+    }
+
+    pub fn fmt_fiat(&self, v: Units, cur: &str) -> String {
+        self.fiat_value(v, cur).map(|f| money::fmt_fiat(f, &self.fiat())).unwrap_or_default()
     }
 
     /// A slot session currency (fiat like USD/EUR) that the casino market does not know.
@@ -439,8 +467,8 @@ impl App {
         if let Some(dec) = self.session_currency(cur) {
             return format!("{plus}{}", crate::slots::fmt_money(v as i64, cur, dec));
         }
-        if self.usd_mode() && self.info(cur).map(|i| i.price > 0.0).unwrap_or(false) {
-            format!("{plus}{}", self.fmt_usd(v, cur))
+        if self.fiat_mode() && self.info(cur).map(|i| i.price > 0.0).unwrap_or(false) {
+            format!("{plus}{}", self.fmt_fiat(v, cur))
         } else {
             format!("{plus}{} {}", self.fmt_coin(v, cur), cur.to_uppercase()).trim_end().to_string()
         }
@@ -452,10 +480,10 @@ impl App {
         if self.session_currency(cur).is_some() {
             return String::new();
         }
-        if self.usd_mode() {
+        if self.fiat_mode() {
             format!("{plus}{} {}", self.fmt_coin(v, cur), cur.to_uppercase()).trim_end().to_string()
         } else {
-            let u = self.fmt_usd(v, cur);
+            let u = self.fmt_fiat(v, cur);
             if u.is_empty() {
                 u
             } else {
@@ -1150,8 +1178,8 @@ impl App {
         self.spins.clear();
         self.slot_stats = Stats::fresh("USD", 2);
         self.slot_pop = None;
-        let currency = self.active_currency();
-        self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency });
+        let (currency, fiat) = (self.active_currency(), self.fiat());
+        self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency, fiat });
     }
 
     pub fn slot_set_mode(&mut self, demo: bool) {
@@ -1167,8 +1195,8 @@ impl App {
         if let Some(game) = self.slot.game.clone() {
             self.spins.clear();
             self.slot_stats = Stats::fresh("USD", 2);
-            let currency = self.active_currency();
-            self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency });
+            let (currency, fiat) = (self.active_currency(), self.fiat());
+            self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency, fiat });
         }
     }
 
@@ -1179,8 +1207,8 @@ impl App {
     /// Opens the current game's session again (after an error).
     pub fn reopen_slot(&mut self) {
         if let Some(game) = self.slot.game.clone() {
-            let currency = self.active_currency();
-            self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency });
+            let (currency, fiat) = (self.active_currency(), self.fiat());
+            self.engine.send(Command::OpenSlot { game, mode: self.slot_play_mode(), currency, fiat });
         }
     }
 
@@ -1208,6 +1236,7 @@ impl App {
             stop_loss: money_field(&s.slot_stop_loss),
             delay_ms: 0,
             currency: self.active_currency(),
+            fiat: self.fiat(),
             stop_before_fs: s.slot_stop_fs,
         };
         self.flash = None;
@@ -1295,7 +1324,7 @@ impl App {
         }
     }
 
-    /// Switch COIN <-> USD, converting the typed amount so the stake stays the same.
+    /// Switch COIN <-> fiat, converting the typed amount so the stake stays the same.
     pub fn set_unit(&mut self, unit: Unit) {
         if self.settings.unit == unit || self.auto.running {
             return;
@@ -1305,16 +1334,45 @@ impl App {
         self.settings.unit = unit;
         if let (Some(base), Some(info)) = (base, self.info(&cur).cloned()) {
             self.settings.amount = match unit {
-                Unit::Usd => self.usd_value(base, &cur).map(|u| trim_float(u, 4)).unwrap_or_default(),
+                Unit::Fiat => self.fiat_value(base, &cur).map(|u| trim_float(u, 4)).unwrap_or_default(),
                 Unit::Coin => format_units(base, info.decimals, info.decimals),
             };
         }
         self.mark_dirty();
     }
 
+    /// Picks the fiat amounts are shown in (wallet). Amounts typed in fiat keep their worth, and an
+    /// open slot session starts again in the new fiat.
+    pub fn set_fiat(&mut self, code: &str) {
+        let code = code.to_ascii_lowercase();
+        if self.settings.fiat == code || self.auto.running {
+            return;
+        }
+        let cur = self.active_currency();
+        let typed = |s: &Settings| [s.amount.clone(), s.stop_profit.clone(), s.stop_loss.clone(), s.max_bet.clone()];
+        let worth: Vec<Option<Units>> = if self.fiat_mode() { typed(&self.settings).iter().map(|v| self.to_base(v, &cur)).collect() } else { vec![] };
+        self.settings.fiat = code;
+        let fresh: Vec<Option<String>> = worth.into_iter().map(|b| b.and_then(|b| self.fiat_value(b, &cur)).map(|f| trim_float(f, 4))).collect();
+        let s = &mut self.settings;
+        for (field, v) in [&mut s.amount, &mut s.stop_profit, &mut s.stop_loss, &mut s.max_bet].into_iter().zip(fresh) {
+            if let Some(v) = v {
+                *field = v;
+            }
+        }
+        self.mark_dirty();
+        self.slot_money_changed();
+    }
+
+    /// The coin or fiat a real slot session runs in changed: open it again with the new one.
+    pub fn slot_money_changed(&mut self) {
+        if self.screen == Screen::Slot && !self.slot.running && self.slot_play_mode() == PlayMode::Real {
+            self.reopen_slot();
+        }
+    }
+
     pub fn adjust_amount(&mut self, double: bool) {
         let cur = self.active_currency();
-        if self.usd_mode() {
+        if self.fiat_mode() {
             let v = money::num(&self.settings.amount).unwrap_or(0.0);
             self.settings.amount = trim_float(if double { v * 2.0 } else { v / 2.0 }, 4);
         } else if let Some(info) = self.info(&cur).cloned() {
@@ -1572,6 +1630,7 @@ impl App {
         });
         if !self.wallet_open {
             self.wallet_search_focused = false;
+            self.wallet_fiats = false;
         }
     }
 

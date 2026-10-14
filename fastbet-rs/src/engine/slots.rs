@@ -22,8 +22,9 @@ pub struct SlotConfig {
     pub stop_profit: Option<i64>,
     pub stop_loss: Option<i64>,
     pub delay_ms: u64,
-    /// Wallet currency used to launch real-money sessions (for reopening).
+    /// Wallet currency used to launch real-money sessions, and the fiat the game shows (for reopening).
     pub currency: String,
+    pub fiat: String,
     /// Stop as soon as a spin triggers free spins, leaving them for the browser.
     pub stop_before_fs: bool,
 }
@@ -82,18 +83,18 @@ impl Engine {
     }
 
     /// Opens a fresh session for `game`, resetting the run state.
-    pub(super) async fn open_slot(self: Arc<Self>, game: SlotGame, mode: PlayMode, currency: String) {
+    pub(super) async fn open_slot(self: Arc<Self>, game: SlotGame, mode: PlayMode, currency: String, fiat: String) {
         self.close_slot().await;
         {
             let mut s = self.slot.lock();
             *s = SlotState { game: Some(game.clone()), mode: Some(mode), opening: true, msg: "Opening session…".into(), ..Default::default() };
         }
         self.emit_slot();
-        self.connect_slot(game, mode, currency).await;
+        self.connect_slot(game, mode, currency, fiat).await;
     }
 
     /// Replaces the provider session but keeps the run counters (used when a session expires mid-run).
-    async fn reopen_slot_session(&self, game: SlotGame, mode: PlayMode, currency: String) {
+    async fn reopen_slot_session(&self, game: SlotGame, mode: PlayMode, currency: String, fiat: String) {
         if let Some(s) = self.slot_session.lock().await.take() {
             s.close();
         }
@@ -104,10 +105,10 @@ impl Engine {
             s.msg = "Session expired · reconnecting…".into();
         }
         self.emit_slot();
-        self.connect_slot(game, mode, currency).await;
+        self.connect_slot(game, mode, currency, fiat).await;
     }
 
-    async fn connect_slot(&self, game: SlotGame, mode: PlayMode, currency: String) {
+    async fn connect_slot(&self, game: SlotGame, mode: PlayMode, currency: String, fiat: String) {
         let Some(provider) = Provider::for_producer(&game.producer) else {
             return self.slot_fail(format!("{} games are not supported yet", game.producer));
         };
@@ -115,14 +116,14 @@ impl Engine {
             // the casino's launch URL
             let launch_url = |demo: bool| {
                 let game = game.clone();
-                let currency = currency.clone();
+                let (currency, fiat) = (currency.clone(), fiat.clone());
                 async move {
                     // the casino socket may still be coming up (e.g. right after start)
                     let mut last = String::new();
                     for attempt in 0..12 {
                         let casino = self.casino.lock().clone();
                         let res = match casino {
-                            Some(c) => c.launch_slot(&game.id, demo, &currency).await.map_err(|e| e.to_string()),
+                            Some(c) => c.launch_slot(&game.id, demo, &currency, &fiat).await.map_err(|e| e.to_string()),
                             None => Err("Not connected".to_string()),
                         };
                         match res {
@@ -288,7 +289,7 @@ impl Engine {
                     if reopened > 3 {
                         return self.stop_slot("Session keeps expiring");
                     }
-                    self.reopen_slot_session(game, mode, cfg.currency.clone()).await;
+                    self.reopen_slot_session(game, mode, cfg.currency.clone(), cfg.fiat.clone()).await;
                     if self.slot.lock().error.is_some() {
                         return self.stop_slot("Could not reopen the session");
                     }

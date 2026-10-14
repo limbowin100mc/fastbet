@@ -297,6 +297,7 @@ impl ChipsGg {
                             decimals: dec as u32,
                             price: c.get("price").and_then(f64_from_json).unwrap_or(0.0),
                             hidden: c.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false),
+                            fiat: false,
                         },
                     );
                 }
@@ -458,7 +459,7 @@ impl Casino for ChipsGg {
             .collect())
     }
 
-    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str, _fiat: &str) -> Result<String, CasinoError> {
         let channel = if demo { "public" } else { "private" };
         let r = self
             .call(channel, "initializeCasinoGame", vec![json!({ "catalogid": catalog_id, "isMobile": false, "demo": demo, "currency": currency })])

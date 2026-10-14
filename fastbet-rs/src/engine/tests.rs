@@ -88,7 +88,7 @@ impl Casino for Mock {
     async fn list_slots(&self, _f: crate::casino::SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
         Ok(vec![])
     }
-    async fn launch_slot(&self, _id: &str, _demo: bool, _cur: &str) -> Result<String, CasinoError> {
+    async fn launch_slot(&self, _id: &str, _demo: bool, _cur: &str, _fiat: &str) -> Result<String, CasinoError> {
         Err(CasinoError::NotConnected)
     }
     /// Like Stake's: a Mines auto bet settles in its one request.
@@ -622,7 +622,7 @@ async fn run_slot(stop_before_fs: bool) -> (slots::SlotState, u32) {
     let slot = Arc::new(MockSlot { info: crate::slots::SessionInfo { currency: "USD".into(), decimals: 2, ..Default::default() }, spins: AtomicU32::new(0) });
     *e.slot_session.lock().await = Some(slot.clone());
     e.slot.lock().info = Some(slot.info.clone());
-    let cfg = slots::SlotConfig { bet: 10, feature: None, stop_mult: None, limit: 6, stop_profit: None, stop_loss: None, delay_ms: 0, currency: "usd".into(), stop_before_fs };
+    let cfg = slots::SlotConfig { bet: 10, feature: None, stop_mult: None, limit: 6, stop_profit: None, stop_loss: None, delay_ms: 0, currency: "usd".into(), fiat: "usd".into(), stop_before_fs };
     e.start_slot(cfg);
     for _ in 0..200 {
         if !e.slot.lock().running {

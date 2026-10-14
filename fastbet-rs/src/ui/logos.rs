@@ -73,7 +73,7 @@ pub fn paint_wordmark(p: &Painter, rect: Rect) {
 }
 
 /// Renders the SVG into a `w`×`h` image, aspect kept, centred.
-fn rasterise(data: &[u8], w: u32, h: u32) -> Option<ColorImage> {
+pub(super) fn rasterise(data: &[u8], w: u32, h: u32) -> Option<ColorImage> {
     let tree = usvg::Tree::from_data(data, &usvg::Options::default()).ok()?;
     let size = tree.size();
     let scale = (w as f32 / size.width()).min(h as f32 / size.height());
