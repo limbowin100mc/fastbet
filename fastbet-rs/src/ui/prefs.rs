@@ -1,12 +1,15 @@
 //! The Settings window (account menu → Settings): app-wide options, one category at a time
 //! from the list on the left.
 
+use std::sync::mpsc;
+
 use egui::{pos2, vec2, Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, Ui};
 
 use super::theme::{self, alpha, BG1, DIM, G1, G2, GOLD, LINE, MUTED, TEXT, TEXT2};
 use super::widgets::{self, Btn};
 use super::App;
 use crate::settings::{clean_seed_name, SeedChars, RANDOM_SEED_DEFAULT, RANDOM_SEED_LEN, SEED_NAME_MAX};
+use crate::storage::{self, fmt_bytes, Part, Report};
 
 const WIDTH: f32 = 640.0;
 const NAV_W: f32 = 180.0;
@@ -17,22 +20,35 @@ const BODY_H: f32 = 500.0;
 pub enum Tab {
     #[default]
     Seed,
+    Storage,
 }
 
 impl Tab {
-    const ALL: [Tab; 1] = [Tab::Seed];
+    const ALL: [Tab; 2] = [Tab::Seed, Tab::Storage];
 
     fn name(self) -> &'static str {
         match self {
             Tab::Seed => "Seed",
+            Tab::Storage => "Storage",
         }
     }
 
     fn icon(self) -> &'static str {
         match self {
             Tab::Seed => "seed",
+            Tab::Storage => "stack",
         }
     }
+}
+
+/// Settings → Storage: the last sizes measured, a measure or clear running, and what it did.
+#[derive(Default)]
+pub struct StorageView {
+    report: Option<Report>,
+    job: Option<mpsc::Receiver<Report>>,
+    /// The parts the running job clears, and their sizes before.
+    clearing: Vec<(Part, u64)>,
+    note: Option<String>,
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -80,6 +96,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     ui.set_width(w);
                     match app.prefs_tab {
                         Tab::Seed => seed(app, ui, w),
+                        Tab::Storage => storage_page(app, ui, w),
                     }
                 });
             });
@@ -106,6 +123,146 @@ fn nav_item(ui: &mut Ui, icon_name: &str, text: &str, on: bool) -> egui::Respons
     widgets::icon(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(14.0, 14.0)), icon_name, if on { G1 } else { color });
     p.text(pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, text, theme::font_semi(12.5), color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Measures (and first clears `parts`) on a worker thread; the page picks the result up.
+fn storage_job(app: &mut App, parts: Vec<Part>) {
+    let before = app.storage.report.clone().unwrap_or_default();
+    app.storage.clearing = parts.iter().map(|p| (*p, before.get(*p).bytes)).collect();
+    let (tx, rx) = mpsc::channel();
+    let repaint = app.repaint.clone();
+    std::thread::spawn(move || {
+        for p in parts {
+            storage::clear(p);
+        }
+        let _ = tx.send(storage::measure());
+        repaint();
+    });
+    app.storage.job = Some(rx);
+}
+
+/// Bets, hits and stats: in memory only, emptied here.
+fn clear_bets(app: &mut App) {
+    super::clear_history(app);
+    app.hits.clear();
+    app.hits_seen = 0;
+    app.card = None;
+    app.spins.clear();
+    app.spins_total = 0;
+    app.reset_stats();
+    app.slot_stats = super::stats::Stats::fresh(&app.slot_stats.cur.clone(), app.slot_stats.decimals);
+}
+
+fn storage_page(app: &mut App, ui: &mut Ui, w: f32) {
+    heading(ui, "Storage", "What FastBet keeps on this PC. Clearing never touches your logins or settings.");
+    // the sizes: measured when the page opens, and again after every clear
+    if let Some(report) = app.storage.job.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        app.storage.job = None;
+        if !app.storage.clearing.is_empty() {
+            let (before, left): (u64, u64) = app.storage.clearing.iter().fold((0, 0), |(b, l), (p, was)| (b + was, l + report.get(*p).bytes));
+            let freed = before.saturating_sub(left);
+            app.storage.note = Some(if left > 1024 * 1024 {
+                format!("Freed {}. {} is in use by an open window or connection and stays until FastBet restarts.", fmt_bytes(freed), fmt_bytes(left))
+            } else {
+                format!("Freed {}.", fmt_bytes(freed))
+            });
+            app.storage.clearing.clear();
+        }
+        app.storage.report = Some(report);
+    }
+    if app.storage.report.is_none() && app.storage.job.is_none() {
+        storage_job(app, vec![]);
+    }
+    let busy = app.storage.job.is_some();
+    if busy {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+    }
+    let size = |part: Part| match (&app.storage.report, busy) {
+        (_, true) if app.storage.clearing.iter().any(|(p, _)| *p == part) => "Clearing…".to_string(),
+        (Some(r), _) => fmt_bytes(r.get(part).bytes),
+        (None, _) => "Measuring…".to_string(),
+    };
+    let in_memory = app.history.entries.iter().filter(|e| matches!(e, super::stats::HistEntry::Bet { .. })).count() + app.spins.len();
+    let rows: Vec<(Option<Part>, &str, &str, String)> = vec![
+        (
+            None,
+            "Bets and history",
+            "Never saved to disk. Bets, hits and stats live in memory and are gone when FastBet closes.",
+            format!("{} in memory", crate::money::fmt_int(in_memory as i128)),
+        ),
+        (Some(Part::Pictures), "Game pictures", "Slot and originals artwork. It downloads again when it's shown.", size(Part::Pictures)),
+        (
+            Some(Part::Browser),
+            "Browser data",
+            "Login windows and Cloudflare checks. Your saved logins stay; a login window opens signed out and Cloudflare checks run again.",
+            size(Part::Browser),
+        ),
+        (Some(Part::Updates), "Downloaded updates", "Installers of updates that are already installed.", size(Part::Updates)),
+        (Some(Part::Backups), "Old settings backups", "Copies kept when the settings couldn't be read. They hold old logins.", size(Part::Backups)),
+    ];
+    let mut clear: Option<Option<Part>> = None;
+    widgets::card(ui, w, "On this PC", None, None, |ui| {
+        let inner = ui.available_width();
+        for (i, (part, title, about, value)) in rows.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(10.0);
+                widgets::hsep(ui);
+                ui.add_space(10.0);
+            }
+            let empty = part.is_some_and(|p| app.storage.report.as_ref().is_some_and(|r| r.get(p).files == 0));
+            // the name, its size and Clear on one line, what it is under them
+            ui.allocate_ui_with_layout(vec2(inner, 34.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.label(widgets::semi(*title, 13.0, TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::button(ui, "Clear", Btn::Ghost, !busy && !empty, Some(72.0)).clicked() {
+                        clear = Some(*part);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(widgets::semi(value.clone(), 12.5, if empty { DIM } else { TEXT2 }));
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(RichText::new(*about).size(11.5).color(MUTED));
+        }
+    });
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        ui.set_width(w);
+        if let Some(note) = &app.storage.note {
+            ui.label(RichText::new(note).size(12.0).color(G2));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if widgets::button(ui, "Clear all", Btn::Ghost, !busy, Some(100.0)).clicked() {
+                clear_bets(app);
+                storage_job(app, Part::ALL.to_vec());
+            }
+        });
+    });
+    match clear {
+        Some(None) => {
+            clear_bets(app);
+            app.storage.note = Some("Bets, hits and stats cleared.".into());
+        }
+        Some(Some(part)) => storage_job(app, vec![part]),
+        None => {}
+    }
+    if let Some(dir) = storage::settings_dir() {
+        ui.add_space(18.0);
+        ui.label(RichText::new(format!("Settings and logins are kept in {}", dir.display())).size(11.5).color(DIM));
+        ui.add_space(4.0);
+        if ui.add(egui::Label::new(RichText::new("Open folder").size(11.5).color(TEXT2).underline()).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            open_folder(&dir);
+        }
+    }
+}
+
+fn open_folder(dir: &std::path::Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
 }
 
 fn heading(ui: &mut Ui, title: &str, sub: &str) {

@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "fastbet"
-version = "3.13.0"
+version = "3.13.1"
 dependencies = [
  "async-trait",
  "directories",

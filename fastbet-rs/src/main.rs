@@ -11,6 +11,7 @@ mod money;
 mod originals;
 mod settings;
 mod slots;
+mod storage;
 mod ui;
 mod update;
 

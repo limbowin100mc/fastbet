@@ -138,6 +138,8 @@ pub struct App {
     /// The Settings window, and the category it shows.
     pub prefs_open: bool,
     pub prefs_tab: prefs::Tab,
+    /// Settings → Storage: sizes on disk, and clearing.
+    pub storage: prefs::StorageView,
     /// The seed name field has the focus: the name is only used once typing is done.
     pub seed_name_editing: bool,
     /// The client seed the engine was last given.
@@ -261,7 +263,9 @@ impl App {
             update_open: false,
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
-            prefs_tab: prefs::Tab::default(),
+            // FASTBET_PREFS=storage opens it on Storage
+            prefs_tab: if std::env::var("FASTBET_PREFS").as_deref() == Ok("storage") { prefs::Tab::Storage } else { prefs::Tab::default() },
+            storage: prefs::StorageView::default(),
             seed_name_editing: false,
             seed_sent: None,
             seed_applied: None,

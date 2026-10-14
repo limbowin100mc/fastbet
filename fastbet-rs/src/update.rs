@@ -170,6 +170,10 @@ impl Updater {
             let res = download_dir().and_then(|dir| {
                 let file = dir.join(&asset.name);
                 download(&asset, &file, &cancel, progress)?;
+                // earlier installers aren't needed any more (an AppImage's folder is the user's: left alone)
+                if appimage_path().is_none() {
+                    crate::storage::prune_updates(&dir, &asset.name);
+                }
                 launch(&file)
             });
             *state.lock() = match res {
