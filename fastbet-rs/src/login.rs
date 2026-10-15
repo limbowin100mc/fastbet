@@ -107,6 +107,7 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
             Event::UserEvent(UserEvent::Token(t)) => {
                 let t = match (id.login_cookie(), id.cookie_login()) {
                     (Some((url, name)), _) => with_cookie(&webview, &t, url, name, &mut misses),
+                    (None, Some(_)) if id.cookie_needs_page_login() && !reports_login(&t) => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
                     (None, Some((url, name))) => cookie_token(&webview, url, name),
                     (None, None) => t,
                 };
@@ -149,7 +150,7 @@ fn with_cookie(webview: &wry::WebView, report: &str, url: &str, name: &str, miss
     v.to_string()
 }
 
-/// A login that is an HttpOnly cookie (Gambulls): the report is the cookie `name` as the token,
+/// A login that is an HttpOnly cookie (Gambulls, Metaspins): the report is the cookie `name` as the token,
 /// logged in once the browser holds it.
 fn cookie_token(webview: &wry::WebView, url: &str, name: &str) -> String {
     let value = webview.cookies_for_url(url).ok().and_then(|cs| cs.iter().find(|c| c.name() == name).map(|c| c.value().to_string())).filter(|v| !v.is_empty());
@@ -157,6 +158,11 @@ fn cookie_token(webview: &wry::WebView, url: &str, name: &str) -> String {
         Some(v) => serde_json::json!({ "token": v, "loggedIn": true }).to_string(),
         None => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
     }
+}
+
+/// The page's report says it is logged in.
+fn reports_login(report: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(report).is_ok_and(|v| v["loggedIn"].as_bool() == Some(true))
 }
 
 /// Traffic capture for reverse-engineering a slot provider: opens `url` in a

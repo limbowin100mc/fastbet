@@ -1623,7 +1623,7 @@ checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "fastbet"
-version = "3.14.0"
+version = "3.15.0"
 dependencies = [
  "async-trait",
  "directories",

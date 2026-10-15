@@ -46,7 +46,8 @@ pub fn jwt_exp(token: &str) -> Option<u64> {
     serde_json::from_slice::<Value>(&payload).ok()?.get("exp")?.as_u64()
 }
 
-fn base64url(s: &str) -> Option<Vec<u8>> {
+/// Base64, URL-safe or standard alphabet, padding optional.
+pub(crate) fn base64url(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut buf, mut bits) = (0u32, 0u32);
     for c in s.bytes() {
