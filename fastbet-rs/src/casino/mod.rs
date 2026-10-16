@@ -154,7 +154,30 @@ impl CasinoId {
                 "play'ngo",
                 "retrogaming",
             ],
-            CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
+            // Stake Engine and the providers Stake carries (`stake::PROVIDER_GROUPS`); Relax isn't
+            // available on Stake, Fantasma there is on its own server
+            CasinoId::Stake => &[
+                crate::slots::STAKE_ENGINE,
+                "pragmaticplay",
+                "hacksawgaming",
+                "play'ngo",
+                "bgaming",
+                "avatarux",
+                "penguinking",
+                "peter&sons",
+                "popiplay",
+                "shadylady",
+                "slotmillgames",
+                "spinomenal",
+                "onetouch",
+                "wickedgames",
+                "bullsharkgames",
+                "nownow",
+                "trustygaming",
+                "goodtimesstudios",
+                "pineappleplay",
+                "alohagaming",
+            ],
             CasinoId::Shuffle => &[
                 "hacksawgaming",
                 "shadylady",
@@ -260,12 +283,6 @@ impl CasinoId {
     /// Slot artwork is landscape (chips.gg's 4:3 thumbnails), so the lobby's tiles are too.
     pub fn slot_art_landscape(self) -> bool {
         matches!(self, CasinoId::ChipsGg)
-    }
-
-    /// The slot catalog lists only games the app can play (Stake: Stake Engine games),
-    /// so the lobby has no tested / untested split.
-    pub fn slots_curated(self) -> bool {
-        matches!(self, CasinoId::Stake)
     }
 
     /// What the casino calls the credential the user pastes.

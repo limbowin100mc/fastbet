@@ -1228,12 +1228,9 @@ impl App {
         self.catalog.error = None;
         self.catalog.featured.clear();
         self.catalog.loading = 1;
-        // a curated catalog is all playable: no separate list of the supported producers
-        if !self.casino().slots_curated() {
-            for p in self.casino().slot_producers() {
-                self.catalog.loading += 1;
-                self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: slots_lobby::PROVIDER_PAGE, ..Default::default() } });
-            }
+        for p in self.casino().slot_producers() {
+            self.catalog.loading += 1;
+            self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: slots_lobby::PROVIDER_PAGE, ..Default::default() } });
         }
         self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { limit: slots_lobby::PAGE, ..Default::default() } });
     }

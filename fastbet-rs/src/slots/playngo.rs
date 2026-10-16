@@ -5,7 +5,8 @@
 //! plain HTTPS takes them too), every reply `d=<first line>\r\n<line>…`, an error `d=111 "<text>"`.
 //!   GET  {cw}/games/getgamebygid/<gid>                 -> gameId (numeric), name, gameType
 //!   GET  {cw}/configuration/prelaunchconfiguration     -> Server (the game server's URL)
-//!   103 4962 "<lang>" <gameId> "<UA>" "<name>" "<channel>"  -> d=103 "<pre-session>"
+//!   103 <product> "<lang>" <gameId> "<UA>" "<name>" "<channel>"  -> d=103 "<pre-session>"
+//!        (product = 10 × pid − 8, as Play'n GO's launcher works it out: chips.gg 4962, Stake 16162)
 //!   101 "<ticket>" "" "" "" "" ""   (empty ticket: practice) -> d=103 "<session>", 101 <uid> "<CUR>" …
 //!        (the load balancer now and then hands 101 to a server that never saw the 103: start over)
 //!   GET  {cw}/configuration/v2?…&currency=<CUR>         -> settings, lines, denom (default coin)
@@ -207,6 +208,11 @@ fn awards_free_spins(reply: &str) -> bool {
     reply.split(NL).any(|l| l.strip_prefix("2 2 1 ").and_then(|n| n.split(' ').next()?.parse::<i64>().ok()).is_some_and(|n| n >= 3))
 }
 
+/// The product id a session asks for: the launcher's `10 * pid - 8`.
+fn product_id(pid: &str) -> i64 {
+    pid.trim().parse::<i64>().map(|p| 10 * p - 8).unwrap_or(4962)
+}
+
 fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -270,7 +276,7 @@ async fn login(http: &reqwest::Client, l: &Launch, game: &Game, practice: bool) 
     for _ in 0..6 {
         conn.seq = 0;
         conn.session = "0".into();
-        let hello = conn.ask(&format!("103 4962 \"{}\" {} \"{}\" \"{}\" \"{}\"", l.lang, game.id, urlencode(UA), game.name, l.channel)).await?;
+        let hello = conn.ask(&format!("103 {} \"{}\" {} \"{}\" \"{}\" \"{}\"", product_id(&l.pid), l.lang, game.id, urlencode(UA), game.name, l.channel)).await?;
         conn.session = quoted(&hello).unwrap_or_default().to_string();
         reply = conn.post(&format!("101 \"{ticket}\" \"\" \"\" \"\" \"\" \"\"")).await?;
         if reply.starts_with("d=103 \"") {
@@ -280,6 +286,9 @@ async fn login(http: &reqwest::Client, l: &Launch, game: &Game, practice: bool) 
         if !reply.contains("Failed to process packets") {
             break;
         }
+    }
+    if std::env::var_os("FASTBET_PNG_DUMP").is_some() {
+        eprintln!("playngo login: {}", reply.replace(NL, " | ").chars().take(400).collect::<String>());
     }
     if !reply.starts_with("d=103 \"") {
         return Err(error_of(&reply).unwrap_or_else(|| SlotError::Provider(format!("Play'n GO login: {}", reply.chars().take(160).collect::<String>()))));
@@ -507,6 +516,7 @@ mod tests {
         // Moon Princess asks which princess
         assert!(wants_pick("d=2 6\r\n2 0 0 2 0 0\r\n2 1\r\n\r\n"));
         assert_eq!(Family::Grid(10).line(15), "1 10 1 15 1");
+        assert_eq!((product_id("497"), product_id("1617")), (4962, 16162));
         assert_eq!(Family::Video(10).line(20), "1 1 10 20 1");
     }
 }

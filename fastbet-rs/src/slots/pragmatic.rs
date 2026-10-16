@@ -79,6 +79,11 @@ pub async fn open(launch_url: &str) -> Result<PragmaticSession, SlotError> {
         choice: AtomicBool::new(false),
     };
     let init = s.call("doInit", &[]).await?;
+    if std::env::var_os("FASTBET_PP_DUMP").is_some() {
+        let mut keys: Vec<_> = init.iter().filter(|(k, _)| !["mgckey", "sessionId", "sh", "st", "sw"].contains(&k.as_str())).map(|(k, v)| format!("{k}={}", v.chars().take(120).collect::<String>())).collect();
+        keys.sort();
+        eprintln!("pragmatic init: {}", keys.join(" & "));
+    }
     s.lines = init.get("l").and_then(|v| v.parse().ok()).unwrap_or(20);
     s.coins = init.get("sc").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
     s.bls = init.get("bls").map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();

@@ -176,6 +176,7 @@ pub async fn resolve_launcher(url: &str) -> Result<String, String> {
 /// Like [`resolve_launcher`], also returning the final page's body (some launchers
 /// end on a page that carries the parameters in its HTML instead of its URL).
 pub async fn follow_launcher(url: &str) -> Result<(String, String), String> {
+    let url = &unwrap_ignition(url);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(UA)
@@ -194,6 +195,48 @@ pub async fn follow_launcher(url: &str) -> Result<(String, String), String> {
         return Ok((current, body));
     }
     Ok((current, String::new()))
+}
+
+/// SoftSwiss' "ignition" page (Stake's BGaming, Popiplay, Spinomenal…) only wraps the game:
+/// `…/ignition.button/…/index.html?options=<base64 {"launch_options":{"game_url":…}}>`. Any
+/// other URL comes back as it is.
+pub fn unwrap_ignition(url: &str) -> String {
+    if !url.contains("ignition.") {
+        return url.to_string();
+    }
+    let map = hacksaw::query_map(url);
+    let inner = map
+        .get("options")
+        .and_then(|o| base64_decode(o))
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.pointer("/launch_options/game_url").and_then(|u| u.as_str()).map(str::to_string));
+    inner.unwrap_or_else(|| url.to_string())
+}
+
+/// Standard or URL-safe base64, padding optional.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes().filter(|c| *c != b'=' && !c.is_ascii_whitespace()) {
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// The browser we present ourselves as on plain HTTP calls.
@@ -379,5 +422,13 @@ mod tests {
         assert_eq!(fmt_money(1_000, "JPY", 0), "¥1,000");
         assert_eq!(fmt_money(1_000, "PLN", 0), "1,000 PLN");
         assert_eq!(fmt_money(15, "XYZ", 1), "1.5 XYZ");
+    }
+
+    #[test]
+    fn ignition_wrapper() {
+        // {"launch_options":{"game_url":"https://cur.popiplay.network/games/MayaRelics/FUN?play_token=x","strategy":"iframe"}}
+        let url = "https://s3.eu-central-1.amazonaws.com/ignition.button/round-2/index.html?options=eyJsYXVuY2hfb3B0aW9ucyI6eyJnYW1lX3VybCI6Imh0dHBzOi8vY3VyLnBvcGlwbGF5Lm5ldHdvcmsvZ2FtZXMvTWF5YVJlbGljcy9GVU4%2FcGxheV90b2tlbj14Iiwic3RyYXRlZ3kiOiJpZnJhbWUifX0%3D";
+        assert_eq!(unwrap_ignition(url), "https://cur.popiplay.network/games/MayaRelics/FUN?play_token=x");
+        assert_eq!(unwrap_ignition("https://example.com/a?b=1"), "https://example.com/a?b=1");
     }
 }

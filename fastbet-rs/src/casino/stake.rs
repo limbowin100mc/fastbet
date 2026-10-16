@@ -104,7 +104,7 @@ const REWARDS: &str = "query FastbetRewards { claimableSelfServeBonuses { bonusC
 const CLAIM_RAKEBACK: &str = "mutation FastbetClaimRakeback { claimRakeback { id currency amount } }";
 /// The open challenges (Stake refuses the list in some regions).
 const CHALLENGES: &str = "query FastbetChallenges { challengeGlobalList(limit: 50, offset: 0, sort: prize) { id active targetMultiplier minBetUsd award currency \
-    expireAt game { name slug thumbnailUrl providerGroup { name } } } }";
+    expireAt game { name slug thumbnailUrl providerGroup { name slug } groupGames { group { slug } } } } }";
 /// Refresh ticks between VIP reads.
 const VIP_EVERY: u32 = 3;
 const ME: &str = "query FastbetMe { user { id name balances { available { amount currency } } \
@@ -121,16 +121,43 @@ const LIMBO: &str = "mutation FastbetLimbo($amount: Float!, $multiplierTarget: F
 const ROTATE: &str = "mutation FastbetRotateSeed($seed: String!) { rotateSeedPair(seed: $seed) { clientSeed { user { id \
     activeClientSeed { id seed } activeServerSeed { id nonce seedHash nextSeedHash } } } } }";
 
-// Slots: Stake Engine games only. They sit in one kurator group; a session is a game URL
-// carrying the RGS session (see `slots::stake_engine`).
+// Slots: each provider the drivers know is a kurator group (its page on Stake), Stake Engine
+// games (many studios) one more; all of them are in "slots". Every game opens the same way, as
+// a game URL (Stake Engine's carries the RGS session, see `slots::stake_engine`).
 const ENGINE_GROUP: &str = "stake-engine";
-const SLOTS_LIST: &str = "query FastbetEngineGames($slug: String!, $limit: Int!, $offset: Int!) { slugKuratorGroup(slug: $slug) { id \
+const SLOTS_GROUP: &str = "slots";
+/// Stake's provider group of each producer key the drivers know.
+const PROVIDER_GROUPS: &[(&str, &str)] = &[
+    ("pragmaticplay", "pragmatic-play"),
+    ("hacksawgaming", "hacksaw-gaming"),
+    ("play'ngo", "playn-go"),
+    ("bgaming", "bgaming"),
+    ("avatarux", "avatarux"),
+    ("penguinking", "penguin-king"),
+    ("peter&sons", "peter-sons"),
+    ("popiplay", "popiplay"),
+    ("shadylady", "shady-lady"),
+    ("slotmillgames", "slotmill"),
+    ("spinomenal", "spinomenal"),
+    ("onetouch", "onetouch"),
+    ("wickedgames", "wicked-games"),
+    ("bullsharkgames", "bullshark-games"),
+    ("nownow", "nownow-gaming"),
+    ("trustygaming", "trusty-gaming"),
+    ("goodtimesstudios", "goodtimes-studios"),
+    ("pineappleplay", "pineapple-play"),
+    ("alohagaming", "aloha-gaming"),
+];
+/// Most games a group page gives at once (`numberLessEqual` above).
+const GROUP_PAGE: usize = 50;
+const CATALOG_CALLS: usize = 4;
+const SLOTS_LIST: &str = "query FastbetSlotGames($slug: String!, $limit: Int!, $offset: Int!) { slugKuratorGroup(slug: $slug) { id \
     groupGamesList(limit: $limit, offset: $offset, sort: popular7d) { game { id name slug thumbnailUrl edge isDemoEnabled \
-    providerGroup { name translation } } } } }";
-const SLOTS_SEARCH: &str = "query FastbetEngineSearch($query: String!, $groupIds: [String!], $limit: Int, $offset: Int) { \
+    providerGroup { name translation slug } groupGames { group { slug } } } } } }";
+const SLOTS_SEARCH: &str = "query FastbetSlotSearch($query: String!, $groupIds: [String!], $limit: Int, $offset: Int) { \
     kuratorGameQuery(query: $query, groupIds: $groupIds, limit: $limit, offset: $offset) { id name slug thumbnailUrl edge \
-    isDemoEnabled providerGroup { name translation } groupGames { group { slug } } } }";
-const ENGINE_GROUP_ID: &str = "query FastbetEngineGroup($slug: String!) { slugKuratorGroup(slug: $slug) { id } }";
+    isDemoEnabled providerGroup { name translation slug } groupGames { group { slug } } } }";
+const GROUP_ID: &str = "query FastbetSlotGroup($slug: String!) { slugKuratorGroup(slug: $slug) { id } }";
 const START_SLOT: &str = "mutation FastbetStartSlot($slug: String!, $source: CurrencyEnum!, $target: CurrencyEnum!) { \
     startThirdPartySession(slug: $slug, source: $source, target: $target) { config } }";
 const START_DEMO: &str = "mutation FastbetStartDemo($slug: String!) { startThirdPartyDemoSession(slug: $slug) { config } }";
@@ -230,8 +257,10 @@ pub struct Stake {
     /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
     inflight: AtomicUsize,
     settled: AtomicU64,
-    /// Id of the Stake Engine game group, for searching inside it.
-    engine_group: Mutex<Option<String>>,
+    /// Id of the "slots" game group, for searching inside it.
+    slots_group: Mutex<Option<String>>,
+    /// Catalog calls in flight at once: the lobby asks for every provider's games together.
+    catalog_calls: tokio::sync::Semaphore,
     /// Open rounds of originals and what they have staked so far (already taken off the wallet).
     open_rounds: Mutex<std::collections::HashMap<String, Units>>,
 }
@@ -257,7 +286,8 @@ impl Stake {
             last_vip: Mutex::new(None),
             inflight: AtomicUsize::new(0),
             settled: AtomicU64::new(0),
-            engine_group: Mutex::new(None),
+            slots_group: Mutex::new(None),
+            catalog_calls: tokio::sync::Semaphore::new(CATALOG_CALLS),
             open_rounds: Mutex::new(Default::default()),
         });
         tokio::spawn(me.clone().run());
@@ -684,18 +714,44 @@ impl Stake {
         bet.and_then(|b| round_from(game, b)).ok_or_else(|| CasinoError::BadReply(v.to_string().chars().take(200).collect()))
     }
 
-    /// One API call over the current bridge. A dead or challenged bridge is flagged for the run loop.
-    /// The Stake Engine group's id, looked up once.
-    async fn engine_group_id(&self) -> Result<String, CasinoError> {
-        if let Some(id) = self.engine_group.lock().clone() {
+    /// The "slots" group's id, looked up once.
+    async fn slots_group_id(&self) -> Result<String, CasinoError> {
+        if let Some(id) = self.slots_group.lock().clone() {
             return Ok(id);
         }
-        let data = self.gql(ENGINE_GROUP_ID, json!({ "slug": ENGINE_GROUP }), false).await?;
+        let data = self.gql(GROUP_ID, json!({ "slug": SLOTS_GROUP }), false).await?;
         let id = data.pointer("/slugKuratorGroup/id").and_then(Value::as_str).ok_or_else(|| CasinoError::BadReply(data.to_string()))?.to_string();
-        *self.engine_group.lock() = Some(id.clone());
+        *self.slots_group.lock() = Some(id.clone());
         Ok(id)
     }
 
+    /// `limit` games of a group from `skip`, most played this week first, over as many pages as that takes.
+    async fn group_games(&self, slug: &str, skip: usize, limit: usize) -> Result<Vec<Value>, CasinoError> {
+        let auth = self.ready.load(Ordering::SeqCst);
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let take = (limit - out.len()).min(GROUP_PAGE);
+            let vars = json!({ "slug": slug, "limit": take, "offset": skip + out.len() });
+            let data = {
+                let _turn = self.catalog_calls.acquire().await;
+                self.gql(SLOTS_LIST, vars, auth).await?
+            };
+            let group = data.get("slugKuratorGroup").ok_or_else(|| CasinoError::BadReply(data.to_string()))?;
+            // a provider Stake doesn't carry
+            if group.is_null() {
+                break;
+            }
+            let page = group.get("groupGamesList").and_then(Value::as_array).cloned().unwrap_or_default();
+            let short = page.len() < take;
+            out.extend(page.into_iter().map(|g| g["game"].clone()));
+            if short {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One API call over the current bridge. A dead or challenged bridge is flagged for the run loop.
     async fn gql(&self, query: &str, variables: Value, auth: bool) -> Result<Value, CallError> {
         let link = self.link.lock().clone().ok_or(CallError::Casino(CasinoError::NotConnected))?;
         let res = self.post(&link, query, variables, auth, RPC_TIMEOUT).await;
@@ -928,33 +984,31 @@ impl Casino for Stake {
     async fn list_originals(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
         let data = self.gql(ORIGINALS_LIST, json!({ "slug": ORIGINALS_GROUP }), false).await?;
         let list = data.pointer("/slugKuratorGroup/groupGamesList").and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(list.iter().filter_map(|g| slot_game(&g["game"])).collect())
+        Ok(list.iter().filter_map(|g| slot_game(&g["game"], None)).collect())
     }
 
     async fn list_slots(&self, filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
-        // Stake answers a bigger page with `numberLessEqual`
-        let limit = filter.limit.clamp(1, 50);
-        let auth = self.ready.load(Ordering::SeqCst);
+        let limit = filter.limit.max(1);
         let query = filter.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
-        let Some(query) = query else {
-            let vars = json!({ "slug": ENGINE_GROUP, "limit": limit, "offset": filter.skip });
-            let data = self.gql(SLOTS_LIST, vars, auth).await?;
-            let group = data.get("slugKuratorGroup").filter(|g| g.is_object()).ok_or_else(|| CasinoError::BadReply(data.to_string()))?;
-            if let Some(id) = group.get("id").and_then(Value::as_str) {
-                *self.engine_group.lock() = Some(id.to_string());
-            }
-            let list = group.get("groupGamesList").and_then(Value::as_array).cloned().unwrap_or_default();
-            return Ok(list.iter().filter_map(|g| slot_game(&g["game"])).collect());
+        if let Some(query) = query {
+            let group = self.slots_group_id().await?;
+            let vars = json!({ "query": query, "groupIds": [group], "limit": limit.min(GROUP_PAGE), "offset": filter.skip });
+            let data = self.gql(SLOTS_SEARCH, vars, self.ready.load(Ordering::SeqCst)).await?;
+            let list = data.get("kuratorGameQuery").and_then(Value::as_array).cloned().unwrap_or_default();
+            // the group filter is the server's; keep only slots either way
+            let in_group = |g: &&Value| g["groupGames"].as_array().is_none_or(|a| a.iter().any(|x| matches!(x.pointer("/group/slug").and_then(Value::as_str), Some(SLOTS_GROUP | ENGINE_GROUP))));
+            return Ok(list.iter().filter(in_group).filter_map(|g| slot_game(g, None)).collect());
+        }
+        let (slug, producer) = match filter.producer.as_deref() {
+            Some(crate::slots::STAKE_ENGINE) => (ENGINE_GROUP, Some(crate::slots::STAKE_ENGINE)),
+            Some(p) => match PROVIDER_GROUPS.iter().find(|(ours, _)| *ours == p) {
+                Some((ours, group)) => (*group, Some(*ours)),
+                None => return Ok(vec![]),
+            },
+            None => (SLOTS_GROUP, None),
         };
-        let group = self.engine_group_id().await?;
-        let vars = json!({ "query": query, "groupIds": [group], "limit": limit, "offset": filter.skip });
-        let data = self.gql(SLOTS_SEARCH, vars, auth).await?;
-        let list = data.get("kuratorGameQuery").and_then(Value::as_array).cloned().unwrap_or_default();
-        // the group filter is the server's; keep only Stake Engine games either way
-        let in_group = |g: &&Value| {
-            g["groupGames"].as_array().is_none_or(|a| a.iter().any(|x| x.pointer("/group/slug").and_then(Value::as_str) == Some(ENGINE_GROUP)))
-        };
-        Ok(list.iter().filter(in_group).filter_map(slot_game).collect())
+        let list = self.group_games(slug, filter.skip, limit).await?;
+        Ok(list.iter().filter_map(|g| slot_game(g, producer)).collect())
     }
 
     async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str, fiat: &str) -> Result<String, CasinoError> {
@@ -985,18 +1039,32 @@ impl Casino for Stake {
     }
 }
 
-/// A Stake Engine game from a kurator listing.
-fn slot_game(g: &Value) -> Option<crate::slots::SlotGame> {
+/// A game from a kurator listing as a lobby tile. Its producer: `producer` when the list was a provider's, else the
+/// provider its `providerGroup` names, or Stake Engine when it is in that group (or the reply
+/// says nothing of its groups); a provider the drivers don't know keeps Stake's slug.
+fn slot_game(g: &Value, producer: Option<&str>) -> Option<crate::slots::SlotGame> {
     let slug = g.get("slug")?.as_str()?;
     let name = g.get("name")?.as_str()?.trim();
     let pg = &g["providerGroup"];
-    // `translation` is sometimes an untranslated key ("game_kurator_group.ovryx_gaming")
+    let groups: Option<Vec<&str>> = g["groupGames"].as_array().map(|a| a.iter().filter_map(|x| x.pointer("/group/slug").and_then(Value::as_str)).collect());
+    let producer = producer.map(str::to_string).unwrap_or_else(|| {
+        let provider = pg["slug"].as_str().unwrap_or("");
+        match PROVIDER_GROUPS.iter().find(|(_, group)| *group == provider) {
+            Some((ours, _)) => ours.to_string(),
+            None if groups.as_ref().is_none_or(|g| g.contains(&ENGINE_GROUP)) => crate::slots::STAKE_ENGINE.to_string(),
+            None => provider.to_string(),
+        }
+    });
+    // `translation` is sometimes an untranslated key ("game_kurator_group.ovryx_gaming"); a
+    // provider the drivers know is named by them
+    let known = producer != crate::slots::STAKE_ENGINE && crate::slots::Provider::for_producer(&producer).is_some();
     let studio = [&pg["name"], &pg["translation"]]
         .into_iter()
         .filter_map(Value::as_str)
         .map(str::trim)
         .find(|s| !s.is_empty() && !s.contains("game_kurator_group"))
-        .map(str::to_string);
+        .map(str::to_string)
+        .filter(|_| !known);
     let edge = g.get("edge").and_then(f64_from_json).filter(|e| *e > 0.0 && *e < 1.0);
     let image = g
         .get("thumbnailUrl")
@@ -1006,7 +1074,7 @@ fn slot_game(g: &Value) -> Option<crate::slots::SlotGame> {
     Some(crate::slots::SlotGame {
         id: slug.to_string(),
         name: name.to_string(),
-        producer: crate::slots::STAKE_ENGINE.into(),
+        producer,
         image,
         demo: g.get("isDemoEnabled").and_then(Value::as_bool).unwrap_or(true),
         rtp: edge.map(|e| (1.0 - e) * 100.0).unwrap_or(0.0),
@@ -1257,23 +1325,11 @@ fn challenges_of(data: &Value, price: &dyn Fn(&str) -> f64) -> Vec<Challenge> {
         .iter()
         .filter(|c| c["active"].as_bool() != Some(false))
         .filter_map(|c| {
-            let g = &c["game"];
-            let studio = g.pointer("/providerGroup/name").and_then(Value::as_str).map(str::to_string);
-            let image = g.get("thumbnailUrl").and_then(Value::as_str).map(|u| format!("{u}{}{THUMB}", if u.contains('?') { '&' } else { '?' })).unwrap_or_default();
             let cur = c.get("currency").and_then(Value::as_str).unwrap_or("usdt");
             Some(Challenge {
                 id: c.get("id")?.as_str()?.to_string(),
                 koth: false,
-                game: crate::slots::SlotGame {
-                    id: g.get("slug")?.as_str()?.to_string(),
-                    name: g.get("name").and_then(Value::as_str).unwrap_or("?").to_string(),
-                    producer: studio.clone().unwrap_or_default().to_ascii_lowercase(),
-                    image,
-                    demo: true,
-                    rtp: 0.0,
-                    provider_game_id: None,
-                    studio,
-                },
+                game: slot_game(&c["game"], None)?,
                 target: c.get("targetMultiplier").and_then(f64_from_json)?,
                 min_bet_usd: c.get("minBetUsd").and_then(f64_from_json).unwrap_or(0.0),
                 prize_usd: c.get("award").and_then(f64_from_json).unwrap_or(0.0) * price(cur),
@@ -1348,10 +1404,12 @@ mod tests {
         assert!(list[1].claimable && list[1].kind == RewardKind::Weekly);
 
         let ch = json!({"challengeGlobalList": [{"id": "c1", "active": true, "targetMultiplier": 5000, "minBetUsd": 0.2, "award": 500, "currency": "usdt", "expireAt": "2026-10-20T00:00:00.000Z",
-            "game": {"name": "Gates of Olympus", "slug": "pragmatic-play-gates-of-olympus", "thumbnailUrl": "https://mediumrare.imgix.net/x.png", "providerGroup": {"name": "Pragmatic Play"}}}]});
+            "game": {"name": "Gates of Olympus", "slug": "pragmatic-play-gates-of-olympus", "thumbnailUrl": "https://mediumrare.imgix.net/x.png", "providerGroup": {"name": "Pragmatic Play", "slug": "pragmatic-play"}, "groupGames": [{"group": {"slug": "slots"}}]}}]});
         let list = challenges_of(&ch, &|_: &str| 1.0);
         assert_eq!((list[0].target, list[0].prize_usd, list[0].game.id.as_str()), (5000.0, 500.0, "pragmatic-play-gates-of-olympus"));
         assert!(list[0].ends.is_some() && list[0].game.image.contains("fit=min"));
+        // the challenge's game opens with its provider's driver
+        assert_eq!(list[0].game.producer, "pragmaticplay");
     }
 
     #[test]
@@ -1422,14 +1480,27 @@ mod tests {
     fn engine_games() {
         let g = json!({"id": "01a0", "name": "Tongue ", "slug": "twist-gaming-tongue", "thumbnailUrl": "https://mediumrare.imgix.net/858a",
             "edge": 0.033, "isDemoEnabled": true, "providerGroup": {"name": "Twist Gaming", "translation": "Twist Gaming"}});
-        let s = slot_game(&g).unwrap();
+        let s = slot_game(&g, None).unwrap();
         assert_eq!((s.id.as_str(), s.name.as_str(), s.studio.as_deref()), ("twist-gaming-tongue", "Tongue", Some("Twist Gaming")));
         assert!((s.rtp - 96.7).abs() < 1e-9);
         assert_eq!(s.image, format!("https://mediumrare.imgix.net/858a?{THUMB}"));
         assert_eq!(crate::slots::Provider::for_producer(&s.producer), Some(crate::slots::Provider::StakeEngine));
 
         let key = json!({"name": "", "slug": "x", "providerGroup": {"name": "", "translation": "game_kurator_group.ovryx_gaming"}});
-        assert_eq!(slot_game(&key).unwrap().studio, None);
+        assert_eq!(slot_game(&key, None).unwrap().studio, None);
+
+        // the full slot list: a provider the drivers know, one they don't, a Stake Engine game
+        let pp = json!({"name": "Gates", "slug": "pragmatic-play-gates", "providerGroup": {"name": "Pragmatic Play", "slug": "pragmatic-play"}, "groupGames": [{"group": {"slug": "slots"}}]});
+        let s = slot_game(&pp, None).unwrap();
+        assert_eq!((s.producer.as_str(), s.studio.as_deref()), ("pragmaticplay", None));
+        let nl = json!({"name": "Mental", "slug": "nolimit-mental", "providerGroup": {"name": "Nolimit City", "slug": "nolimit-city"}, "groupGames": [{"group": {"slug": "slots"}}]});
+        let s = slot_game(&nl, None).unwrap();
+        assert_eq!((s.producer.as_str(), s.studio.as_deref()), ("nolimit-city", Some("Nolimit City")));
+        assert!(crate::slots::Provider::for_producer(&s.producer).is_none());
+        let se = json!({"name": "T", "slug": "twist-t", "providerGroup": {"name": "Twist Gaming", "slug": "twist-gaming"}, "groupGames": [{"group": {"slug": "slots"}}, {"group": {"slug": "stake-engine"}}]});
+        assert_eq!(slot_game(&se, None).unwrap().producer, crate::slots::STAKE_ENGINE);
+        // a provider's own list names its producer
+        assert_eq!(slot_game(&nl, Some("hacksawgaming")).unwrap().producer, "hacksawgaming");
     }
 
     #[test]
