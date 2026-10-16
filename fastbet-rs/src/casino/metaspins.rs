@@ -732,6 +732,7 @@ pub async fn self_test() {
         }
         CasinoEvent::Provable(p) => println!("seeds: client {:?}, server hash {:?}, nonce {:?}", p.client_seed, p.server_seed_hash, p.nonce),
         CasinoEvent::Token(t) => println!("login renewed ({} characters)", t.len()),
+        CasinoEvent::Vip(v) => println!("vip: {} ({} xp)", v.rank, v.exp),
     };
     loop {
         match tokio::time::timeout(Duration::from_secs(60), rx.recv()).await {

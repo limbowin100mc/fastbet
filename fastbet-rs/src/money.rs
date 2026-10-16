@@ -176,6 +176,24 @@ pub fn fmt_fiat(v: f64, code: &str) -> String {
     }
 }
 
+/// Short for big numbers: 3.614 -> "3.61", 10_550 -> "10.6k", 157_210 -> "157k", 1_250_000 -> "1.25M".
+pub fn fmt_compact(v: f64) -> String {
+    let a = v.abs();
+    let (n, suffix) = if a >= 1e9 {
+        (v / 1e9, "B")
+    } else if a >= 1e6 {
+        (v / 1e6, "M")
+    } else if a >= 1e3 {
+        (v / 1e3, "k")
+    } else {
+        (v, "")
+    };
+    let d = if n.abs() >= 100.0 { 0 } else if n.abs() >= 10.0 { 1 } else { 2 };
+    let s = format!("{n:.d$}");
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    format!("{s}{suffix}")
+}
+
 /// 2 -> "2.00×", 12345.6 -> "12,345×"
 pub fn fmt_multi(m: f64) -> String {
     if !m.is_finite() {
@@ -218,6 +236,16 @@ mod tests {
         assert_eq!(format_units(-150_000_000, 8, 8), "-1.5");
         assert_eq!(format_units(0, 8, 8), "0");
         assert_eq!(format_units(123_456_789_012, 8, 4), "1234.5678");
+    }
+
+    #[test]
+    fn compact_numbers() {
+        assert_eq!(fmt_compact(3.614), "3.61");
+        assert_eq!(fmt_compact(450.0), "450");
+        assert_eq!(fmt_compact(10_550.0), "10.6k");
+        assert_eq!(fmt_compact(3_000.0), "3k");
+        assert_eq!(fmt_compact(157_210.0), "157k");
+        assert_eq!(fmt_compact(1_250_000.0), "1.25M");
     }
 
     #[test]

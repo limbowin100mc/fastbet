@@ -48,7 +48,21 @@ pub struct ChipsGg {
     open_rounds: Mutex<HashMap<Game, Round>>,
     /// The payout tables; Mines' come from chips.gg itself.
     tables: Mutex<Tables>,
+    /// What the live `vip` state lacks, fetched after login: the ranks and the account's XP per dollar.
+    vip_extra: Mutex<VipExtra>,
+    last_vip: Mutex<Option<VipStatus>>,
 }
+
+#[derive(Default)]
+struct VipExtra {
+    /// (name, XP it starts at), lowest first.
+    ranks: Vec<(String, f64)>,
+    xp_per_usd: Option<f64>,
+}
+
+/// The notifications VIP bonuses come as; each is claimed by its id.
+const BONUS_NOTES: &[(&str, RewardKind)] = &[("vip:bonus:weekly", RewardKind::Weekly), ("vip:bonus:monthly", RewardKind::Monthly), ("vip:bonus:tier", RewardKind::LevelUp)];
+const DAY_MS: f64 = 86_400_000.0;
 
 impl ChipsGg {
     pub fn spawn(token: Option<String>, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
@@ -65,6 +79,8 @@ impl ChipsGg {
             last_market: Mutex::new(Market::default()),
             open_rounds: Mutex::new(HashMap::new()),
             tables: Mutex::new(Tables::builtin()),
+            vip_extra: Mutex::new(VipExtra::default()),
+            last_vip: Mutex::new(None),
         });
         tokio::spawn(me.clone().run());
         me
@@ -167,6 +183,8 @@ impl ChipsGg {
                     if let Ok(st) = me.provable_state().await {
                         let _ = me.events.send(CasinoEvent::Provable(st));
                     }
+                    me.load_vip_extra().await;
+                    me.publish_vip();
                 });
             }
             Err(e) => self.status(ConnStatus::AuthFailed, e.to_string()),
@@ -194,8 +212,9 @@ impl ChipsGg {
     }
 
     fn on_frame(&self, raw: &str) {
+        const MARKET: &[&str] = &["currencies", "myWallets", "me"];
         let Ok(Value::Array(msgs)) = serde_json::from_str::<Value>(raw) else { return };
-        let mut market_dirty = false;
+        let (mut market_dirty, mut vip_dirty) = (false, false);
         for m in msgs {
             let Value::Array(m) = m else { continue };
             if m.len() < 3 {
@@ -203,7 +222,11 @@ impl ChipsGg {
             }
             if m[1].is_null() {
                 let channel = m[0].as_str().unwrap_or("").to_string();
-                market_dirty |= self.apply_event(&channel, &m[2]);
+                // "": the channel's whole state
+                if let Some(key) = self.apply_event(&channel, &m[2]) {
+                    market_dirty |= key.is_empty() || MARKET.contains(&key.as_str());
+                    vip_dirty |= key.is_empty() || key == "vip";
+                }
                 continue;
             }
             let Some(id) = m[1].as_u64() else { continue };
@@ -223,15 +246,18 @@ impl ChipsGg {
         if market_dirty {
             self.publish_market();
         }
+        if vip_dirty {
+            self.publish_vip();
+        }
     }
 
-    /// Applies one `[path, data]` patch. Returns true if a key the UI cares about changed.
-    fn apply_event(&self, channel: &str, patch: &Value) -> bool {
-        const WATCHED: &[&str] = &["currencies", "myWallets", "me"];
+    /// Applies one `[path, data]` patch. Returns the top-level key it changed ("" for the whole
+    /// channel), or `None` when it was no patch.
+    fn apply_event(&self, channel: &str, patch: &Value) -> Option<String> {
         let (path, data) = match patch {
             Value::Array(a) if a.len() >= 2 => (&a[0], &a[1]),
             Value::Array(a) if a.len() == 1 => (&a[0], &Value::Null),
-            _ => return false,
+            _ => return None,
         };
         let path: Vec<String> = match path {
             Value::Array(p) => p.iter().map(value_to_string).collect(),
@@ -241,7 +267,7 @@ impl ChipsGg {
         let mut state = self.state.lock();
         if path.is_empty() {
             state.insert(channel.to_string(), data.clone());
-            return true;
+            return Some(String::new());
         }
         let root = state.entry(channel.to_string()).or_insert_with(|| json!({}));
         if !root.is_object() {
@@ -263,7 +289,7 @@ impl ChipsGg {
         } else {
             obj.insert(last.clone(), data.clone());
         }
-        WATCHED.contains(&path[0].as_str())
+        Some(path[0].clone())
     }
 
     /// The site merges every channel's state into one object; look keys up the same way.
@@ -319,6 +345,114 @@ impl ChipsGg {
         if *last != market {
             *last = market.clone();
             let _ = self.events.send(CasinoEvent::Market(market));
+        }
+    }
+
+    /// The `vip` state (pushed live as XP comes in) plus the ranks and XP rate fetched after login.
+    fn publish_vip(&self) {
+        let Some(v) = Self::pick(&self.state.lock(), "vip") else { return };
+        let num = |k: &str| v.get(k).and_then(f64_from_json).unwrap_or(0.0);
+        let exp = num("exp");
+        let status = {
+            let extra = self.vip_extra.lock();
+            VipStatus {
+                rank: v.get("rank").and_then(Value::as_str).unwrap_or("Unranked").to_string(),
+                level: Some(num("level") as u32),
+                exp,
+                level_start: num("baseLevelExp"),
+                level_end: num("nextLevelExp"),
+                rank_start: extra.ranks.iter().rev().find(|(_, at)| *at <= exp).map(|(_, at)| *at).unwrap_or(0.0),
+                next_rank: extra.ranks.iter().find(|(_, at)| *at > exp).cloned(),
+                xp_per_usd: extra.xp_per_usd,
+                in_dollars: false,
+            }
+        };
+        let mut last = self.last_vip.lock();
+        if last.as_ref() != Some(&status) {
+            *last = Some(status.clone());
+            let _ = self.events.send(CasinoEvent::Vip(status));
+        }
+    }
+
+    async fn load_vip_extra(&self) {
+        if let Ok(Value::Array(ranks)) = self.call("public", "listVipRanks", vec![json!({})]).await {
+            let ranks = ranks.iter().filter_map(|r| Some((r.get("rank")?.as_str()?.to_string(), r.get("exp").and_then(f64_from_json)?))).collect();
+            self.vip_extra.lock().ranks = ranks;
+        }
+        match self.call("private", "listMyNotifications", vec![json!({ "types": ["vip:bonus:weekly"], "limit": 12 })]).await {
+            Ok(notes) => self.vip_extra.lock().xp_per_usd = xp_rate(&notes),
+            Err(e) => tracing::info!("chipsgg: weekly bonuses: {e}"),
+        }
+    }
+
+    /// A coin's decimals and USD price, from the public `currencies` state.
+    fn coin(&self, cur: &str) -> Option<(u32, f64)> {
+        let state = self.state.lock();
+        let c = Self::pick(&state, "currencies")?.get(cur)?.clone();
+        Some((c.get("decimals")?.as_u64()? as u32, c.get("price").and_then(f64_from_json).unwrap_or(0.0)))
+    }
+
+    fn usd(&self, units: Units, cur: &str) -> Option<f64> {
+        self.coin(cur).map(|(dec, price)| crate::money::to_f64(units, dec) * price)
+    }
+
+    /// A running challenge or King of the Hill round from chips.gg's game record.
+    fn challenge_of(&self, c: &Value, koth: bool) -> Option<Challenge> {
+        let g = c.get("catalogGame")?;
+        let catalog_id = c.get("catalogid").and_then(Value::as_str)?.to_string();
+        let cur = c.get("currency").and_then(Value::as_str).unwrap_or("usdt");
+        let usd = |k: &str| c.get(k).and_then(units_from_json).and_then(|u| self.usd(u, cur)).unwrap_or(0.0);
+        // a King of the Hill pool grows with a cut of the bets
+        let prize = if koth { usd("amount").max(usd("winnings")) } else { usd("amount") };
+        let name = |u: &Value| u.get("username").and_then(Value::as_str).map(str::to_string);
+        let leader = c.get("winner").and_then(name).or_else(|| c.get("winningBet").and_then(|b| b.get("user")).and_then(name));
+        Some(Challenge {
+            id: c.get("id").and_then(Value::as_str)?.to_string(),
+            koth,
+            game: crate::slots::SlotGame {
+                id: catalog_id,
+                name: g.get("title").or(g.get("name")).and_then(Value::as_str).unwrap_or("?").to_string(),
+                producer: g.get("producer").or(g.get("provider")).and_then(Value::as_str).unwrap_or("").to_string(),
+                image: g.get("images").and_then(|i| i.get("s1").or(i.get("s2"))).and_then(Value::as_str).unwrap_or("").to_string(),
+                demo: true,
+                rtp: g.get("rtp").and_then(f64_from_json).unwrap_or(0.0),
+                provider_game_id: None,
+                studio: None,
+            },
+            target: c.get("multiplier").and_then(f64_from_json).unwrap_or(0.0),
+            min_bet_usd: usd("minBet"),
+            prize_usd: prize,
+            ends: c.get("endTime").and_then(f64_from_json).map(at_ms),
+            leader: if koth { leader } else { None },
+        })
+    }
+
+    /// Rakeback waiting in every coin: (coin, units), and what it is worth.
+    async fn rakeback(&self) -> Result<(Vec<(String, Units)>, f64), CasinoError> {
+        let funds = self.call("private", "myRakebackFunds", vec![]).await?;
+        let mut coins: Vec<(String, Units)> = funds
+            .as_object()
+            .map(|o| o.iter().filter_map(|(cur, f)| Some((cur.clone(), f.get("earned")?.get("balance").and_then(units_from_json)?))).filter(|(_, u)| *u > 0).collect())
+            .unwrap_or_default();
+        let usd: f64 = coins.iter().filter_map(|(c, u)| self.usd(*u, c)).sum();
+        coins.sort_by(|a, b| self.usd(b.1, &b.0).unwrap_or(0.0).total_cmp(&self.usd(a.1, &a.0).unwrap_or(0.0)));
+        Ok((coins, usd))
+    }
+
+    /// "0.0248 USDT" for a claim's receipt(s), where they say what was paid.
+    fn receipt_text(&self, r: &Value) -> Option<String> {
+        let one = |x: &Value| {
+            let cur = x.get("currency").and_then(Value::as_str)?;
+            let amount = x.get("amount").and_then(units_from_json)?;
+            let (dec, _) = self.coin(cur)?;
+            Some(format!("{} {}", crate::money::format_units(amount, dec, 8), cur.to_uppercase()))
+        };
+        match r {
+            Value::Array(a) => {
+                let parts: Vec<String> = a.iter().filter_map(one).collect();
+                (!parts.is_empty()).then(|| parts.join(" + "))
+            }
+            other => one(other),
         }
     }
 }
@@ -580,6 +714,220 @@ impl Casino for ChipsGg {
             })
             .collect())
     }
+
+    /// Rakeback, the daily bonus (claimable 24 hours after the last one), the weekly / monthly /
+    /// level-up bonuses (notifications, claimed by their id until they expire) and a cash reload.
+    async fn rewards(&self) -> Result<Vec<Reward>, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let types: Vec<&str> = BONUS_NOTES.iter().map(|(t, _)| *t).collect();
+        let (rakeback, perks, notes, reload) = tokio::join!(
+            self.rakeback(),
+            self.call("private", "getMyVipPerks", vec![]),
+            self.call("private", "listMyNotifications", vec![json!({ "types": types, "limit": 20 })]),
+            self.call("private", "getMyCashReload", vec![]),
+        );
+        let now = now_ms();
+        let mut out = Vec::new();
+
+        let (coins, usd) = rakeback?;
+        let detail = if coins.is_empty() {
+            "Nothing waiting yet".to_string()
+        } else {
+            coins
+                .iter()
+                .take(3)
+                .map(|(c, u)| match self.coin(c) {
+                    Some((dec, _)) => format!("{} {}", crate::money::format_units(*u, dec, 8), c.to_uppercase()),
+                    None => c.to_uppercase(),
+                })
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        out.push(Reward { id: "rakeback".into(), kind: RewardKind::Rakeback, title: RewardKind::name(RewardKind::Rakeback).to_string(), link: None, usd: Some(usd), detail, claimable: !coins.is_empty(), next_at: None, expires: None });
+
+        let perks = perks?;
+        let perk = |k: &str| perks.get(k).and_then(f64_from_json).unwrap_or(0.0);
+        if perks.get("dailyBonus").and_then(Value::as_bool) == Some(true) {
+            let at = perks.get("distributeDailyVipAt").and_then(f64_from_json).unwrap_or(0.0);
+            let ready = at <= now;
+            out.push(Reward {
+                id: "daily".into(),
+                kind: RewardKind::Daily, title: RewardKind::name(RewardKind::Daily).to_string(), link: None,
+                usd: None,
+                detail: "Plus an hour of boosted rakeback".into(),
+                claimable: ready,
+                next_at: (!ready).then(|| at_ms(at)),
+                expires: None,
+            });
+        }
+
+        let notes = notes?;
+        let notes = notes.as_array().cloned().unwrap_or_default();
+        for (ty, kind) in BONUS_NOTES {
+            let mut mine: Vec<&Value> = notes.iter().filter(|n| n.get("type").and_then(Value::as_str) == Some(ty)).collect();
+            mine.sort_by(|a, b| note_created(b).total_cmp(&note_created(a)));
+            let expires = |n: &Value| n.get("data").and_then(|d| d.get("expires")).and_then(f64_from_json).unwrap_or(0.0);
+            let open = mine.iter().find(|n| n.get("done").and_then(Value::as_bool) != Some(true) && expires(n) > now);
+            match open {
+                Some(n) => out.push(Reward {
+                    id: n.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    kind: *kind, title: RewardKind::name(*kind).to_string(), link: None,
+                    usd: bonus_usd(n),
+                    detail: n.get("title").and_then(Value::as_str).unwrap_or(kind.name()).to_string(),
+                    claimable: true,
+                    next_at: None,
+                    expires: Some(at_ms(expires(n))),
+                }),
+                // the bonuses this rank gets, when the next one drops
+                None if *kind != RewardKind::LevelUp => {
+                    let rate = perk(if *kind == RewardKind::Weekly { "weeklyBonus" } else { "monthlyBonus" });
+                    if rate <= 0.0 {
+                        continue;
+                    }
+                    let next = if *kind == RewardKind::Weekly { next_monday(now) } else { next_month(now) };
+                    let when = if *kind == RewardKind::Weekly { "Mondays" } else { "The 1st of the month" };
+                    let detail = match mine.first().and_then(|n| bonus_usd(n)) {
+                        Some(v) => format!("{when} · last {}", crate::money::fmt_usd(v)),
+                        None => format!("{when}, after a week of play"),
+                    };
+                    out.push(Reward { id: String::new(), kind: *kind, title: RewardKind::name(*kind).to_string(), link: None, usd: None, detail, claimable: false, next_at: Some(at_ms(next)), expires: None });
+                }
+                None => {}
+            }
+        }
+
+        // an error is "You don't have an active cash reload!"
+        if let Ok(r) = reload {
+            if let Some(id) = r.get("id").and_then(Value::as_str).filter(|_| r.get("done").and_then(Value::as_bool) != Some(true)) {
+                let per = r.get("amountPerClaim").and_then(units_from_json).and_then(|u| self.usd(u, "usdt"));
+                let left = r.get("maxClaims").and_then(Value::as_u64).unwrap_or(1).saturating_sub(r.get("count").and_then(Value::as_u64).unwrap_or(0));
+                out.push(Reward {
+                    id: id.to_string(),
+                    kind: RewardKind::Reload, title: RewardKind::name(RewardKind::Reload).to_string(), link: None,
+                    usd: per,
+                    detail: r.get("status").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{left} claims left")),
+                    claimable: left > 0,
+                    next_at: None,
+                    expires: r.get("expiresAt").and_then(f64_from_json).map(at_ms),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn claim_reward(&self, id: &str, currency: &str) -> Result<String, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let paid = |r: Value| self.receipt_text(&r).map(|t| format!("Claimed {t}")).unwrap_or_else(|| "Claimed".into());
+        match id {
+            // rakeback is paid in the coins it was earned in
+            "rakeback" => {
+                let (coins, _) = self.rakeback().await?;
+                if coins.is_empty() {
+                    return Err(CasinoError::Server("No rakeback to claim yet".into()));
+                }
+                let mut texts = Vec::new();
+                for (cur, _) in coins {
+                    let r = self.call("private", "claimRakebackEarnings", vec![json!({ "currency": cur })]).await?;
+                    texts.extend(self.receipt_text(&r));
+                }
+                Ok(if texts.is_empty() { "Rakeback claimed".into() } else { format!("Claimed {}", texts.join(" + ")) })
+            }
+            "daily" => Ok(paid(self.call("private", "claimDailyVipBonus", vec![json!({ "currency": currency })]).await?)),
+            _ if id.starts_with("reload:") => Ok(paid(self.call("private", "claimMyCashReload", vec![json!({ "reloadid": id, "currency": currency })]).await?)),
+            _ if !id.is_empty() => Ok(paid(self.call("private", "claimVipBonus", vec![json!({ "id": id, "currency": currency })]).await?)),
+            _ => Err(CasinoError::Server("Nothing to claim yet".into())),
+        }
+    }
+
+    /// The running challenges, and the King of the Hill round when one is on (the public state
+    /// keeps the latest round, ended or not).
+    async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
+        let list = self.call("public", "listChallenges", vec![json!({})]).await?;
+        let mut out: Vec<Challenge> = list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c.get("state").and_then(Value::as_str) == Some("running") && c.get("done").and_then(Value::as_bool) != Some(true))
+            .filter_map(|c| self.challenge_of(c, false))
+            .collect();
+        let koth = Self::pick(&self.state.lock(), "koth");
+        let koth = match koth {
+            Some(k) => Some(k),
+            None => self.call("public", "getKothGame", vec![json!({})]).await.ok(),
+        };
+        if let Some(k) = koth.filter(|k| k.get("id").is_some() && k.get("done").and_then(Value::as_bool) != Some(true)) {
+            out.extend(self.challenge_of(&k, true));
+        }
+        // King of the Hill first, then the biggest prizes
+        out.sort_by(|a, b| b.koth.cmp(&a.koth).then(b.prize_usd.total_cmp(&a.prize_usd)));
+        Ok(out)
+    }
+}
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
+}
+
+fn at_ms(ms: f64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_millis(ms.max(0.0) as u64)
+}
+
+fn note_created(n: &Value) -> f64 {
+    n.get("created").and_then(f64_from_json).unwrap_or(0.0)
+}
+
+/// A VIP bonus note's worth: its USDT amount, else the "$2.8" in its text.
+fn bonus_usd(n: &Value) -> Option<f64> {
+    if let Some(u) = n.get("data").and_then(|d| d.get("gpRewardTotalUsdt")).and_then(units_from_json) {
+        return Some(crate::money::to_f64(u, 6));
+    }
+    let text = n.get("text").and_then(Value::as_str)?;
+    let rest = &text[text.find('$')? + 1..];
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',').filter(|c| *c != ',').collect();
+    num.trim_end_matches('.').parse().ok()
+}
+
+/// XP a dollar wagered earns the account, from its weekly bonus notes: each has the XP at the time
+/// and that week's wager, so the XP gained between two weeks over the later week's wager is the
+/// rate. The last eight weeks, while they add up to a wager worth measuring.
+fn xp_rate(notes: &Value) -> Option<f64> {
+    let mut weeks: Vec<(f64, f64, f64)> = notes
+        .as_array()?
+        .iter()
+        .filter_map(|n| {
+            let d = n.get("data")?;
+            Some((note_created(n), d.get("exp").and_then(f64_from_json)?, d.get("totalWager").and_then(f64_from_json)?))
+        })
+        .collect();
+    weeks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut xp, mut usd) = (0.0, 0.0);
+    for w in weeks.windows(2).rev().take(8) {
+        let ((t0, xp0, _), (t1, xp1, wager)) = (w[0], w[1]);
+        if ((t1 - t0) - 7.0 * DAY_MS).abs() < DAY_MS / 2.0 && xp1 >= xp0 {
+            xp += xp1 - xp0;
+            usd += wager;
+        }
+    }
+    (usd >= 50.0 && xp > 0.0).then(|| xp / usd)
+}
+
+/// The next Monday 00:00 UTC (the weekly bonus drops then).
+fn next_monday(now: f64) -> f64 {
+    let day = (now / DAY_MS).floor();
+    // 1970-01-01 was a Thursday
+    let since_monday = (day as i64 + 3).rem_euclid(7);
+    (day + (7 - since_monday) as f64) * DAY_MS
+}
+
+/// The 1st of next month, 00:00 UTC (the monthly bonus drops then).
+fn next_month(now: f64) -> f64 {
+    let (y, m, _) = civil_from_days((now / DAY_MS).floor() as i64);
+    let (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    days_from_civil(y, m, 1) as f64 * DAY_MS
 }
 
 /// A catalog reply: a list, or `{results: [...]}`.
@@ -738,6 +1086,69 @@ mod tests {
             {"card":{"hit":12,"color":"black","suit":"spades"},"choice":"startCard","multiplier":1},
             {"card":{"hit":9,"suit":"hearts","color":"red"},"multiplier":0,"choice":"face","win":false}]});
         assert_eq!(round_of(Game::Hilo, &lost, &tables).unwrap().multiplier, 0.0);
+    }
+
+    #[test]
+    fn bonus_schedule_and_xp_rate() {
+        // 2026-10-16 08:00 UTC (a Friday)
+        let now = 1_792_137_600_000.0;
+        assert_eq!(next_monday(now), 1_792_368_000_000.0); // Monday 2026-10-19 00:00
+        assert_eq!(next_month(now), 1_793_491_200_000.0); // 2026-11-01 00:00
+        assert_eq!(next_month(1_796_860_800_000.0), 1_798_761_600_000.0); // 2026-12-10 -> 2027-01-01
+        assert_eq!(civil_from_days(days_from_civil(2028, 2, 29)), (2028, 2, 29));
+
+        // weekly notes as chips.gg sends them (exp at the time, that week's wager in USD)
+        let note = |created: f64, exp: f64, wager: f64| json!({ "created": created, "data": { "exp": exp, "totalWager": wager } });
+        let w = 7.0 * DAY_MS;
+        let notes = json!([note(1_791_763_267_034.0, 532_840.0, 5393.9), note(1_791_763_267_034.0 - w, 518_071.0, 1974.8), note(1_791_763_267_034.0 - 2.0 * w, 512_945.0, 1529.6)]);
+        let rate = xp_rate(&notes).unwrap();
+        assert!((rate - (14_769.0 + 5126.0) / (5393.9 + 1974.8)).abs() < 1e-9);
+        // too little wagered to say
+        assert_eq!(xp_rate(&json!([note(0.0, 10.0, 1.0), note(w, 20.0, 5.0)])), None);
+
+        let bonus = json!({ "text": "Your weekly VIP Bonus of $2.8 is now available, claim your reward before it expires!", "data": { "gpRewardTotalUsdt": "2800000" } });
+        assert_eq!(bonus_usd(&bonus), Some(2.8));
+        assert_eq!(bonus_usd(&json!({ "text": "Your monthly VIP Bonus of $1,210.5 is now available." })), Some(1210.5));
+    }
+
+    /// A client with only the given state, for the parsers that read it.
+    fn offline(public: Value) -> ChipsGg {
+        ChipsGg {
+            seq: AtomicU64::new(0),
+            out: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            state: Mutex::new(HashMap::from([("public".to_string(), public)])),
+            token: Mutex::new(None),
+            token_changed: Notify::new(),
+            alive: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            events: mpsc::unbounded_channel().0,
+            last_market: Mutex::new(Market::default()),
+            open_rounds: Mutex::new(HashMap::new()),
+            tables: Mutex::new(Tables::builtin()),
+            vip_extra: Mutex::new(VipExtra::default()),
+            last_vip: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn challenges_and_koth() {
+        let c = offline(json!({ "currencies": { "usdt": { "decimals": 6, "price": 1 } } }));
+        // a King of the Hill round as chips.gg keeps it (trimmed), still running
+        let koth = json!({"id":"22d03d82","type":"koth","done":false,"state":"running","currency":"usdt","minBet":"200000","amount":"250000000","winnings":"284094372",
+            "catalogid":"hacksawgaming-le-vampire","multiplier":518.2,"endTime":1792082878253u64,
+            "winningBet":{"user":null},"winner":{"username":"HeftigerNever"},
+            "catalogGame":{"id":"hacksawgaming-le-vampire","title":"Le Vampire","provider":"hacksawgaming","producer":"hacksawgaming","images":{"s1":"https://cdn.hub88.io/hacksawgaming/hsg_levampire.jpg"},"rtp":96.36}});
+        let k = c.challenge_of(&koth, true).unwrap();
+        assert!(k.koth && k.target == 518.2 && k.game.name == "Le Vampire" && k.game.producer == "hacksawgaming");
+        assert!((k.min_bet_usd - 0.2).abs() < 1e-9 && (k.prize_usd - 284.094372).abs() < 1e-9);
+        assert_eq!(k.leader.as_deref(), Some("HeftigerNever"));
+        assert!(k.ends.is_some());
+        let ch = json!({"id":"challenge:7ff7","state":"running","done":false,"currency":"usdt","minBet":"400000","amount":"150000000","winnings":"150000000",
+            "catalogid":"wickedgames-lucked","multiplier":1500,"endTime":1792993038313u64,"winner":null,
+            "catalogGame":{"id":"wickedgames-lucked","title":"Lucked","provider":"wickedgames","producer":"wickedgames","images":{"s1":"https://cdn.hub88.io/wicked/wckd_lucked.jpg"},"rtp":96.15}});
+        let ch = c.challenge_of(&ch, false).unwrap();
+        assert!(!ch.koth && ch.target == 1500.0 && (ch.prize_usd - 150.0).abs() < 1e-9 && (ch.min_bet_usd - 0.4).abs() < 1e-9 && ch.leader.is_none());
     }
 
     #[test]

@@ -61,6 +61,12 @@ pub enum Command {
     StopSlot,
     PauseSlot,
     SlotStopOnNextWin,
+    /// Rakeback and bonuses; answered with `Event::Rewards`.
+    Rewards,
+    /// Claims a reward in `currency`; answered with `Event::RewardClaimed`, then `Event::Rewards`.
+    ClaimReward { id: String, currency: String },
+    /// Running slot challenges; answered with `Event::Challenges`.
+    Challenges,
     Shutdown,
 }
 
@@ -102,7 +108,8 @@ pub enum Event {
     Seed(SeedInfo),
     Auto(AutoState),
     Flash(String),
-    Slots { kind: SlotListKind, skip: usize, games: Vec<crate::slots::SlotGame>, error: Option<String> },
+    /// A page of the slot catalog; `producer` is the one asked for.
+    Slots { kind: SlotListKind, skip: usize, producer: Option<String>, games: Vec<crate::slots::SlotGame>, error: Option<String> },
     Slot(slots::SlotState),
     Spin(slots::SpinRecord),
     /// Every answer about an original's round, open or settled (settled ones also come as `Bet`).
@@ -111,6 +118,10 @@ pub enum Event {
     RoundFailed { game: Game },
     OriginalTables(Tables),
     Originals(Vec<crate::slots::SlotGame>),
+    Vip(casino::VipStatus),
+    Rewards(Result<Vec<casino::Reward>, String>),
+    RewardClaimed { id: String, result: Result<String, String> },
+    Challenges(Result<Vec<casino::Challenge>, String>),
 }
 
 /// A bet on an original, before the casino adds its own fields.
@@ -500,7 +511,7 @@ impl Engine {
                 Command::ListSlots { kind, filter } => {
                     let me = self.clone();
                     tokio::spawn(async move {
-                        let skip = filter.skip;
+                        let (skip, producer) = (filter.skip, filter.producer.clone());
                         let casino = me.casino.lock().clone();
                         let res = match casino {
                             Some(c) => c.list_slots(filter).await.map_err(|e| e.to_string()),
@@ -510,7 +521,7 @@ impl Engine {
                             Ok(g) => (g, None),
                             Err(e) => (vec![], Some(e)),
                         };
-                        me.emit(Event::Slots { kind, skip, games, error });
+                        me.emit(Event::Slots { kind, skip, producer, games, error });
                     });
                 }
                 Command::OpenSlot { game, mode, currency, fiat } => {
@@ -530,6 +541,26 @@ impl Engine {
                         drop(s);
                         self.emit_slot();
                     }
+                }
+                Command::Rewards => {
+                    let me = self.clone();
+                    tokio::spawn(async move { me.emit_rewards().await });
+                }
+                Command::ClaimReward { id, currency } => {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let Ok(casino) = me.casino() else { return };
+                        let result = casino.claim_reward(&id, &currency).await.map_err(|e| e.to_string());
+                        me.emit(Event::RewardClaimed { id, result });
+                        me.emit_rewards().await;
+                    });
+                }
+                Command::Challenges => {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let Ok(casino) = me.casino() else { return };
+                        me.emit(Event::Challenges(casino.challenges().await.map_err(|e| e.to_string())));
+                    });
                 }
                 Command::Shutdown => break,
             }
@@ -565,10 +596,16 @@ impl Engine {
                     CasinoEvent::Market(m) => Event::Market(m),
                     CasinoEvent::Provable(p) => Event::Provable(p),
                     CasinoEvent::Token(t) => Event::Token(id, t),
+                    CasinoEvent::Vip(v) => Event::Vip(v),
                 });
             }
         });
         *self.forwarder.lock() = Some(fwd);
+    }
+
+    async fn emit_rewards(&self) {
+        let Ok(casino) = self.casino() else { return };
+        self.emit(Event::Rewards(casino.rewards().await.map_err(|e| e.to_string())));
     }
 
     // ------------------------------------------------------------- seed

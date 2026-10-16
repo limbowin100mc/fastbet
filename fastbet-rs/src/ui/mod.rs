@@ -2,6 +2,7 @@
 //! (left rail, top bar, stats panel) around the lobby and the Limbo page.
 
 pub mod accounts;
+pub mod challenges;
 pub mod coins;
 pub mod controls;
 pub mod hitcard;
@@ -13,6 +14,7 @@ pub mod logos;
 pub mod original;
 pub mod originals;
 pub mod prefs;
+pub mod rewards;
 pub mod slot;
 pub mod slots_lobby;
 pub mod sound;
@@ -21,6 +23,7 @@ pub mod stats_pane;
 pub mod theme;
 pub mod titlebar;
 pub mod update;
+pub mod vip;
 pub mod wallet;
 pub mod widgets;
 
@@ -56,6 +59,8 @@ pub enum Screen {
     Slot,
     /// An original besides Limbo.
     Original(crate::originals::Game),
+    /// Rakeback and VIP bonuses to claim (casinos with rewards).
+    Rewards,
 }
 
 /// Where the account screen is in the connect flow.
@@ -171,6 +176,12 @@ pub struct App {
     // originals
     pub orig: originals::State,
 
+    // VIP level, rewards and slot challenges (casinos that have them)
+    pub vip: Option<crate::casino::VipStatus>,
+    pub vip_open: bool,
+    pub rewards: rewards::State,
+    pub challenges: challenges::State,
+
     dirty: bool,
     last_save: Instant,
     title: String,
@@ -191,6 +202,7 @@ impl App {
             Ok("limbo") => Screen::Limbo,
             Ok("slots") => Screen::Slots,
             Ok("account") => Screen::Account,
+            Ok("rewards") => Screen::Rewards,
             // FASTBET_SCREEN=orig:<slug> opens an original's page (UI work)
             Ok(v) if v.starts_with("orig:") => crate::originals::Game::from_slug(&v[5..]).map(Screen::Original).unwrap_or(Screen::Lobby),
             _ => Screen::Accounts,
@@ -289,6 +301,12 @@ impl App {
             slot_stats: Stats::fresh("USD", 2),
             slot_pop: None,
             orig: originals::State::default(),
+            vip: None,
+            // FASTBET_VIP=1: the VIP dropdown opens at start (UI work)
+            vip_open: std::env::var("FASTBET_VIP").is_ok(),
+            rewards: rewards::State::default(),
+            // FASTBET_CHALLENGES=1: the challenges window opens at start (UI work)
+            challenges: challenges::State { window_open: std::env::var("FASTBET_CHALLENGES").is_ok(), ..Default::default() },
             dirty: false,
             last_save: Instant::now(),
             title: String::new(),
@@ -329,6 +347,14 @@ impl App {
         if std::env::var("FASTBET_CLOUDFLARE").is_ok() {
             app.open_settings();
             app.cf_open = true;
+        }
+        // FASTBET_PROVIDERS=open: the slots lobby opens with its provider list out; =<name>,<name> picks those (UI work)
+        if let Ok(v) = std::env::var("FASTBET_PROVIDERS") {
+            if v == "open" {
+                app.catalog.providers_open = true;
+            } else {
+                app.catalog.providers = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
         }
         // FASTBET_UPDATE=1: run "Check for updates" at start (UI work)
         if std::env::var("FASTBET_UPDATE").is_ok() {
@@ -394,6 +420,10 @@ impl App {
 
     pub fn casino(&self) -> CasinoId {
         self.settings.casino
+    }
+
+    pub fn send(&self, cmd: Command) {
+        self.engine.send(cmd);
     }
 
     /// The casino as the user reaches it: its name, or the mirror's domain when that isn't the main site.
@@ -885,6 +915,10 @@ impl App {
         // every casino has its own slot catalog and originals
         self.catalog = slots_lobby::Catalog::default();
         self.orig = originals::State::default();
+        self.vip = None;
+        self.vip_open = false;
+        self.rewards = rewards::State::default();
+        self.challenges = challenges::State::default();
         self.provable = ProvableState::default();
         self.status = ConnStatus::Connecting;
         self.status_detail.clear();
@@ -1176,6 +1210,13 @@ impl App {
         self.screen = Screen::Limbo;
     }
 
+    pub fn go_rewards(&mut self) {
+        self.leave_slot();
+        self.screen = Screen::Rewards;
+        // fresh numbers every time the page opens
+        self.rewards.asked_at = None;
+    }
+
     // ------------------------------------------------------------ slots
 
     pub fn go_slots(&mut self) {
@@ -1191,7 +1232,7 @@ impl App {
         if !self.casino().slots_curated() {
             for p in self.casino().slot_producers() {
                 self.catalog.loading += 1;
-                self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: 100, ..Default::default() } });
+                self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter: SlotFilter { producer: Some((*p).into()), limit: slots_lobby::PROVIDER_PAGE, ..Default::default() } });
             }
         }
         self.engine.send(Command::ListSlots { kind: SlotListKind::All, filter: SlotFilter { limit: slots_lobby::PAGE, ..Default::default() } });
@@ -1510,15 +1551,24 @@ impl App {
                     self.auto = a;
                 }
                 Event::Flash(m) => self.flash(m),
-                Event::Slots { kind, skip, games, error } => {
+                Event::Slots { kind, skip, producer, games, error } => {
                     self.catalog.loading = self.catalog.loading.saturating_sub(1);
                     self.catalog.error = error.filter(|e| !e.contains("Not connected"));
                     match kind {
                         SlotListKind::Featured => {
+                            let (got, mut fresh) = (games.len(), 0);
                             for g in games {
                                 if !self.catalog.featured.iter().any(|x| x.id == g.id) {
                                     self.catalog.featured.push(g);
+                                    fresh += 1;
                                 }
+                            }
+                            // a (nearly) full page: the provider has more, and the provider filter wants them all.
+                            // The casino drops a few non-slots from a page, so it can come back a little short.
+                            if got >= slots_lobby::PROVIDER_PAGE / 2 && fresh > 0 {
+                                self.catalog.loading += 1;
+                                let filter = SlotFilter { producer, skip: skip + slots_lobby::PROVIDER_PAGE, limit: slots_lobby::PROVIDER_PAGE, ..Default::default() };
+                                self.engine.send(Command::ListSlots { kind: SlotListKind::Featured, filter });
                             }
                         }
                         SlotListKind::Search => self.catalog.results = games,
@@ -1563,6 +1613,36 @@ impl App {
                 }
                 Event::OriginalTables(t) => self.orig.tables = t,
                 Event::Originals(list) => self.orig.catalog = list,
+                Event::Vip(v) => self.vip = Some(v),
+                Event::Rewards(res) => match res {
+                    Ok(list) => {
+                        self.rewards.list = list;
+                        self.rewards.loaded = true;
+                        self.rewards.error = None;
+                    }
+                    Err(e) => self.rewards.error = Some(e),
+                },
+                Event::RewardClaimed { id, result } => {
+                    self.rewards.claiming.remove(&id);
+                    match result {
+                        Ok(msg) => self.notice = Some((msg, Instant::now())),
+                        Err(e) => self.flash(e),
+                    }
+                }
+                Event::Challenges(res) => match res {
+                    Ok(list) => {
+                        self.challenges.list = list;
+                        self.challenges.loaded = true;
+                        self.challenges.error = None;
+                    }
+                    Err(e) => {
+                        // the socket may still be connecting: ask again soon (any other refusal waits its turn)
+                        if e.contains("Not connected") {
+                            self.challenges.asked_at = Instant::now().checked_sub(Duration::from_secs(50));
+                        }
+                        self.challenges.error = Some(e).filter(|e| !e.contains("Not connected"));
+                    }
+                },
             }
         }
     }
@@ -1597,6 +1677,7 @@ impl App {
         }
         if space {
             match self.screen {
+                Screen::Rewards => {}
                 Screen::Original(g) => {
                     if self.settings.mode == crate::settings::Mode::Manual || !g.auto() {
                         self.orig_bet(g);
@@ -1630,6 +1711,7 @@ impl App {
                     Screen::Limbo => " – Limbo".to_string(),
                     Screen::Original(g) => format!(" – {}", self.casino().original_name(g)),
                     Screen::Slots => " – Slots".to_string(),
+                    Screen::Rewards => " – Rewards".to_string(),
                     Screen::Slot => {
                         let g = self.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "Slot".into());
                         let state = if self.slot.running { " [Running]" } else { "" };
@@ -1658,6 +1740,18 @@ impl App {
             ui.add_space(4.0);
             widgets::logo_mark(ui, 32.0);
             ui.add_space(18.0);
+            if self.casino().has_rewards() {
+                let resp = widgets::rail_button(ui, self.screen == Screen::Rewards, "Rewards", widgets::paint_gift);
+                // something waits to be claimed
+                if self.rewards.any_claimable() {
+                    let c = resp.rect.right_top() + egui::vec2(-7.0, 7.0);
+                    ui.painter().circle_filled(c, 4.5, BG1);
+                    ui.painter().circle_filled(c, 3.2, rewards::DOT);
+                }
+                if resp.clicked() {
+                    self.go_rewards();
+                }
+            }
             // Limbo and every other original open from the Originals lobby
             let in_originals = matches!(self.screen, Screen::Lobby | Screen::Limbo | Screen::Original(_));
             if widgets::rail_button(ui, in_originals, "Originals", widgets::paint_die).clicked() {
@@ -1701,7 +1795,14 @@ impl App {
                 let hr = ui.max_rect();
                 let pill_rect = egui::Rect::from_center_size(pos2(hr.center().x, hr.center().y), egui::vec2(260.0, 34.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pill_rect).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)));
-                child.horizontal_centered(|ui| wallet::pill(self, ui));
+                let wallet = child.horizontal_centered(|ui| wallet::pill(self, ui)).response;
+                // the VIP level, just right of the balance
+                if self.casino().has_vip() && self.vip.is_some() {
+                    let left = wallet.rect.right() + 10.0;
+                    let vr = egui::Rect::from_min_max(pos2(left, hr.center().y - 17.0), pos2(hr.right().max(left + 1.0), hr.center().y + 17.0));
+                    let mut vui = ui.new_child(egui::UiBuilder::new().max_rect(vr).layout(Layout::left_to_right(Align::Center)));
+                    vip::pill(self, &mut vui);
+                }
             });
         });
         if !self.wallet_open {
@@ -1826,6 +1927,13 @@ impl eframe::App for App {
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
             self.go_lobby();
         }
+        if self.screen == Screen::Rewards && !self.casino().has_rewards() {
+            self.go_lobby();
+        }
+        // now and then in the background, for the dot on the rail's Rewards button
+        if matches!(self.screen, Screen::Lobby | Screen::Limbo | Screen::Slots | Screen::Slot | Screen::Original(_)) {
+            rewards::refresh(self, Duration::from_secs(300));
+        }
         if let Screen::Original(g) = self.screen {
             if !self.casino().originals().contains(&g) {
                 self.go_lobby();
@@ -1880,7 +1988,7 @@ impl eframe::App for App {
             Screen::Account => {
                 egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| accounts::account(self, ui));
             }
-            Screen::Lobby | Screen::Limbo | Screen::Slots | Screen::Slot | Screen::Original(_) => {
+            Screen::Lobby | Screen::Limbo | Screen::Slots | Screen::Slot | Screen::Original(_) | Screen::Rewards => {
                 egui::Panel::left("rail")
                     .exact_size(60.0)
                     .resizable(false)
@@ -1925,6 +2033,7 @@ impl eframe::App for App {
                         Screen::Slots => slots_lobby::show(self, ui),
                         Screen::Slot => slot::show(self, ui),
                         Screen::Original(g) => original::show(self, ui, g),
+                        Screen::Rewards => rewards::show(self, ui),
                         _ => lobby::show(self, ui),
                     }
                     self.toast(ui, area);
@@ -1936,6 +2045,9 @@ impl eframe::App for App {
         }
         prefs::show(self, ui.ctx());
         hits::show(self, ui.ctx());
+        if matches!(self.screen, Screen::Slots | Screen::Slot) {
+            challenges::window(self, ui.ctx());
+        }
         update::show(self, ui.ctx());
         titlebar::resize_grips(ui);
     }

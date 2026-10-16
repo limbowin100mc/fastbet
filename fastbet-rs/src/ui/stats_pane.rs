@@ -1,4 +1,5 @@
-//! The Session pane: session profit with its chart, then the numbers in grouped cards.
+//! The Session pane: session profit with its chart, the statistics as one list, and the
+//! ranked lists (multipliers, streaks) in tabs.
 //! It sits on the right, or floats wherever it's dragged to, and minimizes to a small card
 //! with just the profit.
 
@@ -7,10 +8,10 @@ use egui::{
     StrokeKind, Ui, UiBuilder, Vec2,
 };
 
-use super::theme::{self, alpha, BG1, BG2, DIM, G1, GOLD, GREEN, LINE, LINE2, MUTED, RED, TEXT};
+use super::theme::{self, alpha, BG1, BG2, DIM, G1, GOLD, GREEN, LINE, LINE2, MUTED, RED, TEXT, TEXT2};
 use super::widgets::{self, semi};
 use super::{titlebar, App, Screen};
-use crate::money::{fmt_int, fmt_ms, fmt_multi};
+use crate::money::{fmt_int, fmt_ms, fmt_multi, fmt_time};
 
 /// Width of the floating pane.
 const FLOAT_W: f32 = 292.0;
@@ -28,17 +29,6 @@ const FLOAT: &str = "session-float";
 const ROW_H: f32 = 26.0;
 /// Rows a ranked list shows before it scrolls.
 const LIST_ROWS: f32 = 5.0;
-
-struct Cell {
-    cap: &'static str,
-    value: String,
-    color: Color32,
-    sub: String,
-}
-
-fn cell(cap: &'static str, value: String, color: Color32, sub: impl Into<String>) -> Cell {
-    Cell { cap, value, color, sub: sub.into() }
-}
 
 /// The pane docked: it fills the right side panel.
 pub fn docked(app: &mut App, ui: &mut Ui) {
@@ -161,7 +151,13 @@ fn header(app: &mut App, ui: &mut Ui, docked_pane: Option<Rect>) {
     }
     let p = ui.painter();
     widgets::icon(p, Rect::from_center_size(pos2(row.left() + 4.0, row.center().y), vec2(8.0, 12.0)), "grip", DIM);
-    p.text(pos2(row.left() + 16.0, row.center().y), Align2::LEFT_CENTER, if slots { "Slot session" } else { "Session" }, theme::font_bold(14.0), TEXT);
+    let title = p.text(pos2(row.left() + 16.0, row.center().y), Align2::LEFT_CENTER, if slots { "Slot session" } else { "Session" }, theme::font_bold(14.0), TEXT);
+    // how long it has run: up to now while betting, else to the last bet
+    let (s, running) = if slots { (&app.slot_stats, app.slot.running) } else { (&app.stats, app.auto.running) };
+    if let (Some(start), Some(last)) = (s.started, s.last_at) {
+        let end = if running { std::time::Instant::now() } else { last };
+        p.text(pos2(title.right() + 10.0, row.center().y + 0.5), Align2::LEFT_CENTER, fmt_time(end.duration_since(start).as_millis()), theme::font_mono(11.0), DIM);
+    }
 
     let mut buttons = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
     buttons.spacing_mut().item_spacing.x = 2.0;
@@ -223,8 +219,8 @@ fn currency(app: &App) -> (bool, String, bool) {
     (slots, cur, has)
 }
 
-/// The profit card and the numbers, scrolling. `max_h` caps their height (floating); without
-/// it they fill what's left (docked).
+/// The profit card, the statistics and the ranked lists, scrolling. `max_h` caps their height
+/// (floating); without it they fill what's left (docked).
 fn body(app: &mut App, ui: &mut Ui, max_h: Option<f32>) {
     let scroll = match max_h {
         // an Area lays out in last frame's size: the minimum lets it grow back to what the numbers need
@@ -242,7 +238,7 @@ fn body(app: &mut App, ui: &mut Ui, max_h: Option<f32>) {
 
         // profit, the number that matters most, with the curve under it
         let edge = s.edge_pct().map(|e| format!("{}{e:.2}%", if e >= 0.0 { "+" } else { "" }));
-        let sub = [edge, Some(sec(s.profit, true)).filter(|x| !x.is_empty())].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
+        let sub = [Some(sec(s.profit, true)).filter(|x| !x.is_empty()), edge].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
         profit_card(ui, full, &prim(s.profit, true), theme::pnl(s.profit), &sub, s.bets, &s.chart_points());
 
         let (streak, streak_c) = if s.streak > 0 {
@@ -252,56 +248,42 @@ fn body(app: &mut App, ui: &mut Ui, max_h: Option<f32>) {
         } else {
             ("–".to_string(), TEXT)
         };
-        let rtp = s.rtp_pct();
-        grid(
-            ui,
-            full,
-            vec![
-                [
-                    cell("Bet speed", format!("{per_s:.1}/s"), if per_s > 0.0 { G1 } else { TEXT }, format!("{}/m · {}", fmt_int(per_m as i128), fmt_ms(s.latency))),
-                    cell("Streak", streak, streak_c, format!("best W{} · L{}", s.best_win_streak(), s.worst_loss_streak())),
-                ],
-                [
-                    cell("Wins", fmt_int(s.wins as i128), GREEN, s.win_pct().map(|p| format!("{p:.2}%")).unwrap_or("–".into())),
-                    cell("Losses", fmt_int(s.losses as i128), RED, if s.hits > 0 { format!("{} hit{}", s.hits, if s.hits > 1 { "s" } else { "" }) } else { String::new() }),
-                ],
-                [
-                    cell("Wagered", prim(s.wagered, false), TEXT, sec(s.wagered, false)),
-                    cell("RTP", rtp.map(|r| format!("{r:.2}%")).unwrap_or("–".into()), if rtp.is_none() { TEXT } else if rtp.unwrap_or(0.0) >= 100.0 { GREEN } else { RED }, format!("{} bets", fmt_int(s.bets as i128))),
-                ],
-            ],
-        );
-        grid(
-            ui,
-            full,
-            vec![
-                [
-                    cell("Highest profit", prim(s.peak, true), theme::pnl(s.peak), ""),
-                    cell("Lowest", prim(s.low, false), theme::pnl(s.low), ""),
-                ],
-                [
-                    cell("Highest win", prim(s.hi_win, true), if s.hi_win > 0 { GREEN } else { TEXT }, ""),
-                    cell("Highest loss", prim(-s.hi_loss, false), if s.hi_loss > 0 { RED } else { TEXT }, ""),
-                ],
-                [
-                    cell("Max drawdown", prim(-s.max_dd, false), if s.max_dd > 0 { RED } else { TEXT }, ""),
-                    cell("Highest bet", prim(s.hi_bet, false), TEXT, ""),
-                ],
-            ],
-        );
-        if s.retries > 0 {
-            grid(ui, full, vec![[cell("Busy retries", fmt_int(s.retries as i128), GOLD, "server said wait"), cell("", String::new(), TEXT, "")]]);
+        let dash = |v: i128, sign: bool| if v == 0 { "–".to_string() } else { prim(v, sign) };
+        let mut activity = vec![
+            row("Speed", if s.bets > 0 { format!("{per_s:.1}/s") } else { "–".into() }, TEXT, if s.bets > 0 { format!("{}/m", fmt_int(per_m as i128)) } else { String::new() }),
+            row("Latency", if s.latency > 0.0 { fmt_ms(s.latency) } else { "–".into() }, TEXT, ""),
+            row("Wagered", prim(s.wagered, false), TEXT, sec(s.wagered, false)),
+            row("Wins / losses", format!("{} / {}", fmt_int(s.wins as i128), fmt_int(s.losses as i128)), TEXT, s.win_pct().map(|p| format!("{p:.1}%")).unwrap_or_default()),
+            row("RTP", s.rtp_pct().map(|r| format!("{r:.2}%")).unwrap_or("–".into()), TEXT, ""),
+            row("Streak", streak, streak_c, if s.bets > 0 { format!("best W{} · L{}", s.best_win_streak(), s.worst_loss_streak()) } else { String::new() }),
+        ];
+        if s.hits > 0 {
+            activity.push(row("Hits", fmt_int(s.hits as i128), TEXT, ""));
         }
+        let mut extremes = vec![
+            row("Highest profit", dash(s.peak, true), TEXT, ""),
+            row("Lowest profit", dash(s.low, false), TEXT, ""),
+            row("Biggest win", dash(s.hi_win, true), TEXT, ""),
+            row("Biggest loss", dash(-s.hi_loss, false), TEXT, ""),
+            row("Max drawdown", dash(-s.max_dd, false), TEXT, ""),
+            row("Highest bet", dash(s.hi_bet, false), TEXT, ""),
+        ];
+        if s.retries > 0 {
+            extremes.push(row("Busy retries", fmt_int(s.retries as i128), GOLD, ""));
+        }
+        stats_card(ui, full, &[activity, extremes]);
+
         let multis: Vec<Ranked> = s.top_multi.iter().map(|m| Ranked { value: fmt_multi(m.multi), amount: prim(m.profit, true), tip: Some("Open the card".into()) }).collect();
         let multi_ns: Vec<u64> = s.top_multi.iter().map(|m| m.n).collect();
         let streak_rows = |list: Vec<super::stats::Streak>, mark: &str| -> Vec<Ranked> {
             list.iter().map(|st| Ranked { value: format!("{mark}{}", st.len), amount: prim(st.profit, true), tip: None }).collect()
         };
-        let wins = streak_rows(s.win_streaks_now(), "W");
-        let losses = streak_rows(s.loss_streaks_now(), "L");
-        let clicked = list_card(ui, full, "Top multipliers", &multis, TEXT, true);
-        list_card(ui, full, "Best win streaks", &wins, GREEN, false);
-        list_card(ui, full, "Worst loss streaks", &losses, RED, false);
+        let lists = [
+            ("Multipliers", multis, TEXT, true),
+            ("Win streaks", streak_rows(s.win_streaks_now(), "W"), GREEN, false),
+            ("Loss streaks", streak_rows(s.loss_streaks_now(), "L"), RED, false),
+        ];
+        let clicked = lists_card(ui, full, &lists);
         if let Some(n) = clicked.and_then(|i| multi_ns.get(i).copied()) {
             if slots {
                 super::hits::open_spin(app, n);
@@ -317,7 +299,7 @@ fn card_frame() -> Frame {
 }
 
 fn profit_card(ui: &mut Ui, width: f32, value: &str, color: Color32, sub: &str, bets: u64, pts: &[f64]) {
-    card_frame().inner_margin(Margin { left: 14, right: 14, top: 12, bottom: 10 }).show(ui, |ui| {
+    card_frame().inner_margin(Margin { left: 14, right: 14, top: 12, bottom: 12 }).show(ui, |ui| {
         ui.set_width(width - 30.0);
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.horizontal(|ui| {
@@ -326,47 +308,63 @@ fn profit_card(ui: &mut Ui, width: f32, value: &str, color: Color32, sub: &str, 
                 ui.label(semi(format!("{} bets", fmt_int(bets as i128)), 11.0, DIM));
             });
         });
-        let (vr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-        widgets::fit_text(ui.painter(), vr.left_center(), Align2::LEFT_CENTER, value, theme::font_bold(24.0), color, vr.width());
+        let (vr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+        widgets::fit_text(ui.painter(), vr.left_center(), Align2::LEFT_CENTER, value, theme::font_bold(26.0), color, vr.width());
+        let (sr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
         if !sub.is_empty() {
-            ui.label(semi(sub, 11.0, DIM));
+            widgets::fit_text(ui.painter(), sr.left_center(), Align2::LEFT_CENTER, sub, theme::font(11.0), DIM, sr.width());
         }
-        ui.add_space(8.0);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
+        ui.add_space(10.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 104.0), Sense::hover());
         draw_chart(ui, rect, if bets == 0 { &[] } else { pts });
     });
 }
 
-/// Two-column card of captioned values, split by hairlines.
-fn grid(ui: &mut Ui, width: f32, rows: Vec<[Cell; 2]>) {
-    let heights: Vec<f32> = rows.iter().map(|r| if r.iter().any(|c| !c.sub.is_empty()) { 62.0 } else { 48.0 }).collect();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, heights.iter().sum()), Sense::hover());
+/// One line of the statistics: a grey label, the value on the right, and a dim note before it.
+struct Row {
+    label: &'static str,
+    value: String,
+    color: Color32,
+    note: String,
+}
+
+fn row(label: &'static str, value: String, color: Color32, note: impl Into<String>) -> Row {
+    Row { label, value, color, note: note.into() }
+}
+
+/// Height of a line of the statistics.
+const STAT_H: f32 = 25.0;
+
+/// The statistics in one card, label on the left and value on the right, in groups split by a hairline.
+fn stats_card(ui: &mut Ui, width: f32, groups: &[Vec<Row>]) {
+    let (pad, gap) = (8.0, 13.0);
+    let lines: usize = groups.iter().map(Vec::len).sum();
+    let height = pad * 2.0 + lines as f32 * STAT_H + gap * (groups.len().saturating_sub(1)) as f32;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let p = ui.painter();
     p.rect(rect, CornerRadius::same(12), BG2, Stroke::new(1.0, LINE), StrokeKind::Inside);
-    let half = rect.width() / 2.0;
-    let mut y = rect.top();
-    for (i, (row, h)) in rows.iter().zip(&heights).enumerate() {
-        if i > 0 {
-            p.hline((rect.left() + 12.0)..=(rect.right() - 12.0), y, Stroke::new(1.0, LINE));
+    let (left, right) = (rect.left() + 14.0, rect.right() - 14.0);
+    let mut y = rect.top() + pad;
+    for (gi, group) in groups.iter().enumerate() {
+        if gi > 0 {
+            p.hline(left..=right, y + gap / 2.0, Stroke::new(1.0, LINE));
+            y += gap;
         }
-        for (j, c) in row.iter().enumerate() {
-            if c.cap.is_empty() {
-                continue;
+        for r in group {
+            let cy = y + STAT_H / 2.0;
+            let label = p.text(pos2(left, cy), Align2::LEFT_CENTER, r.label, theme::font(11.5), MUTED);
+            let room = right - label.right() - 12.0;
+            let value = p.layout_no_wrap(r.value.clone(), theme::font_semi(12.5), r.color);
+            let value_w = value.size().x.min(room);
+            widgets::fit_text(p, pos2(right, cy), Align2::RIGHT_CENTER, &r.value, theme::font_semi(12.5), r.color, room);
+            if !r.note.is_empty() {
+                let note_room = room - value_w - 8.0;
+                if note_room > 24.0 {
+                    widgets::fit_text(p, pos2(right - value_w - 8.0, cy), Align2::RIGHT_CENTER, &r.note, theme::font(11.0), DIM, note_room);
+                }
             }
-            let x = rect.left() + half * j as f32 + 14.0;
-            let max_w = half - 22.0;
-            p.text(pos2(x, y + 12.0), Align2::LEFT_TOP, c.cap, theme::font_semi(11.0), MUTED);
-            widgets::fit_text(p, pos2(x, y + 28.0), Align2::LEFT_TOP, &c.value, theme::font_semi(15.0), c.color, max_w);
-            if !c.sub.is_empty() {
-                widgets::fit_text(p, pos2(x, y + 47.0), Align2::LEFT_TOP, &c.sub, theme::font(10.5), DIM, max_w);
-            }
+            y += STAT_H;
         }
-        if row[1].cap.is_empty() {
-            y += h;
-            continue;
-        }
-        p.vline(rect.center().x, (y + 10.0)..=(y + h - 10.0), Stroke::new(1.0, LINE));
-        y += h;
     }
 }
 
@@ -377,49 +375,71 @@ struct Ranked {
     tip: Option<String>,
 }
 
-/// A captioned card listing `rows` best first, one under the other. Past `LIST_ROWS` it
-/// scrolls on its own, with the edge that has more to show fading out. With `clickable`, the
-/// row clicked is returned.
-fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32, clickable: bool) -> Option<usize> {
+/// The ranked lists in one card, a tab each: (name, rows best first, value colour, rows clickable).
+/// Past `LIST_ROWS` a list scrolls on its own, with the edge that has more to show fading out.
+/// Returns the row clicked in a clickable list.
+fn lists_card(ui: &mut Ui, width: f32, lists: &[(&str, Vec<Ranked>, Color32, bool)]) -> Option<usize> {
+    let tab_id = ui.id().with("session-list-tab");
+    let mut tab: usize = ui.data(|d| d.get_temp(tab_id)).unwrap_or(0).min(lists.len() - 1);
     let mut clicked = None;
-    card_frame().inner_margin(Margin { left: 14, right: 10, top: 11, bottom: 8 }).show(ui, |ui| {
-        ui.set_width(width - 26.0);
-        ui.spacing_mut().item_spacing.y = 4.0;
-        ui.horizontal(|ui| {
-            ui.label(semi(cap, 11.0, MUTED));
-            if rows.len() as f32 > LIST_ROWS {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(4.0);
-                    ui.label(semi(fmt_int(rows.len() as i128), 11.0, DIM));
-                });
+    card_frame().inner_margin(Margin { left: 12, right: 10, top: 4, bottom: 8 }).show(ui, |ui| {
+        ui.set_width(width - 24.0);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // the tabs, underlined like the history's
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+        // a third of the card each, so they fit however narrow the pane is
+        let third = bar.width() / lists.len() as f32;
+        for (i, (name, rows, _, _)) in lists.iter().enumerate() {
+            let font = theme::font_semi(11.5);
+            let g = ui.painter().layout_no_wrap(name.to_string(), font.clone(), TEXT);
+            let cx = bar.left() + third * (i as f32 + 0.5);
+            let r = Rect::from_center_size(pos2(cx, bar.center().y), vec2(g.size().x.min(third - 8.0), bar.height()));
+            let resp = ui.interact(r.expand2(vec2(5.0, 0.0)), ui.id().with(("session-tab", i)), Sense::click());
+            let color = if i == tab {
+                TEXT
+            } else if resp.hovered() {
+                TEXT2
+            } else {
+                MUTED
+            };
+            let p = ui.painter();
+            widgets::fit_text(p, r.center(), Align2::CENTER_CENTER, name, font, color, third - 8.0);
+            if i == tab {
+                p.rect_filled(Rect::from_min_max(pos2(r.left(), bar.bottom() - 2.0), pos2(r.right(), bar.bottom())), CornerRadius::same(1), G1);
+            } else if !rows.is_empty() {
+                p.circle_filled(pos2(r.right() + 5.0, r.center().y - 4.0), 2.0, alpha(TEXT2, 120));
             }
-        });
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                tab = i;
+            }
+        }
+        ui.painter().hline(bar.x_range(), bar.bottom(), Stroke::new(1.0, LINE));
+        ui.add_space(4.0);
+
+        let (name, rows, color, clickable) = &lists[tab];
         if rows.is_empty() {
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
-            ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, "None yet", theme::font(11.5), DIM);
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::hover());
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "None yet", theme::font(11.5), DIM);
             return;
         }
-        let out = egui::ScrollArea::vertical().id_salt(cap).max_height(ROW_H * LIST_ROWS).auto_shrink([false, true]).show(ui, |ui| {
+        let out = egui::ScrollArea::vertical().id_salt(*name).max_height(ROW_H * LIST_ROWS).auto_shrink([false, true]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, r) in rows.iter().enumerate() {
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), if clickable { Sense::click() } else { Sense::hover() });
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), if *clickable { Sense::click() } else { Sense::hover() });
                 let p = ui.painter();
-                if clickable && resp.hovered() {
+                if *clickable && resp.hovered() {
                     p.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(6), alpha(Color32::WHITE, 8));
                 }
-                if i > 0 {
-                    p.hline(rect.left()..=(rect.right() - 6.0), rect.top(), Stroke::new(1.0, LINE));
-                }
                 p.text(pos2(rect.left() + 9.0, rect.center().y), Align2::CENTER_CENTER, (i + 1).to_string(), theme::font_semi(10.5), DIM);
-                let value = p.layout_no_wrap(r.value.clone(), theme::font_semi(12.5), color);
+                let value = p.layout_no_wrap(r.value.clone(), theme::font_semi(12.5), *color);
                 let value_w = value.size().x;
-                p.galley(pos2(rect.left() + 26.0, rect.center().y - value.size().y / 2.0), value, color);
+                p.galley(pos2(rect.left() + 26.0, rect.center().y - value.size().y / 2.0), value, *color);
                 // clear of the scroll bar, which floats over the right edge
                 let right = rect.right() - 10.0;
                 let room = right - (rect.left() + 26.0 + value_w + 12.0);
                 widgets::fit_text(p, pos2(right, rect.center().y), Align2::RIGHT_CENTER, &r.amount, theme::font(11.5), MUTED, room);
-                let resp = if clickable { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
-                if clickable && resp.clicked() {
+                let resp = if *clickable { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
+                if *clickable && resp.clicked() {
                     clicked = Some(i);
                 }
                 if let Some(tip) = &r.tip {
@@ -436,7 +456,9 @@ fn list_card(ui: &mut Ui, width: f32, cap: &str, rows: &[Ranked], color: Color32
             fade(p, Rect::from_min_max(pos2(view.left(), view.bottom() - 14.0), pos2(view.right() - 8.0, view.bottom())), BG2, false);
         }
     });
-    clicked
+    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+    // only the multipliers' rows open something
+    clicked.filter(|_| lists[tab].3)
 }
 
 /// `color` fading to clear across `rect`: from its top edge when `from_top`, else from its bottom.

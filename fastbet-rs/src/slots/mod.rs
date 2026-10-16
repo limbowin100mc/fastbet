@@ -8,6 +8,7 @@ pub mod hacksaw;
 pub mod onetouch;
 pub mod onlyplay;
 pub mod outstanding;
+pub mod playngo;
 pub mod playson;
 pub mod pragmatic;
 pub mod relax;
@@ -61,6 +62,7 @@ pub enum Provider {
     Pragmatic,
     Playson,
     Spinomenal,
+    PlayNGo,
 }
 
 impl Provider {
@@ -78,10 +80,13 @@ impl Provider {
             "onlyplay" => Some(Provider::Onlyplay),
             "penguinking" => Some(Provider::Outstanding),
             "slotmillgames" => Some(Provider::Slotmill),
-            "relaxgaming" => Some(Provider::Relax),
+            // Relax's own games and the studios it hosts (Shuffle's names)
+            "relaxgaming" | "printstudios" | "fantasma" | "fourleafgaming" => Some(Provider::Relax),
             "pragmaticplay" => Some(Provider::Pragmatic),
             "playson" => Some(Provider::Playson),
-            "spinomenal" => Some(Provider::Spinomenal),
+            // Retro Gaming runs on Spinomenal's platform
+            "spinomenal" | "retrogaming" => Some(Provider::Spinomenal),
+            "play'ngo" | "playngo" => Some(Provider::PlayNGo),
             _ => None,
         }
     }
@@ -108,10 +113,15 @@ impl Provider {
             "penguinking" => "Penguin King",
             "slotmillgames" => "Slotmill Games",
             "relaxgaming" => "Relax Gaming",
+            "printstudios" => "Print Studios",
+            "fantasma" => "Fantasma",
+            "fourleafgaming" => "Four Leaf Gaming",
             "playson" => "Playson",
             "spinomenal" => "Spinomenal",
+            "retrogaming" => "Retro Gaming",
             "nolimitcity" => "Nolimit City",
             "pragmaticplay" => "Pragmatic Play",
+            "play'ngo" | "playngo" => "Play'n GO",
             other => other,
         }
     }
@@ -153,6 +163,7 @@ pub async fn open_launch(provider: Provider, launch_url: &str) -> Result<Arc<dyn
         Provider::Pragmatic => Ok(Arc::new(pragmatic::open(launch_url).await.map_err(|e| e.to_string())?)),
         Provider::Playson => Ok(Arc::new(playson::open(launch_url).await.map_err(|e| e.to_string())?)),
         Provider::Spinomenal => Ok(Arc::new(spinomenal::open(launch_url).await.map_err(|e| e.to_string())?)),
+        Provider::PlayNGo => Ok(Arc::new(playngo::open(launch_url).await.map_err(|e| e.to_string())?)),
     }
 }
 
@@ -217,9 +228,13 @@ pub async fn self_test(producer: &str, launch_url: &str, spins: usize, feature: 
         println!("  feature {} \"{}\" cost ×{} rtp {:?}", f.id, f.name, f.cost_mult, f.rtp);
     }
     let bet = info.default_bet.or(info.bet_levels.first().map(|b| b.minor)).unwrap_or(100);
+    // FASTBET_SLOT_HOLD=1: spin as "stop before free spins" does, ending at the first held round
+    let hold = std::env::var_os("FASTBET_SLOT_HOLD").is_some();
     for i in 0..spins {
         let feat = if i + 1 == spins { feature } else { None };
-        match s.spin(bet, feat, false).await {
+        let res = s.spin(bet, feat, hold).await;
+        let held = matches!(&res, Ok(r) if r.held);
+        match res {
             Ok(r) => println!(
                 "spin {}{} round {} cost {} win {} x{:.2} balance {:?} pending {} fs {} events {} {:.0} ms",
                 i + 1,
@@ -235,6 +250,10 @@ pub async fn self_test(producer: &str, launch_url: &str, spins: usize, feature: 
                 r.ms
             ),
             Err(e) => println!("spin {} failed: {e}", i + 1),
+        }
+        if held {
+            println!("held for the browser");
+            break;
         }
     }
     s.close();

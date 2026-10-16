@@ -111,6 +111,7 @@ fn settings(app: &mut App, ui: &mut Ui) {
             let w = panel_w - 24.0 - 8.0;
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.set_max_width(w);
+            super::challenges::slot_cards(app, ui, w);
             general(app, ui, w);
             counts(app, ui, w);
             stops(app, ui, w);

@@ -355,7 +355,7 @@ const DRIVER_SCRIPT: &str = r#"(function () {
     var r = c.getBoundingClientRect();
     // alternate between a few spots: centre, the left/right thirds and lower middle
     // (intro screens with buttons, spin buttons at the bottom)
-    var spots = [[0.5, 0.5], [0.36, 0.62], [0.5, 0.86], [0.64, 0.62], [0.75, 0.88]];
+    var spots = [[0.5, 0.5], [0.36, 0.62], [0.5, 0.8], [0.5, 0.86], [0.64, 0.62], [0.75, 0.88]];
     var sp = spots[n % spots.length];
     var x = r.left + r.width * sp[0], y = r.top + r.height * sp[1];
     function pe(type) { try { c.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: type === 'pointerup' ? 0 : 1 })); } catch (e) {} }

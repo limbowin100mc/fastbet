@@ -873,6 +873,47 @@ pub fn paint_slot_machine(p: &egui::Painter, r: Rect, color: Color32, pull: f32)
     p.circle_filled(at(0.92, knob), r.width() * 0.11, color);
 }
 
+/// Rewards: a gift box with its ribbon and bow. `open` (0–1, the hover) lifts the lid.
+pub fn paint_gift(p: &egui::Painter, r: Rect, color: Color32, open: f32) {
+    let s = Stroke::new(1.6, color);
+    let at = |fx: f32, fy: f32| pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
+    let lift = 0.1 * open;
+    p.rect(Rect::from_min_max(at(0.1, 0.46), at(0.9, 1.0)), CornerRadius::same(2), alpha(color, 40), s, StrokeKind::Middle);
+    p.rect(Rect::from_min_max(at(0.0, 0.26 - lift), at(1.0, 0.46 - lift)), CornerRadius::same(2), alpha(color, 40), s, StrokeKind::Middle);
+    p.line_segment([at(0.5, 0.46), at(0.5, 1.0)], s);
+    p.line_segment([at(0.5, 0.26 - lift), at(0.5, 0.46 - lift)], s);
+    // the bow: two loops over the lid
+    let knot = at(0.5, 0.26 - lift);
+    for dx in [-1.0, 1.0] {
+        p.add(egui::Shape::line(vec![knot, at(0.5 + 0.3 * dx, 0.02 - lift), at(0.5 + 0.34 * dx, 0.18 - lift), knot], s));
+    }
+}
+
+/// King of the Hill: a three-pointed crown.
+pub fn paint_crown(p: &egui::Painter, r: Rect, color: Color32) {
+    let at = |fx: f32, fy: f32| pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
+    let pts = vec![at(0.06, 0.82), at(0.0, 0.26), at(0.3, 0.52), at(0.5, 0.12), at(0.7, 0.52), at(1.0, 0.26), at(0.94, 0.82)];
+    p.add(egui::Shape::convex_polygon(vec![at(0.06, 0.82), at(0.04, 0.6), at(0.96, 0.6), at(0.94, 0.82)], alpha(color, 60), Stroke::NONE));
+    p.add(egui::Shape::closed_line(pts, Stroke::new(1.6, color)));
+    for fx in [0.0, 0.5, 1.0] {
+        p.circle_filled(at(fx, if fx == 0.5 { 0.1 } else { 0.24 }), r.width() * 0.07, color);
+    }
+}
+
+/// Challenges: a trophy cup on its stand.
+pub fn paint_trophy(p: &egui::Painter, r: Rect, color: Color32) {
+    let s = Stroke::new(1.6, color);
+    let at = |fx: f32, fy: f32| pos2(r.left() + r.width() * fx, r.top() + r.height() * fy);
+    let cup = vec![at(0.22, 0.06), at(0.78, 0.06), at(0.74, 0.4), at(0.6, 0.58), at(0.4, 0.58), at(0.26, 0.4)];
+    p.add(egui::Shape::convex_polygon(cup.clone(), alpha(color, 40), Stroke::NONE));
+    p.add(egui::Shape::closed_line(cup, s));
+    // the handles
+    p.add(egui::Shape::line(vec![at(0.22, 0.14), at(0.04, 0.14), at(0.08, 0.34), at(0.27, 0.42)], s));
+    p.add(egui::Shape::line(vec![at(0.78, 0.14), at(0.96, 0.14), at(0.92, 0.34), at(0.73, 0.42)], s));
+    p.line_segment([at(0.5, 0.58), at(0.5, 0.8)], s);
+    p.rect(Rect::from_min_max(at(0.26, 0.8), at(0.74, 0.96)), CornerRadius::same(1), alpha(color, 40), s, StrokeKind::Middle);
+}
+
 /// Paints a tiny icon by name into `r`.
 pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
     let s = Stroke::new(1.6, color);
@@ -880,6 +921,42 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
     match name {
         "dice" => paint_die(p, r, color, 0.0),
         "slots" => paint_slot_machine(p, r, color, 0.0),
+        "gift" => paint_gift(p, r, color, 0.0),
+        "crown" => paint_crown(p, r, color),
+        "trophy" => paint_trophy(p, r, color),
+        "coins" => {
+            // two coins, the front one over the back one
+            for (fx, fy, fr) in [(0.64, 0.36, 0.3), (0.4, 0.62, 0.34)] {
+                let c = at(fx, fy);
+                let rad = r.width() * fr;
+                p.circle_filled(c, rad, BG2);
+                p.circle_stroke(c, rad, s);
+                p.circle_stroke(c, rad * 0.5, Stroke::new(1.2, color));
+            }
+        }
+        "sun" => {
+            let c = r.center();
+            p.circle_stroke(c, r.width() * 0.22, s);
+            for i in 0..8 {
+                let a = std::f32::consts::TAU * i as f32 / 8.0;
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([c + d * r.width() * 0.36, c + d * r.width() * 0.5], s);
+            }
+        }
+        "calendar" => {
+            p.rect(Rect::from_min_max(at(0.06, 0.16), at(0.94, 0.96)), CornerRadius::same(2), Color32::TRANSPARENT, s, StrokeKind::Middle);
+            p.line_segment([at(0.06, 0.38), at(0.94, 0.38)], s);
+            for fx in [0.3, 0.7] {
+                p.line_segment([at(fx, 0.04), at(fx, 0.24)], s);
+            }
+            for (fx, fy) in [(0.3, 0.58), (0.5, 0.58), (0.7, 0.58), (0.3, 0.78), (0.5, 0.78)] {
+                p.circle_filled(at(fx, fy), r.width() * 0.05, color);
+            }
+        }
+        "arrow-up" => {
+            p.line_segment([at(0.5, 0.92), at(0.5, 0.1)], s);
+            p.add(egui::Shape::line(vec![at(0.18, 0.42), at(0.5, 0.1), at(0.82, 0.42)], s));
+        }
         "bolt" => {
             let pts = [(13.2, 2.0), (4.0, 13.6), (10.6, 13.6), (9.8, 22.0), (20.0, 9.9), (13.3, 9.9)];
             let sc = r.height() / 22.0;

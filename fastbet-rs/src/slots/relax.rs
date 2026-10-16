@@ -14,6 +14,11 @@
 //!     -> ended, win, ba, stats{b}; a round goes on with more "spin" plays while `ended` is false
 //!   POST {gameServerApi}/gamefinished {g, sid, restoreVersion}  -> {b}
 //! Amounts are minor units. A bonus buy plays `ba` = bet × buyFeatureCost with buyFeature:true.
+//! Games with `config.creditsPerBet` (Four Leaf's on Shuffle) bet per credit instead: play sends
+//! `la` (a legalBets value) and `betMode` (an index of creditsPerBet), costing la × creditsPerBet[mode];
+//! modes past the first are the game's boosts and buys (`buyFeatureCost` = their price in bets).
+//! Games with `paylineOptions` above one line work the same with lines for credits (la per line,
+//! mode = how many lines), and also send `ba` = la × lines.
 //! The casino-client API (config, token) sits behind a bot filter that only lets browsers in, so
 //! those two calls go through the browser bridge, parked on the launcher's origin like the game;
 //! the game server itself is plain HTTPS.
@@ -36,6 +41,13 @@ pub struct RelaxSession {
     sid: String,
     version: AtomicU64,
     balance: Mutex<Option<i64>>,
+    /// `creditsPerBet` (or `paylineOptions`) of a game that bets per credit (see the module docs).
+    credits: Option<Vec<f64>>,
+    /// The per-credit game also wants the whole bet as `ba` (the per-line kind).
+    with_ba: bool,
+    /// Which of `credits` prices a plain spin (all lines, where the player may pick how many);
+    /// the spin itself still goes as mode 0.
+    base_mode: usize,
     info: SessionInfo,
 }
 
@@ -87,7 +99,7 @@ pub async fn open(launch_url: &str) -> Result<RelaxSession, SlotError> {
         return Err(SlotError::Provider("Relax didn't name its game server".into()));
     };
 
-    let mut s = RelaxSession { http, server, game: game.clone(), sid: String::new(), version: AtomicU64::new(0), balance: Mutex::new(None), info: SessionInfo::default() };
+    let mut s = RelaxSession { http, server, game: game.clone(), sid: String::new(), version: AtomicU64::new(0), balance: Mutex::new(None), credits: None, with_ba: false, base_mode: 0, info: SessionInfo::default() };
     let token = if real {
         let ticket = map.get("ticket").cloned().unwrap_or_default();
         let token_api = cfg["tokenApi"].as_str().map(str::to_string).unwrap_or_else(|| format!("{root}/capi/2.0/casino/token/gettoken"));
@@ -106,6 +118,13 @@ pub async fn open(launch_url: &str) -> Result<RelaxSession, SlotError> {
     } else {
         s.post("funmoneylogin", json!({ "userid": null, "mode": "dev", "partnerid": partner, "channel": channel, "clientid": "", "g": game, "immediatePayouts": false, "clientversion": CLIENT_VERSION, "jurisdiction": jurisdiction })).await?
     };
+    if std::env::var_os("FASTBET_RELAX_DUMP").is_some() {
+        let mut cfg = login["config"].clone();
+        if let Some(o) = cfg.as_object_mut() {
+            o.retain(|k, _| k != "grids" && k != "paytable" && k != "dreamDrop");
+        }
+        eprintln!("relax login: limits {} config {}", login["limits"], cfg.to_string().chars().take(3000).collect::<String>());
+    }
     s.sid = login["sid"].as_str().ok_or_else(|| SlotError::Provider("Relax login gave no session".into()))?.to_string();
     let bets: Vec<i64> = login["limits"]["legalBets"].as_array().or(login["config"]["betSizeOptions"].as_array()).map(|a| a.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
     let mut features = Vec::new();
@@ -115,11 +134,50 @@ pub async fn open(launch_url: &str) -> Result<RelaxSession, SlotError> {
     }
     let balance = login["stats"]["b"].as_i64();
     *s.balance.get_mut() = balance;
+    let floats = |v: &Value| v.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<f64>>()).unwrap_or_default();
+    let mut credits = floats(&login["config"]["creditsPerBet"]);
+    let lines = floats(&login["config"]["paylineOptions"]);
+    if credits.is_empty() && (lines.len() > 1 || lines.first().is_some_and(|l| *l > 1.0)) {
+        // 1, 2, … n lines to pick from: play them all
+        if lines[0] == 1.0 {
+            s.base_mode = lines.len() - 1;
+        }
+        credits = lines;
+        s.with_ba = true;
+    }
+    let base = s.base_mode;
+    let mut bet_levels: Vec<BetLevel> = bets.iter().map(|b| BetLevel { raw: b.to_string(), minor: *b }).collect();
+    let mut default_bet = login["limits"]["defaultBet"].as_i64();
+    if let Some(&unit) = credits.get(base).filter(|u| **u > 0.0) {
+        if login["config"]["baseBet"].is_number() {
+            // legalBets are whole bets already: la = bet / credits
+            bet_levels = bets.iter().map(|b| BetLevel { raw: ((*b as f64 / unit).round() as i64).to_string(), minor: *b }).collect();
+        } else {
+            // a bet level is la × the base mode's credits; defaultBet is the whole bet where
+            // that is a level, else an la
+            bet_levels = bets.iter().map(|la| BetLevel { raw: la.to_string(), minor: (*la as f64 * unit).round() as i64 }).collect();
+            default_bet = default_bet.map(|d| if bet_levels.iter().any(|b| b.minor == d) { d } else { (d as f64 * unit).round() as i64 });
+        }
+        features = credits
+            .iter()
+            .enumerate()
+            .skip(1)
+            // a mode at the base price changes something else (a jackpot drop), not the bet;
+            // fewer lines than all of them aren't worth offering
+            .filter(|(_, c)| (**c - unit).abs() > 1e-9 && base == 0)
+            .map(|(i, c)| {
+                let x = c / unit;
+                let n = if x.fract() == 0.0 { format!("{}", x as i64) } else { format!("{x}") };
+                Feature { id: format!("mode{i}"), name: if x >= 10.0 { format!("Buy bonus (×{n})") } else { format!("Bet mode ×{n}") }, cost_mult: x, rtp: None }
+            })
+            .collect();
+        s.credits = Some(credits);
+    }
     s.info = SessionInfo {
         currency: login["stats"]["currency"].as_str().unwrap_or("FUN").to_uppercase(),
         decimals: 2,
-        bet_levels: bets.iter().map(|b| BetLevel { raw: b.to_string(), minor: *b }).collect(),
-        default_bet: login["limits"]["defaultBet"].as_i64(),
+        bet_levels,
+        default_bet,
         features,
         balance,
     };
@@ -141,9 +199,13 @@ impl RelaxSession {
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         // errors come back as 200s with an errorCode
         let code = v["errorCode"].as_i64().or(v["errorcode"].as_i64());
+        if (status != 200 || code.is_some()) && std::env::var_os("FASTBET_RELAX_DUMP").is_some() {
+            eprintln!("relax error {status}: {}", text.chars().take(400).collect::<String>());
+        }
         if status != 200 || code.is_some() {
             let msg = v["errorMessage"].as_str().or(v["errormessage"].as_str()).unwrap_or("").to_string();
-            let lower = msg.to_ascii_lowercase();
+            // some messages echo the request (sid and all) after the reason
+            let lower = msg.split('{').next().unwrap_or("").to_ascii_lowercase();
             if lower.contains("insufficient") || lower.contains("balance") || lower.contains("funds") {
                 return Err(SlotError::Balance);
             }
@@ -172,8 +234,23 @@ impl SlotSession for RelaxSession {
         let mult = feature.and_then(|f| self.info.features.iter().find(|x| x.id == f)).map(|f| f.cost_mult).unwrap_or(1.0);
         let ba = (bet as f64 * mult).round() as i64;
         let before = *self.balance.lock().await;
-        let mut body = json!({ "g": self.game, "sid": self.sid, "ga": "spin", "ba": ba, "restoreState": "{}", "restoreVersion": self.next_version() });
-        if feature.is_some() {
+        // a per-credit game: the level's la, and the mode the feature names
+        let stake = |body: &mut Value| match &self.credits {
+            Some(c) => {
+                let base = c.get(self.base_mode).copied().unwrap_or(c[0]);
+                let la = self.info.bet_levels.iter().find(|b| b.minor == bet).and_then(|b| b.raw.parse::<i64>().ok()).unwrap_or((bet as f64 / base).round() as i64);
+                let mode = feature.and_then(|f| f.strip_prefix("mode")).and_then(|m| m.parse::<usize>().ok());
+                body["la"] = json!(la);
+                body["betMode"] = json!(mode.unwrap_or(0));
+                if self.with_ba {
+                    body["ba"] = json!((la as f64 * mode.and_then(|m| c.get(m).copied()).unwrap_or(base)).round() as i64);
+                }
+            }
+            None => body["ba"] = json!(ba),
+        };
+        let mut body = json!({ "g": self.game, "sid": self.sid, "ga": "spin", "restoreState": "{}", "restoreVersion": self.next_version() });
+        stake(&mut body);
+        if feature.is_some() && self.credits.is_none() {
             body["buyFeature"] = json!(true);
         }
         let mut r = self.post("play", body).await?;
@@ -187,7 +264,9 @@ impl SlotSession for RelaxSession {
                 held = true;
                 break;
             }
-            r = self.post("play", json!({ "g": self.game, "sid": self.sid, "ga": "spin", "ba": ba, "restoreState": "{}", "restoreVersion": self.next_version() })).await?;
+            let mut body = json!({ "g": self.game, "sid": self.sid, "ga": "spin", "restoreState": "{}", "restoreVersion": self.next_version() });
+            stake(&mut body);
+            r = self.post("play", body).await?;
             steps += 1;
         }
         let finished = if held { None } else { self.post("gamefinished", json!({ "g": self.game, "sid": self.sid, "restoreVersion": self.next_version() })).await.ok() };

@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -73,6 +73,40 @@ pub const MIRRORS: &[&str] = &[
     "stake3116.com", "stake3119.com", "stake3199.com",
 ];
 
+/// The VIP flag and how far to the next one (0–1), asked on its own so it can never break the account query.
+const VIP: &str = "query FastbetVip { user { id flagProgress { flag progress } } }";
+/// Stake's VIP flags, lowest first: (flag, name, dollars wagered it starts at).
+const FLAGS: &[(&str, &str, f64)] = &[
+    ("none", "Unranked", 0.0),
+    ("bronze", "Bronze", 10e3),
+    ("silver", "Silver", 50e3),
+    ("gold", "Gold", 100e3),
+    ("platinum", "Platinum I", 250e3),
+    ("wagered(500k)", "Platinum II", 500e3),
+    ("wagered(1m)", "Platinum III", 1e6),
+    ("wagered(2.5m)", "Platinum IV", 2.5e6),
+    ("wagered(5m)", "Platinum V", 5e6),
+    ("wagered(10m)", "Platinum VI", 10e6),
+    ("wagered(25m)", "Diamond I", 25e6),
+    ("wagered(50m)", "Diamond II", 50e6),
+    ("wagered(100m)", "Diamond III", 100e6),
+    ("wagered(250m)", "Diamond IV", 250e6),
+    ("wagered(500m)", "Diamond V", 500e6),
+    ("wagered(1000m)", "Obsidian I", 1e9),
+    ("wagered(2500m)", "Obsidian II", 2.5e9),
+    ("wagered(5000m)", "Opal I", 5e9),
+    ("wagered(10000m)", "Opal II", 10e9),
+    ("wagered(25000m)", "Plutonium", 25e9),
+];
+/// Rakeback, the reload and the weekly / monthly bonuses waiting.
+const REWARDS: &str = "query FastbetRewards { claimableSelfServeBonuses { bonusCodeId code category availableAt } \
+    user { id rakeback { enabled balances { currency availableAmount } } reload: faucet { id active claimInterval lastClaim expireAt value } } }";
+const CLAIM_RAKEBACK: &str = "mutation FastbetClaimRakeback { claimRakeback { id currency amount } }";
+/// The open challenges (Stake refuses the list in some regions).
+const CHALLENGES: &str = "query FastbetChallenges { challengeGlobalList(limit: 50, offset: 0, sort: prize) { id active targetMultiplier minBetUsd award currency \
+    expireAt game { name slug thumbnailUrl providerGroup { name } } } }";
+/// Refresh ticks between VIP reads.
+const VIP_EVERY: u32 = 3;
 const ME: &str = "query FastbetMe { user { id name balances { available { amount currency } } \
     activeClientSeed { seed } activeServerSeed { seedHash nonce } } }";
 // The site's own currency setup: the USD rate of every coin and fiat (`baseRate`), the fiats it can
@@ -192,6 +226,7 @@ pub struct Stake {
     events: mpsc::UnboundedSender<CasinoEvent>,
     market: Mutex<Market>,
     published: Mutex<Market>,
+    last_vip: Mutex<Option<VipStatus>>,
     /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
     inflight: AtomicUsize,
     settled: AtomicU64,
@@ -219,6 +254,7 @@ impl Stake {
             events,
             market: Mutex::new(Market::default()),
             published: Mutex::new(Market::default()),
+            last_vip: Mutex::new(None),
             inflight: AtomicUsize::new(0),
             settled: AtomicU64::new(0),
             engine_group: Mutex::new(None),
@@ -358,6 +394,7 @@ impl Stake {
     async fn serve(&self, setup: u64) {
         self.authenticate().await;
         let mut rates_at = Instant::now();
+        let mut ticks: u32 = 0;
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {
@@ -381,12 +418,40 @@ impl Stake {
                     }
                     if self.ready.load(Ordering::SeqCst) {
                         self.refresh_me().await;
+                        ticks += 1;
+                        if ticks % VIP_EVERY == 0 {
+                            self.refresh_vip().await;
+                        }
                     }
                 }
             }
             if !self.alive() {
                 return;
             }
+        }
+    }
+
+    /// Reads the VIP flag and its progress.
+    async fn refresh_vip(&self) {
+        match self.gql(VIP, json!({}), true).await {
+            Ok(data) => match data.pointer("/user/flagProgress").and_then(vip_status) {
+                Some(vip) => send_vip(&self.events, &self.last_vip, vip),
+                None => tracing::info!("stake: no vip progress in {}", data.to_string().chars().take(200).collect::<String>()),
+            },
+            Err(e) => tracing::info!("stake: vip progress: {}", CasinoError::from(e)),
+        }
+    }
+
+    /// A coin's USD price as the site gives it; dollar coins count as a dollar until prices are in.
+    fn usd_price(&self, cur: &str) -> f64 {
+        let cur = cur.to_ascii_lowercase();
+        let price = self.market.lock().currencies.get(&cur).map(|i| i.price).unwrap_or(0.0);
+        if price > 0.0 {
+            price
+        } else if matches!(cur.as_str(), "usdt" | "usdc" | "usd") {
+            1.0
+        } else {
+            0.0
         }
     }
 
@@ -431,6 +496,18 @@ impl Stake {
                     self.apply_me(user, true);
                     self.status(ConnStatus::Ready, "");
                     let _ = self.events.send(CasinoEvent::Provable(provable_from(user)));
+                    self.refresh_vip().await;
+                    // FASTBET_STAKE_GQL=<file>: run its queries (split by lines of ---) once logged in and log the replies (dev)
+                    if let Ok(file) = std::env::var("FASTBET_STAKE_GQL") {
+                        for q in std::fs::read_to_string(file).unwrap_or_default().split("\n---") {
+                            let q = q.trim();
+                            if q.is_empty() {
+                                continue;
+                            }
+                            let reply = self.gql(q, json!({}), true).await.map_err(CasinoError::from);
+                            tracing::info!("stake gql {} -> {}", q.chars().take(60).collect::<String>(), format!("{reply:?}").chars().take(3000).collect::<String>());
+                        }
+                    }
                 }
                 None => self.status(ConnStatus::AuthFailed, "Stake returned no account for this token"),
             },
@@ -631,6 +708,31 @@ impl Stake {
 impl Casino for Stake {
     fn id(&self) -> CasinoId {
         CasinoId::Stake
+    }
+
+    /// Rakeback claims here; the reload and the weekly / monthly bonuses only on Stake itself,
+    /// which checks with Cloudflare Turnstile that a person claims them.
+    async fn rewards(&self) -> Result<Vec<Reward>, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let data = self.gql(REWARDS, json!({}), true).await?;
+        let link = format!("https://{}/?tab=rewards&modal=vip", self.mirror.lock());
+        Ok(rewards_of(&data, &|c: &str| self.usd_price(c), SystemTime::now(), &link))
+    }
+
+    async fn claim_reward(&self, id: &str, _currency: &str) -> Result<String, CasinoError> {
+        if id != "rakeback" {
+            return Err(CasinoError::Server("Claim this one on Stake: it checks there that a person claims it".into()));
+        }
+        let data = self.gql(CLAIM_RAKEBACK, json!({}), true).await?;
+        self.refresh_me().await;
+        Ok(claimed_text(data.get("claimRakeback")))
+    }
+
+    async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
+        let data = self.gql(CHALLENGES, json!({}), self.ready.load(Ordering::SeqCst)).await?;
+        Ok(challenges_of(&data, &|c: &str| self.usd_price(c)))
     }
 
     fn set_token(&self, token: Option<String>) {
@@ -1093,6 +1195,112 @@ fn sorted(mut codes: Vec<String>) -> Vec<String> {
 }
 
 /// The coin holding the most value, else BTC.
+/// The reward cards: rakeback (claimed here), the reload and the weekly / monthly bonuses (`link`:
+/// claimed on Stake). The reload comes every `claimInterval` ms after the last claim, until it expires.
+fn rewards_of(data: &Value, price: &dyn Fn(&str) -> f64, now: SystemTime, link: &str) -> Vec<Reward> {
+    let mut out = Vec::new();
+    let user = &data["user"];
+    if user.pointer("/rakeback/enabled").and_then(Value::as_bool) != Some(false) {
+        let coins: Vec<(String, f64)> = user
+            .pointer("/rakeback/balances")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| Some((b.get("currency")?.as_str()?.to_string(), b.get("availableAmount").and_then(f64_from_json)?)))
+            .filter(|(_, a)| *a > 0.0)
+            .collect();
+        let usd: f64 = coins.iter().map(|(c, a)| a * price(c)).sum();
+        let detail = if coins.is_empty() { "Nothing waiting yet".to_string() } else { coins_text(&coins) };
+        out.push(Reward { usd: Some(usd), detail, claimable: usd > 0.0, ..Reward::new("rakeback", RewardKind::Rakeback) });
+    }
+    if let Some(r) = user.get("reload").filter(|r| r.is_object() && r["active"].as_bool() == Some(true)) {
+        let expires = r.get("expireAt").and_then(time_of);
+        let interval = r.get("claimInterval").and_then(f64_from_json).unwrap_or(0.0);
+        let next = r.get("lastClaim").and_then(time_of).map(|t| t + Duration::from_millis(interval.max(0.0) as u64));
+        let ready = next.is_none_or(|n| n <= now) && expires.is_none_or(|e| now < e);
+        out.push(Reward {
+            title: "Reload".into(),
+            link: Some(link.to_string()),
+            usd: r.get("value").and_then(f64_from_json).filter(|v| *v > 0.0),
+            detail: "Claimed on Stake, which checks it's you".into(),
+            claimable: ready,
+            next_at: if ready { None } else { next },
+            expires,
+            ..Reward::new("reload", RewardKind::Reload)
+        });
+    }
+    for b in data.get("claimableSelfServeBonuses").and_then(Value::as_array).into_iter().flatten() {
+        let (kind, id) = match b.get("category").and_then(Value::as_str) {
+            Some("weekly") => (RewardKind::Weekly, "weekly"),
+            Some("monthly") => (RewardKind::Monthly, "monthly"),
+            _ => (RewardKind::Bonus, "bonus"),
+        };
+        let at = b.get("availableAt").and_then(time_of);
+        let ready = at.is_none_or(|t| t <= now);
+        out.push(Reward {
+            link: Some(link.to_string()),
+            detail: "Claimed on Stake, which checks it's you".into(),
+            claimable: ready,
+            next_at: if ready { None } else { at },
+            ..Reward::new(&format!("{id}:{}", b.get("bonusCodeId").and_then(Value::as_str).unwrap_or("")), kind)
+        });
+    }
+    out
+}
+
+/// `challengeGlobalList` -> the active challenges, biggest prize first. The games keep Stake's slug;
+/// the lobby knows which of them it can play.
+fn challenges_of(data: &Value, price: &dyn Fn(&str) -> f64) -> Vec<Challenge> {
+    let list = data.get("challengeGlobalList").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let mut out: Vec<Challenge> = list
+        .iter()
+        .filter(|c| c["active"].as_bool() != Some(false))
+        .filter_map(|c| {
+            let g = &c["game"];
+            let studio = g.pointer("/providerGroup/name").and_then(Value::as_str).map(str::to_string);
+            let image = g.get("thumbnailUrl").and_then(Value::as_str).map(|u| format!("{u}{}{THUMB}", if u.contains('?') { '&' } else { '?' })).unwrap_or_default();
+            let cur = c.get("currency").and_then(Value::as_str).unwrap_or("usdt");
+            Some(Challenge {
+                id: c.get("id")?.as_str()?.to_string(),
+                koth: false,
+                game: crate::slots::SlotGame {
+                    id: g.get("slug")?.as_str()?.to_string(),
+                    name: g.get("name").and_then(Value::as_str).unwrap_or("?").to_string(),
+                    producer: studio.clone().unwrap_or_default().to_ascii_lowercase(),
+                    image,
+                    demo: true,
+                    rtp: 0.0,
+                    provider_game_id: None,
+                    studio,
+                },
+                target: c.get("targetMultiplier").and_then(f64_from_json)?,
+                min_bet_usd: c.get("minBetUsd").and_then(f64_from_json).unwrap_or(0.0),
+                prize_usd: c.get("award").and_then(f64_from_json).unwrap_or(0.0) * price(cur),
+                ends: c.get("expireAt").and_then(time_of),
+                leader: None,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.prize_usd.total_cmp(&a.prize_usd));
+    out
+}
+
+/// `flagProgress { flag progress }` -> the account's VIP status: the progress is how far from
+/// the flag's wager to the next one's, so the XP (dollars wagered) is worked out from it.
+fn vip_status(p: &Value) -> Option<VipStatus> {
+    let flag = p.get("flag").and_then(Value::as_str)?;
+    let progress = p.get("progress").and_then(f64_from_json).unwrap_or(0.0).clamp(0.0, 1.0);
+    let i = FLAGS.iter().position(|(f, _, _)| *f == flag)?;
+    let (_, name, start) = FLAGS[i];
+    let next = FLAGS.get(i + 1).map(|(_, n, at)| (n.to_string(), *at));
+    let exp = match &next {
+        Some((_, at)) => start + progress * (at - start),
+        None => start,
+    };
+    Some(VipStatus { in_dollars: true, ..VipStatus::ranked(name.to_string(), exp, start, next, Some(1.0)) })
+}
+
 fn richest(m: &Market) -> Option<String> {
     let usd = |cur: &str, v: Units| to_f64(v, DECIMALS) * m.info(cur).map(|i| i.price).unwrap_or(0.0);
     m.wallets
@@ -1120,6 +1328,45 @@ fn clean_token(token: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewards_and_challenges() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_148_400);
+        let price = |c: &str| if c == "sol" { 200.0 } else { 0.0 };
+        // what Stake answered for the user's account (no reload, no bonuses waiting)
+        let data = json!({"claimableSelfServeBonuses": [], "user": {"id": "44c4", "rakeback": {"enabled": true, "balances": [
+            {"availableAmount": 4.9e-11, "currency": "btc"}, {"availableAmount": 0.000419482735, "currency": "sol"}, {"availableAmount": 0, "currency": "usdt"}]}, "reload": null}});
+        let list = rewards_of(&data, &price, now, "https://stake.com/?tab=rewards&modal=vip");
+        assert_eq!(list.len(), 1);
+        assert!(list[0].claimable && list[0].link.is_none() && (list[0].usd.unwrap() - 0.000419482735 * 200.0).abs() < 1e-9);
+        // a reload claimed an hour ago that comes back every hour, and a weekly bonus: both on the site
+        let data = json!({"claimableSelfServeBonuses": [{"bonusCodeId": "b1", "code": "x", "category": "weekly", "availableAt": "2026-10-16T10:00:00.000Z"}],
+            "user": {"rakeback": {"enabled": false}, "reload": {"id": "r", "active": true, "claimInterval": 3_600_000, "lastClaim": "2026-10-16T10:30:00.000Z", "expireAt": "2026-10-20T00:00:00.000Z", "value": 2.5}}});
+        let list = rewards_of(&data, &price, now, "L");
+        assert_eq!(list.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["reload", "weekly:b1"]);
+        assert!(!list[0].claimable && list[0].next_at == parse_iso("2026-10-16T11:30:00Z") && list[0].usd == Some(2.5) && list[0].link.as_deref() == Some("L"));
+        assert!(list[1].claimable && list[1].kind == RewardKind::Weekly);
+
+        let ch = json!({"challengeGlobalList": [{"id": "c1", "active": true, "targetMultiplier": 5000, "minBetUsd": 0.2, "award": 500, "currency": "usdt", "expireAt": "2026-10-20T00:00:00.000Z",
+            "game": {"name": "Gates of Olympus", "slug": "pragmatic-play-gates-of-olympus", "thumbnailUrl": "https://mediumrare.imgix.net/x.png", "providerGroup": {"name": "Pragmatic Play"}}}]});
+        let list = challenges_of(&ch, &|_: &str| 1.0);
+        assert_eq!((list[0].target, list[0].prize_usd, list[0].game.id.as_str()), (5000.0, 500.0, "pragmatic-play-gates-of-olympus"));
+        assert!(list[0].ends.is_some() && list[0].game.image.contains("fit=min"));
+    }
+
+    #[test]
+    fn vip_from_flag_progress() {
+        let v = vip_status(&json!({"flag": "wagered(500k)", "progress": 0.25})).unwrap();
+        assert_eq!(v.rank, "Platinum II");
+        assert_eq!(v.next_rank, Some(("Platinum III".to_string(), 1e6)));
+        assert!((v.exp - 625e3).abs() < 1e-6 && (v.rank_progress() - 0.25).abs() < 1e-9);
+        assert!((v.usd_for(v.xp_to_rank().unwrap()).unwrap() - 375e3).abs() < 1e-6);
+        let none = vip_status(&json!({"flag": "none", "progress": 0.5})).unwrap();
+        assert_eq!((none.rank.as_str(), none.next_rank.as_ref().map(|n| n.1)), ("Unranked", Some(10e3)));
+        let top = vip_status(&json!({"flag": "wagered(25000m)", "progress": 0.7})).unwrap();
+        assert!(top.next_rank.is_none() && top.rank_progress() == 1.0);
+        assert!(vip_status(&json!({"flag": "iron"})).is_none());
+    }
 
     #[test]
     fn mirrors_are_unique_bare_hosts() {

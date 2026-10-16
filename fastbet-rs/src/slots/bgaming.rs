@@ -5,6 +5,14 @@
 //!                                                          default_bet, currency{code, exponent}, balance.wallet
 //!   POST {api} {"command":"spin","options":{"bet":N}}  -> outcome.win, balance.wallet, flow{state, available_actions}
 //! Rounds with free spins continue with {"command":"freespin"} until flow.state is "closed".
+//! Newer games live on their own host, `<game>.demo.bgaming-network.com/hyperhive?launch_token=…`,
+//! whose page names a `play_token`; the game speaks JSON-RPC 2.0 to `<host>/api`:
+//!   init {token, req:{}}        -> balance, currency_attributes{code, exponent}, config{bet_limits,
+//!                                  default_bet}, state (an open bonus), state_lock
+//!   play {token, req:{bet}, state_lock} -> final, balance, resp.round{id, win}, state_lock (sent
+//!                                  back with the next call); some games want req {bet, bet_type:"bet", bid:0}
+//! Their bonuses are each game's own (picks, gambles, buys by product), so a round that isn't
+//! `final` is left for the game in the browser, which picks it up from `init`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -21,7 +29,9 @@ pub struct Launch {
 impl Launch {
     /// From the interlayer URL (or a direct game page URL).
     pub fn from_url(url: &str) -> Option<Self> {
-        if url.contains("bgaming-network.com/games/") || url.contains("popiplay.network/games/") {
+        // the game page, or its newer per-game host's `/hyperhive` page (same embedded config)
+        let page = url.contains("/games/") || url.contains("/hyperhive?");
+        if page && (url.contains("bgaming-network.com/") || url.contains("popiplay.network/")) {
             return Some(Self { page_url: url.to_string() });
         }
         let map = super::hacksaw::query_map(url);
@@ -40,6 +50,10 @@ pub struct BgamingSession {
     api: String,
     /// (header, value) the page asks every API call to carry
     csrf: Option<(String, String)>,
+    /// A hyperhive game: its play token and the state lock of the last reply.
+    hive: Option<(String, tokio::sync::Mutex<String>)>,
+    /// Which spin request the hyperhive game takes: 0 not known yet, 1 `{bet}`, 2 with bet_type and bid.
+    shape: std::sync::atomic::AtomicU8,
     info: SessionInfo,
 }
 
@@ -51,6 +65,9 @@ impl BgamingSession {
             .build()
             .map_err(|e| SlotError::Bridge(e.to_string()))?;
         let html = client.get(&launch.page_url).send().await.map_err(|e| SlotError::Bridge(format!("game page: {e}")))?.text().await.unwrap_or_default();
+        if launch.page_url.contains("/hyperhive?") {
+            return Self::open_hive(&launch.page_url, &html).await;
+        }
         let api = extract_json_string(&html, "\"api\":\"").ok_or_else(|| SlotError::Provider("Could not find the game API in the game page".into()))?;
         let csrf = extract_json_string(&html, "\"csrfTokenHeaderValue\":\"").map(|v| (extract_json_string(&html, "\"csrfTokenHeaderName\":\"").unwrap_or_else(|| "X-CSRF-Token".into()), v));
         let origin = api.split('/').take(3).collect::<Vec<_>>().join("/");
@@ -80,8 +97,115 @@ impl BgamingSession {
             features: vec![],
             balance: init["balance"]["wallet"].as_i64().map(|w| w + init["balance"]["game"].as_i64().unwrap_or(0)),
         };
-        Ok(Self { bridge, api, csrf, info })
+        Ok(Self { bridge, api, csrf, hive: None, shape: Default::default(), info })
     }
+
+    async fn open_hive(page_url: &str, html: &str) -> Result<Self, SlotError> {
+        let token = extract_json_string(html, "\"play_token\":\"").ok_or_else(|| SlotError::Provider("Could not find the play token in the game page".into()))?;
+        let origin = page_url.split('/').take(3).collect::<Vec<_>>().join("/");
+        let api = format!("{origin}/api");
+        let bridge = Bridge::open(&format!("{origin}/robots.txt")).await.map_err(SlotError::Bridge)?;
+        let init = match rpc(&bridge, &api, "init", json!({ "token": token, "req": {} })).await {
+            Ok(v) => v,
+            Err(e) => {
+                bridge.close();
+                return Err(e);
+            }
+        };
+        if !init["state"].is_null() {
+            bridge.close();
+            return Err(SlotError::Provider("This game has a bonus open: finish it in your browser first".into()));
+        }
+        let cur = &init["currency_attributes"];
+        let info = SessionInfo {
+            currency: cur["code"].as_str().or(init["currency"].as_str()).unwrap_or("FUN").to_uppercase(),
+            decimals: cur["exponent"].as_u64().unwrap_or(2) as u32,
+            bet_levels: init["config"]["bet_limits"].as_array().map(|a| a.iter().filter_map(Value::as_i64).map(|m| BetLevel { raw: m.to_string(), minor: m }).collect()).unwrap_or_default(),
+            default_bet: init["config"]["default_bet"].as_i64(),
+            features: vec![],
+            balance: init["balance"].as_i64(),
+        };
+        let lock = init["state_lock"].as_str().unwrap_or("").to_string();
+        Ok(Self { bridge, api, csrf: None, hive: Some((token, tokio::sync::Mutex::new(lock))), shape: Default::default(), info })
+    }
+
+    /// One hyperhive spin; a round that doesn't end in it is left for the browser.
+    async fn spin_hive(&self, token: &str, lock: &tokio::sync::Mutex<String>, bet: i64) -> Result<SpinResult, SlotError> {
+        let t0 = std::time::Instant::now();
+        use std::sync::atomic::Ordering;
+        let mut lock = lock.lock().await;
+        let known = self.shape.load(Ordering::Relaxed);
+        let shapes: &[u8] = match known {
+            0 => &[1, 2],
+            1 => &[1],
+            _ => &[2],
+        };
+        let mut r = Value::Null;
+        for (i, &shape) in shapes.iter().enumerate() {
+            let req = if shape == 1 { json!({ "bet": bet }) } else { json!({ "bet": bet, "bet_type": "bet", "bid": 0 }) };
+            let mut params = json!({ "token": token, "req": req });
+            if !lock.is_empty() {
+                params["state_lock"] = json!(*lock);
+            }
+            match rpc(&self.bridge, &self.api, "play", params).await {
+                Ok(v) => {
+                    self.shape.store(shape, Ordering::Relaxed);
+                    r = v;
+                    break;
+                }
+                // the game wants the other request ("Something went wrong")
+                Err(SlotError::Provider(_)) if i + 1 < shapes.len() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(l) = r["state_lock"].as_str() {
+            *lock = l.to_string();
+        }
+        let round = &r["resp"]["round"];
+        let done = r["final"].as_bool() != Some(false);
+        let amount = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+        let win = if done { amount(&round["win"]).unwrap_or(0) } else { 0 };
+        Ok(SpinResult {
+            round_id: round["id"].as_str().unwrap_or("").to_string(),
+            cost: bet,
+            win,
+            multiplier: if bet > 0 { win as f64 / bet as f64 } else { 0.0 },
+            balance: r["balance"].as_i64(),
+            pending: !done,
+            free_spins: !done,
+            held: !done,
+            events: 1,
+            ms: t0.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+/// A JSON-RPC call to a hyperhive game -> its `result`.
+async fn rpc(bridge: &Bridge, api: &str, method: &str, params: Value) -> Result<Value, SlotError> {
+    let body = json!({ "id": "1", "jsonrpc": "2.0", "method": method, "params": params });
+    let (status, res) = match bridge.post_json(api, &[], &body).await {
+        Ok(v) => v,
+        Err(e) if e.starts_with("HTTP 429") => return Err(SlotError::RateLimited),
+        Err(e) => return Err(SlotError::Bridge(e)),
+    };
+    if status == 401 || status == 403 {
+        return Err(SlotError::SessionExpired);
+    }
+    if let Some(err) = res.get("error").filter(|e| !e.is_null()) {
+        let msg = err["message"].as_str().map(str::to_string).unwrap_or_else(|| err.to_string());
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("balance") || lower.contains("funds") {
+            return Err(SlotError::Balance);
+        }
+        if lower.contains("session") || lower.contains("token") {
+            return Err(SlotError::SessionExpired);
+        }
+        return Err(SlotError::Provider(format!("BGaming {method}: {msg}")));
+    }
+    if status != 200 {
+        return Err(SlotError::Provider(format!("BGaming {method} HTTP {status}")));
+    }
+    Ok(res["result"].clone())
 }
 
 fn err_msg(v: &Value) -> String {
@@ -103,6 +227,9 @@ impl SlotSession for BgamingSession {
     }
 
     async fn spin(&self, bet: i64, _feature: Option<&str>, hold: bool) -> Result<SpinResult, SlotError> {
+        if let Some((token, lock)) = &self.hive {
+            return self.spin_hive(token, lock, bet).await;
+        }
         let t0 = std::time::Instant::now();
         let mut body = json!({ "command": "spin", "options": { "bet": bet } });
         let mut total_win = 0i64;

@@ -75,7 +75,22 @@ pub const MIRRORS: &[&str] = &[
 // Like the site's GetPrices: coin prices in USD, and `fiatPrices`, how many of each fiat Shuffle
 // shows amounts in buy one USD (EUR 0.89, JPY 158 …).
 const PRICES: &str = "query FastbetPrices { cryptoPrices(currency: USD) { name price } fiatPrices { name price } }";
-const ME: &str = "query FastbetMe { me { id username account { balances { currency amount: availableAmount } } } }";
+const ME: &str = "query FastbetMe { me { id username vipLevel xp usdWagered account { balances { currency amount: availableAmount } } } }";
+/// Everything the VIP rewards page shows, in one request.
+const REWARDS: &str = "query FastbetRewards { vipRewardsAggregate { dailyRakeback { nextClaimDate eligible currencyAmounts { amount currency } } \
+    weeklyBonus { usdValue nextClaimDate eligible } monthlyBonus { usdValue nextClaimDate eligible } instantRakebackBonus { currency amount } \
+    vipUpgradeBonuses { upgradeBonusUsdAmount vipLevel createdAt id } challengeRewards { claimedAt expiredAt challenge { id amount currency game { name } } } } }";
+const CLAIM_RAKEBACK: &str = "mutation FastbetClaimRakeback { instantRakebackClaim { currency amount } }";
+const CLAIM_DAILY_RAKEBACK: &str = "mutation FastbetClaimDailyRakeback { vipRewardsClaimDailyRakeback { nextClaimDate eligible currencyAmounts { amount currency } } }";
+const CLAIM_WEEKLY: &str = "mutation FastbetClaimWeekly($currency: Currency!) { vipRewardsClaimWeeklyBonus(currency: $currency) { claimedAmount { currency amount } nextClaimDate } }";
+const CLAIM_MONTHLY: &str = "mutation FastbetClaimMonthly($currency: Currency!) { vipRewardsClaimMonthlyBonus(currency: $currency) { claimedAmount { currency amount } nextClaimDate } }";
+const CLAIM_UPGRADE: &str = "mutation FastbetClaimUpgrade($currency: Currency!, $vipLevel: VipLevel!) { claimVipUpgradeBonus(currency: $currency, vipLevel: $vipLevel) { vipUserUpgradeId currency amount } }";
+const CLAIM_CHALLENGE: &str = "mutation FastbetClaimChallenge($challengeId: String!) { claimChallengeReward(challengeId: $challengeId) { challenge { currency amount } claimedAt } }";
+/// The open slot challenges (public).
+const CHALLENGES: &str = "query FastbetChallenges { challenges(first: 50, completed: false) { nodes { id usdMinBet minMultiplier currency amount completed referredOnly \
+    game { id name slug image { key } provider { id name } edge demoMode } } } }";
+/// The XP each VIP level starts at, lowest first (public).
+const VIP_LEVELS: &str = "query FastbetVipLevels { vipLevels { level amount } }";
 const SEEDS: &str = "query FastbetSeeds { currentGameSeeds { id clientSeed hashedSeed status currentNonce } }";
 const ROTATE: &str = "mutation FastbetSeed($clientSeed: String!) { gameSeedChangeAndReveal(newClientSeed: $clientSeed) { \
     id clientSeed hashedSeed status currentNonce } }";
@@ -129,6 +144,10 @@ const PROVIDERS: &[(&str, &str)] = &[
     ("goodtimesstudios", "goodtimesstudios"),
     ("pineappleplay", "pineappleplay"),
     ("alohagaming", "alohagaming"),
+    // studios on Relax's platform
+    ("printstudios", "printstudios"),
+    ("fantasma", "fantasma"),
+    ("fourleafgaming", "fourleafgaming"),
 ];
 
 const EXPIRED: &str = "Your Shuffle login has expired. Log in again in Settings.";
@@ -206,6 +225,9 @@ pub struct Shuffle {
     events: mpsc::UnboundedSender<CasinoEvent>,
     market: Mutex<Market>,
     published: Mutex<Market>,
+    /// The VIP ladder: (level, XP it starts at), lowest first; and the status last sent.
+    vip_levels: Mutex<Vec<(String, f64)>>,
+    last_vip: Mutex<Option<VipStatus>>,
     /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
     inflight: AtomicUsize,
     settled: AtomicU64,
@@ -238,6 +260,8 @@ impl Shuffle {
             events,
             market: Mutex::new(Market::default()),
             published: Mutex::new(Market::default()),
+            vip_levels: Mutex::new(Vec::new()),
+            last_vip: Mutex::new(None),
             inflight: AtomicUsize::new(0),
             settled: AtomicU64::new(0),
             browser_id: random_id(),
@@ -405,6 +429,12 @@ impl Shuffle {
         match self.gql(ME, json!({}), true).await {
             Ok(data) => match data.get("me").filter(|u| u.is_object()) {
                 Some(me) => {
+                    if self.vip_levels.lock().is_empty() {
+                        match self.gql(VIP_LEVELS, json!({}), false).await {
+                            Ok(data) => *self.vip_levels.lock() = vip_ladder(&data),
+                            Err(e) => tracing::info!("shuffle: vip levels: {}", CasinoError::from(e)),
+                        }
+                    }
                     self.apply_me(me, true);
                     self.status(ConnStatus::Ready, "");
                     if let Ok(st) = self.seeds().await {
@@ -447,6 +477,9 @@ impl Shuffle {
         {
             if let Some(id) = me.get("id").and_then(Value::as_str) {
                 *self.user_id.lock() = Some(id.to_string());
+            }
+            if let Some(vip) = vip_status(me, &self.vip_levels.lock()) {
+                send_vip(&self.events, &self.last_vip, vip);
             }
             let mut m = self.market.lock();
             m.username = me.get("username").and_then(Value::as_str).map(str::to_string);
@@ -503,6 +536,19 @@ impl Shuffle {
             }
         }
         self.publish();
+    }
+
+    /// A coin's USD price as the site gives it; dollar coins count as a dollar until prices are in.
+    fn usd_price(&self, cur: &str) -> f64 {
+        let cur = cur.to_ascii_lowercase();
+        let price = self.market.lock().currencies.get(&cur).map(|i| i.price).unwrap_or(0.0);
+        if price > 0.0 {
+            price
+        } else if matches!(cur.as_str(), "usdt" | "usdc" | "usd") {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Books a settled bet into the local wallet.
@@ -671,6 +717,40 @@ impl Shuffle {
 impl Casino for Shuffle {
     fn id(&self) -> CasinoId {
         CasinoId::Shuffle
+    }
+
+    async fn rewards(&self) -> Result<Vec<Reward>, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let data = self.gql(REWARDS, json!({}), true).await?;
+        let r = data.get("vipRewardsAggregate").filter(|r| r.is_object()).ok_or_else(|| CasinoError::BadReply(data.to_string().chars().take(200).collect()))?;
+        Ok(rewards_of(r, &|c: &str| self.usd_price(c), SystemTime::now()))
+    }
+
+    async fn claim_reward(&self, id: &str, currency: &str) -> Result<String, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let cur = currency.to_ascii_uppercase();
+        let (query, vars, key) = match id {
+            "rakeback" => (CLAIM_RAKEBACK, json!({}), "instantRakebackClaim"),
+            "daily-rakeback" => (CLAIM_DAILY_RAKEBACK, json!({}), "vipRewardsClaimDailyRakeback"),
+            "weekly" => (CLAIM_WEEKLY, json!({ "currency": cur }), "vipRewardsClaimWeeklyBonus"),
+            "monthly" => (CLAIM_MONTHLY, json!({ "currency": cur }), "vipRewardsClaimMonthlyBonus"),
+            _ if id.starts_with("upgrade:") => (CLAIM_UPGRADE, json!({ "currency": cur, "vipLevel": &id["upgrade:".len()..] }), "claimVipUpgradeBonus"),
+            _ if id.starts_with("challenge:") => (CLAIM_CHALLENGE, json!({ "challengeId": &id["challenge:".len()..] }), "claimChallengeReward"),
+            _ => return Err(CasinoError::Server("Nothing to claim".into())),
+        };
+        let data = self.gql(query, vars, true).await?;
+        // the balances take the payout
+        self.refresh_me().await;
+        Ok(claimed_text(data.get(key)))
+    }
+
+    async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
+        let data = self.gql(CHALLENGES, json!({}), self.ready.load(Ordering::SeqCst)).await?;
+        Ok(challenges_of(&data, &|c: &str| self.usd_price(c)))
     }
 
     fn set_token(&self, token: Option<String>) {
@@ -896,6 +976,154 @@ fn op_names(game: Game, op: Op) -> Option<(&'static str, &'static str, Option<&'
         (Game::Chicken, Op::Active) => ("ChickenOpen", "chickenActiveBet", None),
         _ => return None,
     })
+}
+
+/// `{currency, amount}` entries with something in them.
+fn coin_amounts(list: Option<&Value>) -> Vec<(String, f64)> {
+    list.and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| Some((c.get("currency")?.as_str()?.to_string(), c.get("amount").and_then(f64_from_json)?)))
+        .filter(|(_, a)| *a > 0.0)
+        .collect()
+}
+
+/// `vipRewardsAggregate` -> the reward cards, the way the site decides what is claimable: an amount
+/// that is there can be claimed until `nextClaimDate`; without one it is cooling down until then.
+fn rewards_of(r: &Value, price: &dyn Fn(&str) -> f64, now: SystemTime) -> Vec<Reward> {
+    let worth = |list: &[(String, f64)]| list.iter().map(|(c, a)| a * price(c)).sum::<f64>();
+    let mut out = Vec::new();
+
+    let instant = coin_amounts(r.get("instantRakebackBonus"));
+    let usd = worth(&instant);
+    let detail = if instant.is_empty() { "Nothing waiting yet".to_string() } else { coins_text(&instant) };
+    out.push(Reward { usd: Some(usd), detail, claimable: usd > 0.0, ..Reward::new("rakeback", RewardKind::Rakeback) });
+
+    if let Some(d) = r.get("dailyRakeback").filter(|d| d.is_object()) {
+        let list = coin_amounts(d.get("currencyAmounts"));
+        let next = d.get("nextClaimDate").and_then(time_of);
+        let ready = d["eligible"].as_bool() == Some(true) && !list.is_empty() && next.is_none_or(|n| now < n);
+        let detail = if list.is_empty() { "Builds up as you play".to_string() } else { coins_text(&list) };
+        out.push(Reward {
+            title: "Daily rakeback".into(),
+            usd: (!list.is_empty()).then(|| worth(&list)),
+            detail,
+            claimable: ready,
+            next_at: if ready { None } else { next },
+            expires: if ready { next } else { None },
+            ..Reward::new("daily-rakeback", RewardKind::Daily)
+        });
+    }
+
+    for (key, id, kind, unlock) in [("weeklyBonus", "weekly", RewardKind::Weekly, "Bronze 1"), ("monthlyBonus", "monthly", RewardKind::Monthly, "Silver 1")] {
+        let Some(b) = r.get(key).filter(|b| b.is_object()) else { continue };
+        let usd = b.get("usdValue").and_then(f64_from_json).unwrap_or(0.0);
+        let next = b.get("nextClaimDate").and_then(time_of);
+        let eligible = b["eligible"].as_bool() == Some(true);
+        let ready = eligible && usd > 0.0 && next.is_none_or(|n| now < n);
+        let detail = if !eligible { format!("Unlocks at {unlock}") } else { "Grows with what you wager".to_string() };
+        out.push(Reward {
+            usd: (usd > 0.0).then_some(usd),
+            detail,
+            claimable: ready,
+            next_at: if ready || !eligible { None } else { next },
+            expires: if ready { next } else { None },
+            ..Reward::new(id, kind)
+        });
+    }
+
+    for u in r.get("vipUpgradeBonuses").and_then(Value::as_array).into_iter().flatten() {
+        let Some(level) = u.get("vipLevel").and_then(Value::as_str) else { continue };
+        // the site gives them a week
+        let expires = u.get("createdAt").and_then(time_of).map(|c| c + Duration::from_secs(7 * 86_400 - 60));
+        out.push(Reward {
+            title: format!("{} bonus", level_name(level)),
+            usd: u.get("upgradeBonusUsdAmount").and_then(f64_from_json),
+            detail: format!("For reaching {}", level_name(level)),
+            claimable: expires.is_none_or(|e| now < e),
+            expires,
+            ..Reward::new(&format!("upgrade:{level}"), RewardKind::LevelUp)
+        });
+    }
+
+    for c in r.get("challengeRewards").and_then(Value::as_array).into_iter().flatten() {
+        let expires = c.get("expiredAt").and_then(time_of);
+        if c.get("claimedAt").is_some_and(|v| !v.is_null()) || expires.is_some_and(|e| e <= now) {
+            continue;
+        }
+        let ch = &c["challenge"];
+        let Some(id) = ch.get("id").and_then(Value::as_str) else { continue };
+        let cur = ch.get("currency").and_then(Value::as_str).unwrap_or("USDC");
+        let amount = ch.get("amount").and_then(f64_from_json).unwrap_or(0.0);
+        let game = ch.pointer("/game/name").and_then(Value::as_str).unwrap_or("a slot");
+        out.push(Reward { usd: Some(amount * price(cur)), detail: format!("Won on {game}"), claimable: true, expires, ..Reward::new(&format!("challenge:{id}"), RewardKind::Challenge) });
+    }
+    out
+}
+
+/// `challenges { nodes }` -> the open challenges anyone can take, biggest prize first.
+fn challenges_of(data: &Value, price: &dyn Fn(&str) -> f64) -> Vec<Challenge> {
+    let nodes = data.pointer("/challenges/nodes").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let mut out: Vec<Challenge> = nodes
+        .iter()
+        .filter(|c| c["completed"].as_bool() != Some(true) && c["referredOnly"].as_bool() != Some(true))
+        .filter_map(|c| {
+            let cur = c.get("currency").and_then(Value::as_str).unwrap_or("USDC");
+            Some(Challenge {
+                id: c.get("id")?.as_str()?.to_string(),
+                koth: false,
+                game: slot_game(&c["game"])?,
+                target: c.get("minMultiplier").and_then(f64_from_json)?,
+                min_bet_usd: c.get("usdMinBet").and_then(f64_from_json).unwrap_or(0.0),
+                prize_usd: c.get("amount").and_then(f64_from_json).unwrap_or(0.0) * price(cur),
+                ends: None,
+                leader: None,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.prize_usd.total_cmp(&a.prize_usd));
+    out
+}
+
+/// `vipLevels` -> (level, XP it starts at), lowest first.
+fn vip_ladder(data: &Value) -> Vec<(String, f64)> {
+    let mut ladder: Vec<(String, f64)> = data
+        .get("vipLevels")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|l| Some((l.get("level")?.as_str()?.to_string(), l.get("amount").and_then(f64_from_json)?)))
+        .collect();
+    ladder.sort_by(|a, b| a.1.total_cmp(&b.1));
+    ladder
+}
+
+/// "GOLD_3" -> "Gold 3", "UNRANKED" -> "Unranked".
+fn level_name(code: &str) -> String {
+    code.split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_ascii_uppercase().to_string() + &c.as_str().to_ascii_lowercase()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The account's VIP level from `me { vipLevel xp usdWagered }` on the ladder, the way the site
+/// works it out: the next level is the first one above the XP.
+fn vip_status(me: &Value, ladder: &[(String, f64)]) -> Option<VipStatus> {
+    let xp = me.get("xp").and_then(f64_from_json)?;
+    let wagered = me.get("usdWagered").and_then(f64_from_json).unwrap_or(0.0);
+    let next = ladder.iter().position(|(_, at)| xp < *at);
+    let (start, next) = match next {
+        Some(i) => (ladder.get(i.wrapping_sub(1)).map(|(_, at)| *at).unwrap_or(0.0), ladder.get(i).map(|(l, at)| (level_name(l), *at))),
+        None => (ladder.last().map(|(_, at)| *at).unwrap_or(0.0), None),
+    };
+    let rank = me.get("vipLevel").and_then(Value::as_str).map(level_name).unwrap_or_else(|| "Unranked".into());
+    Some(VipStatus::ranked(rank, xp, start, next, Some(xp_rate(xp, wagered))))
 }
 
 /// The game's key inside `shuffleOriginalActions { action { … } }`, and the fields asked for.
@@ -1253,6 +1481,53 @@ impl Drop for InFlight<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewards_and_challenges() {
+        // 2026-10-16 11:00 UTC; replies as Shuffle sent them that day
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_148_400);
+        let agg = json!({"dailyRakeback":{"nextClaimDate":"2026-10-17T00:00:00.000Z","eligible":true,"currencyAmounts":[{"amount":"0.04759564","currency":"TRX"}]},
+            "weeklyBonus":{"usdValue":"0","nextClaimDate":"2026-10-22T11:00:00.000Z","eligible":true},"monthlyBonus":{"usdValue":"0","nextClaimDate":"2026-11-06T00:00:00.000Z","eligible":true},
+            "instantRakebackBonus":[{"currency":"BTC","amount":"0"},{"currency":"TRX","amount":"0.11898911"},{"currency":"USDT","amount":"0.002055"}],
+            "vipUpgradeBonuses":[],"challengeRewards":[]});
+        let price = |c: &str| match c.to_ascii_lowercase().as_str() { "trx" => 0.3, "usdt" => 1.0, _ => 0.0 };
+        let list = rewards_of(&agg, &price, now);
+        assert_eq!(list.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["rakeback", "daily-rakeback", "weekly", "monthly"]);
+        assert!(list[0].claimable && (list[0].usd.unwrap() - (0.11898911 * 0.3 + 0.002055)).abs() < 1e-9);
+        assert_eq!(list[0].detail, "0.11898911 TRX + 0.002055 USDT");
+        // what's there can be claimed until the next one comes
+        assert!(list[1].claimable && list[1].expires == parse_iso("2026-10-17T00:00:00Z") && list[1].title == "Daily rakeback");
+        // nothing yet: waiting for the date
+        assert!(!list[2].claimable && list[2].next_at == parse_iso("2026-10-22T11:00:00Z"));
+        assert!(list.iter().all(|r| r.link.is_none()));
+
+        let ch = json!({"challenges":{"nodes":[
+            {"id":"8dca","game":{"id":"e6c4","name":"Max The Mathmagician","slug":"hacksaw-max-the-mathmagician","image":{"key":"b2c6"},"provider":{"id":"kitsunegaming","name":"Kitsune Gaming"},"edge":"3.66","demoMode":true},"usdMinBet":"1","minMultiplier":3000,"currency":"USDC","amount":"850","referredOnly":false,"completed":false},
+            {"id":"29da","game":{"id":"267b","name":"F* Louvre","slug":"7-rings-f-louvre","image":{"key":"20e6"},"provider":{"id":"7rings","name":"7rings"},"edge":"4"},"usdMinBet":"0.4","minMultiplier":10000,"currency":"USDC","amount":"1250","referredOnly":false,"completed":false},
+            {"id":"done","game":{"id":"x","name":"X","slug":"x","provider":{"id":"p","name":"P"}},"usdMinBet":"1","minMultiplier":10,"currency":"USDC","amount":"5","completed":true}]}});
+        let list = challenges_of(&ch, &|_: &str| 1.0);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].game.id.as_str(), list[0].target, list[0].prize_usd, list[0].min_bet_usd), ("7-rings-f-louvre", 10_000.0, 1250.0, 0.4));
+        assert!(list[1].game.image.starts_with("https://shuffle-com.imgix.net/b2c6"));
+    }
+
+    #[test]
+    fn vip_from_xp() {
+        // the account's reply and a slice of the ladder, as Shuffle sends them
+        let ladder = vip_ladder(&json!({"vipLevels": [{"level": "GOLD_4", "amount": "250000"}, {"level": "GOLD_3", "amount": "200000"}, {"level": "UNRANKED", "amount": "0"}]}));
+        assert_eq!(ladder[0], ("UNRANKED".to_string(), 0.0));
+        let me = json!({"vipLevel": "GOLD_3", "xp": 224678, "usdWagered": "224668.14819016"});
+        let v = vip_status(&me, &ladder).unwrap();
+        assert_eq!(v.rank, "Gold 3");
+        assert_eq!(v.next_rank, Some(("Gold 4".to_string(), 250_000.0)));
+        assert!((v.rank_progress() - 24_678.0 / 50_000.0).abs() < 1e-9);
+        assert!((v.xp_per_usd.unwrap() - 1.0).abs() < 1e-3);
+        assert!(v.level.is_none());
+        // past the top of the ladder
+        let top = vip_status(&json!({"vipLevel": "GOLD_4", "xp": 300000, "usdWagered": "300000"}), &ladder).unwrap();
+        assert!(top.next_rank.is_none() && top.rank_progress() == 1.0);
+        assert_eq!(level_name("UNRANKED"), "Unranked");
+    }
 
     /// Every originals request as it goes out, one JSON line each, to check against the live
     /// schema: `cargo test shuffle_queries -- --ignored --nocapture`.

@@ -12,7 +12,7 @@ pub mod stake;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,8 @@ impl CasinoId {
                 "slotmillgames",
                 "spinomenal",
                 "wickedgames",
+                "play'ngo",
+                "retrogaming",
             ],
             CasinoId::Stake => &[crate::slots::STAKE_ENGINE],
             CasinoId::Shuffle => &[
@@ -171,8 +173,27 @@ impl CasinoId {
                 "goodtimesstudios",
                 "pineappleplay",
                 "alohagaming",
+                "printstudios",
+                "fantasma",
+                "fourleafgaming",
             ],
-            CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => &[],
+            // the providers of Goated's (Hub88) catalog that have drivers
+            CasinoId::Goated => &[
+                "hacksawgaming",
+                "pragmaticplay",
+                "relaxgaming",
+                "bgaming",
+                "spinomenal",
+                "avatarux",
+                "penguinking",
+                "peter&sons",
+                "popiplay",
+                "shadylady",
+                "slotmillgames",
+                "play'ngo",
+                "retrogaming",
+            ],
+            CasinoId::Gambulls | CasinoId::Metaspins => &[],
         }
     }
 
@@ -219,6 +240,21 @@ impl CasinoId {
             CasinoId::Shuffle => &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
             _ => &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("expert", "Expert")],
         }
+    }
+
+    /// The account has a VIP level the casino reports live ([`CasinoEvent::Vip`]).
+    pub fn has_vip(self) -> bool {
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+    }
+
+    /// Rakeback and VIP bonuses the app can claim ([`Casino::rewards`]).
+    pub fn has_rewards(self) -> bool {
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+    }
+
+    /// Public slot challenges and King of the Hill rounds ([`Casino::challenges`]).
+    pub fn has_challenges(self) -> bool {
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle)
     }
 
     /// Slot artwork is landscape (chips.gg's 4:3 thumbnails), so the lobby's tiles are too.
@@ -525,6 +561,140 @@ impl ProvableState {
     }
 }
 
+/// The account's VIP level and how far it is to the next one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VipStatus {
+    pub rank: String,
+    /// A finer level inside the rank, where the casino has one (chips.gg's "Level 101").
+    pub level: Option<u32>,
+    pub exp: f64,
+    /// XP where this level started and where the next one starts.
+    pub level_start: f64,
+    pub level_end: f64,
+    /// XP where the current rank started.
+    pub rank_start: f64,
+    /// The next rank up and the XP it starts at.
+    pub next_rank: Option<(String, f64)>,
+    /// XP a dollar wagered earns this account, measured from its own history (None: not known).
+    pub xp_per_usd: Option<f64>,
+    /// The casino counts dollars wagered, not XP (Stake): the amounts are exact and shown only in dollars.
+    pub in_dollars: bool,
+}
+
+impl VipStatus {
+    /// A ladder of named ranks and nothing finer: `exp` on the way from where `rank` starts to
+    /// where the next one does.
+    pub fn ranked(rank: String, exp: f64, rank_start: f64, next_rank: Option<(String, f64)>, xp_per_usd: Option<f64>) -> Self {
+        let level_end = next_rank.as_ref().map(|(_, at)| *at).unwrap_or(exp);
+        Self { rank, level: None, exp, level_start: rank_start, level_end, rank_start, next_rank, xp_per_usd, in_dollars: false }
+    }
+
+    /// How far through the level, 0–1.
+    pub fn progress(&self) -> f64 {
+        let span = self.level_end - self.level_start;
+        if span > 0.0 {
+            ((self.exp - self.level_start) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn xp_to_level(&self) -> f64 {
+        (self.level_end - self.exp).max(0.0)
+    }
+
+    /// How far from the current rank to the next one, 0–1 (1 at the top rank).
+    pub fn rank_progress(&self) -> f64 {
+        match &self.next_rank {
+            Some((_, at)) if *at > self.rank_start => ((self.exp - self.rank_start) / (at - self.rank_start)).clamp(0.0, 1.0),
+            Some(_) => 0.0,
+            None => 1.0,
+        }
+    }
+
+    pub fn xp_to_rank(&self) -> Option<f64> {
+        self.next_rank.as_ref().map(|(_, at)| (at - self.exp).max(0.0))
+    }
+
+    /// Dollars to wager for `xp`, at the account's own rate.
+    pub fn usd_for(&self, xp: f64) -> Option<f64> {
+        self.xp_per_usd.filter(|r| *r > 0.0).map(|r| xp / r)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RewardKind {
+    Rakeback,
+    Daily,
+    Weekly,
+    Monthly,
+    LevelUp,
+    Reload,
+    /// Anything else the casino pays out (its own name is the title).
+    Bonus,
+    /// The prize of a slot challenge the account won.
+    Challenge,
+}
+
+impl RewardKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            RewardKind::Rakeback => "Rakeback",
+            RewardKind::Daily => "Daily bonus",
+            RewardKind::Weekly => "Weekly bonus",
+            RewardKind::Monthly => "Monthly bonus",
+            RewardKind::LevelUp => "Level-up bonus",
+            RewardKind::Reload => "Cash reload",
+            RewardKind::Bonus => "Bonus",
+            RewardKind::Challenge => "Challenge prize",
+        }
+    }
+}
+
+/// Something the casino pays out on request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reward {
+    /// What [`Casino::claim_reward`] takes.
+    pub id: String,
+    pub kind: RewardKind,
+    /// What the card is called (the kind's name, or the casino's own).
+    pub title: String,
+    /// The casino only takes this claim on its site (it asks for a captcha there): where.
+    pub link: Option<String>,
+    /// Its worth in USD, when known.
+    pub usd: Option<f64>,
+    /// One line under it ("0.0248 USDT + 0.00004 SOL", "10% rakeback for an hour").
+    pub detail: String,
+    pub claimable: bool,
+    /// Not claimable yet: when it will be (a guess where the casino keeps a schedule).
+    pub next_at: Option<SystemTime>,
+    /// Claimable until.
+    pub expires: Option<SystemTime>,
+}
+
+impl Reward {
+    /// A reward of `kind` with nothing known about it yet.
+    pub fn new(id: &str, kind: RewardKind) -> Self {
+        Self { id: id.to_string(), kind, title: kind.name().to_string(), link: None, usd: None, detail: String::new(), claimable: false, next_at: None, expires: None }
+    }
+}
+
+/// A public slot challenge: the first bet on `game` paying `target`× or more, at `min_bet_usd` or
+/// more, wins `prize_usd`. A King of the Hill round (`koth`) instead pays the pool to the best
+/// multiplier on `game` when it ends; `target` is the best so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Challenge {
+    pub id: String,
+    pub koth: bool,
+    pub game: crate::slots::SlotGame,
+    pub target: f64,
+    pub min_bet_usd: f64,
+    pub prize_usd: f64,
+    pub ends: Option<SystemTime>,
+    /// Who leads a King of the Hill round.
+    pub leader: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnStatus {
     Connecting,
@@ -588,6 +758,7 @@ pub enum CasinoEvent {
     Provable(ProvableState),
     /// The casino renewed the login (Shuffle): save this token in place of the old one, which stopped working.
     Token(String),
+    Vip(VipStatus),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -691,6 +862,19 @@ pub trait Casino: Send + Sync {
     async fn list_originals(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
         Ok(vec![])
     }
+
+    /// Rakeback and bonuses, claimable or coming ([`CasinoId::has_rewards`]).
+    async fn rewards(&self) -> Result<Vec<Reward>, CasinoError> {
+        Ok(vec![])
+    }
+    /// Pays out the reward with this [`Reward::id`] in `currency`. Answers what was paid.
+    async fn claim_reward(&self, _id: &str, _currency: &str) -> Result<String, CasinoError> {
+        Err(CasinoError::Server("This casino has no rewards to claim".into()))
+    }
+    /// Running slot challenges and King of the Hill rounds ([`CasinoId::has_challenges`]).
+    async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
+        Ok(vec![])
+    }
 }
 
 /// Spawns the casino's connection tasks on the current tokio runtime.
@@ -713,9 +897,155 @@ pub struct Setup {
     pub clearance: Option<Clearance>,
 }
 
+/// "2026-10-17T00:00:00.000Z" (an offset like "+02:00" too) -> the moment it names.
+fn parse_iso(s: &str) -> Option<SystemTime> {
+    let s = s.trim();
+    let (date, time) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>());
+    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    // the zone: Z, +hh:mm or -hh:mm after the clock
+    let (clock, offset) = match time.find(['Z', 'z', '+', '-']) {
+        Some(i) => {
+            let zone = &time[i..];
+            let secs = if zone.eq_ignore_ascii_case("z") {
+                0
+            } else {
+                let sign = if zone.starts_with('-') { -1 } else { 1 };
+                let mut hm = zone[1..].split(':').map(|x| x.parse::<i64>().unwrap_or(0));
+                sign * (hm.next().unwrap_or(0) * 3600 + hm.next().unwrap_or(0) * 60)
+            };
+            (&time[..i], secs)
+        }
+        None => (time, 0),
+    };
+    let mut c = clock.split(':');
+    let (h, mi) = (c.next()?.parse::<i64>().ok()?, c.next().unwrap_or("0").parse::<i64>().ok()?);
+    let sec: f64 = c.next().unwrap_or("0").parse().ok()?;
+    let days = days_from_civil(y, u32::try_from(m).ok()?, u32::try_from(day).ok()?);
+    let ms = ((days * 86_400 + h * 3600 + mi * 60 - offset) as f64 + sec) * 1000.0;
+    (ms >= 0.0).then(|| std::time::UNIX_EPOCH + Duration::from_millis(ms as u64))
+}
+
+/// A time a casino sends as text (ISO) or as milliseconds.
+fn time_of(v: &Value) -> Option<SystemTime> {
+    match v {
+        Value::String(s) => parse_iso(s),
+        Value::Number(n) => n.as_f64().filter(|ms| *ms > 0.0).map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms as u64)),
+        _ => None,
+    }
+}
+
+/// "0.0476 TRX + 0.00024 SOL": coins and amounts, the first three.
+fn coins_text(list: &[(String, f64)]) -> String {
+    list.iter()
+        .filter_map(|(c, a)| {
+            let s = format!("{a:.8}");
+            let s = s.trim_end_matches('0').trim_end_matches('.');
+            // dust below the eighth decimal says nothing
+            (s != "0").then(|| format!("{s} {}", c.to_uppercase()))
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// "Claimed 0.12 TRX" from a claim's answer: a list of `{currency, amount}`, one of them, or one
+/// under `claimedAmount` / `currencyAmounts` / `challenge`.
+fn claimed_text(v: Option<&Value>) -> String {
+    fn coins(v: &Value) -> Vec<(String, f64)> {
+        match v {
+            Value::Array(a) => a.iter().flat_map(coins).collect(),
+            Value::Object(o) => {
+                for k in ["claimedAmount", "currencyAmounts", "challenge", "amounts"] {
+                    if let Some(inner) = o.get(k).filter(|x| !x.is_null()) {
+                        return coins(inner);
+                    }
+                }
+                match (o.get("currency").and_then(Value::as_str), o.get("amount").and_then(crate::money::f64_from_json)) {
+                    (Some(c), Some(a)) if a > 0.0 => vec![(c.to_string(), a)],
+                    _ => vec![],
+                }
+            }
+            _ => vec![],
+        }
+    }
+    let list = v.map(coins).unwrap_or_default();
+    if list.is_empty() {
+        "Claimed".into()
+    } else {
+        format!("Claimed {}", coins_text(&list))
+    }
+}
+
+/// Days since 1970-01-01 -> (year, month, day), proleptic Gregorian (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Hands `status` to the app unless it is what was sent last.
+fn send_vip(events: &mpsc::UnboundedSender<CasinoEvent>, last: &parking_lot::Mutex<Option<VipStatus>>, status: VipStatus) {
+    let mut last = last.lock();
+    if last.as_ref() != Some(&status) {
+        *last = Some(status.clone());
+        let _ = events.send(CasinoEvent::Vip(status));
+    }
+}
+
+/// XP per dollar from an account's XP and its wager in USD (1 where it can't tell).
+fn xp_rate(xp: f64, usd_wagered: f64) -> f64 {
+    if xp > 0.0 && usd_wagered > 0.0 {
+        xp / usd_wagered
+    } else {
+        1.0
+    }
+}
+
 /// Reconnect delay: 0.3 s doubling up to 5 s.
 fn backoff(retries: &mut u32) -> Duration {
     let ms = (300u64 << (*retries).min(5)).min(5000);
     *retries += 1;
     Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn iso_times_and_claim_texts() {
+        let at = |s: u64| Some(std::time::UNIX_EPOCH + Duration::from_secs(s));
+        // 2026-10-16 08:00 UTC
+        assert_eq!(parse_iso("2026-10-16T08:00:00.000Z"), at(1_792_137_600));
+        assert_eq!(parse_iso("2026-10-16T08:00:00Z"), at(1_792_137_600));
+        assert_eq!(parse_iso("2026-10-16T10:00:00+02:00"), at(1_792_137_600));
+        assert_eq!(parse_iso("2026-10-16T03:30:00-04:30"), at(1_792_137_600));
+        assert_eq!(parse_iso("not a date"), None);
+        assert_eq!(time_of(&json!(1_792_137_600_000u64)), at(1_792_137_600));
+        assert_eq!(civil_from_days(days_from_civil(2028, 2, 29)), (2028, 2, 29));
+
+        assert_eq!(claimed_text(Some(&json!([{"currency": "TRX", "amount": "0.119"}, {"currency": "USDT", "amount": "0"}]))), "Claimed 0.119 TRX");
+        assert_eq!(claimed_text(Some(&json!({"claimedAmount": {"currency": "USDT", "amount": "2.5"}, "nextClaimDate": "x"}))), "Claimed 2.5 USDT");
+        assert_eq!(claimed_text(Some(&json!({"nextClaimDate": "x"}))), "Claimed");
+        assert_eq!(claimed_text(None), "Claimed");
+        assert_eq!(coins_text(&[("btc".into(), 4.9e-11), ("sol".into(), 0.000419482735)]), "0.00041948 SOL");
+    }
 }

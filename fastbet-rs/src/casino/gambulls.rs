@@ -603,6 +603,7 @@ pub async fn self_test(bets: usize) {
         CasinoEvent::Market(m) => println!("account: {:?}, balance: {:?}", m.username, m.wallets.get(CURRENCY).map(|v| format_units(*v, DECIMALS, DECIMALS))),
         CasinoEvent::Provable(p) => println!("seeds: client {:?}, server hash {:?}, nonce {:?}", p.client_seed, p.server_seed_hash, p.nonce),
         CasinoEvent::Token(t) => println!("login renewed ({} characters)", t.len()),
+        CasinoEvent::Vip(v) => println!("vip: {} ({} xp)", v.rank, v.exp),
     };
     loop {
         match tokio::time::timeout(Duration::from_secs(150), rx.recv()).await {

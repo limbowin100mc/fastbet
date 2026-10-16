@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -39,6 +39,52 @@ pub const REFRESH_COOKIE: &str = "refresh_token";
 
 const RATES: &str = "/main/exchange-rates";
 const USER: &str = "/user/";
+/// The games of the providers asked for (`?providers=a,b`), grouped by category (public).
+const GAMES: &str = "/main/games?providers=";
+/// A game session's URL: `{currency, platform, fiat, game_id, demo_mode, locale}` (Hub88).
+const LAUNCH: &str = "/hub88/create";
+/// How long the slot list is kept before it is fetched again.
+const SLOTS_TTL: Duration = Duration::from_secs(600);
+/// Goated's (Hub88's) provider codes with slots -> the producer names the drivers know; a code
+/// without one stays itself and shows as Untested.
+pub const PROVIDERS: &[(&str, &str)] = &[
+    ("pgp", "pragmaticplay"),
+    ("hsg", "hacksawgaming"),
+    ("spm", "spinomenal"),
+    ("png", "play'ngo"),
+    ("nlc", "nolimitcity"),
+    ("bgm", "bgaming"),
+    ("rlx", "relaxgaming"),
+    ("rtg", "redtigergaming"),
+    ("avx", "avatarux"),
+    ("ntn", "netent"),
+    ("bmg", "boominggames"),
+    ("wzn", "voltent"),
+    ("end", "endorphina"),
+    ("pgs", "pgsoft"),
+    ("trf", "truelab"),
+    ("popl", "popiplay"),
+    ("oak", "3oaks"),
+    ("oct", "penguinking"),
+    ("pets", "peter&sons"),
+    ("slm", "slotmillgames"),
+    ("big", "bigtimegaming"),
+    ("bst", "betsoft"),
+    ("shdla", "shadylady"),
+    ("bckg", "backseatgaming"),
+    ("bpt", "blueprintgaming"),
+    ("hp", "happyduck"),
+    ("hbo", "habanero"),
+    ("snk", "sneakyslots"),
+    ("rgg", "retrogaming"),
+];
+const VIP_REWARDS: &str = "/user/vip-rewards";
+const DAILY_BONUS: &str = "/user/daily-bonus";
+const DAILY_BONUS_CLAIM: &str = "/user/daily-bonus/claim";
+/// Where the VIP rewards are claimed: Goated asks for a reCAPTCHA there.
+const VIP_PAGE: &str = "https://www.goated.com/vip-program";
+/// Refresh ticks between profile reads (for the VIP progress).
+const VIP_EVERY: u32 = 6;
 const BALANCES: &str = "/user/wallet/balances";
 const RENEW: &str = "/user/auth/token/refresh";
 const LIMBO: &str = "/casino/limbo/bet";
@@ -89,6 +135,9 @@ pub struct Goated {
     events: mpsc::UnboundedSender<CasinoEvent>,
     market: Mutex<Market>,
     published: Mutex<Market>,
+    last_vip: Mutex<Option<VipStatus>>,
+    /// Every slot Goated lists, and when it was fetched (the API has no search or paging).
+    slots: Mutex<Option<(Instant, Vec<crate::slots::SlotGame>)>>,
     /// Bets in flight and bets settled, so a balance poll never overwrites a fresher local balance.
     inflight: AtomicUsize,
     settled: AtomicU64,
@@ -107,6 +156,8 @@ impl Goated {
             events,
             market: Mutex::new(Market::default()),
             published: Mutex::new(Market::default()),
+            last_vip: Mutex::new(None),
+            slots: Mutex::new(None),
             inflight: AtomicUsize::new(0),
             settled: AtomicU64::new(0),
         });
@@ -155,6 +206,7 @@ impl Goated {
         self.authenticate().await;
         let mut rates_at = Instant::now();
         let mut failures = 0;
+        let mut ticks: u32 = 0;
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {
@@ -171,6 +223,13 @@ impl Goated {
                         }
                     }
                     if self.ready.load(Ordering::SeqCst) {
+                        // the profile carries the VIP progress: now and then
+                        ticks += 1;
+                        if ticks % VIP_EVERY == 0 {
+                            if let Ok(user) = self.signed(reqwest::Method::GET, USER, None).await {
+                                self.apply_vip(&user);
+                            }
+                        }
                         match self.refresh_balances().await {
                             Ok(()) => failures = 0,
                             Err(CallError::Casino(CasinoError::ConnectionLost | CasinoError::Timeout)) => failures += 1,
@@ -199,6 +258,7 @@ impl Goated {
             Ok(user) => {
                 let name = ["username", "name", "display_name"].iter().find_map(|k| user.get(*k).and_then(Value::as_str)).map(str::to_string);
                 self.market.lock().username = name;
+                self.apply_vip(&user);
                 if let Err(e) = self.refresh_balances().await {
                     tracing::info!("goated: balances: {}", CasinoError::from(e));
                 }
@@ -210,6 +270,29 @@ impl Goated {
             Err(CallError::Unauthenticated) => self.status(ConnStatus::AuthFailed, EXPIRED),
             Err(CallError::Casino(CasinoError::Server(m))) => self.status(ConnStatus::AuthFailed, m),
             Err(e) => self.status(ConnStatus::Offline, CasinoError::from(e).to_string()),
+        }
+    }
+
+    /// Every slot of the providers in `PROVIDERS`, from the cache while it is fresh.
+    async fn slot_list(&self) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        if let Some((at, list)) = self.slots.lock().as_ref() {
+            if at.elapsed() < SLOTS_TTL && !list.is_empty() {
+                return Ok(list.clone());
+            }
+        }
+        let codes: Vec<&str> = PROVIDERS.iter().map(|(c, _)| *c).collect();
+        let data = self.call(reqwest::Method::GET, &format!("{GAMES}{}", codes.join(",")), None, None).await?;
+        let list = slots_of(&data);
+        if !list.is_empty() {
+            *self.slots.lock() = Some((Instant::now(), list.clone()));
+        }
+        Ok(list)
+    }
+
+    /// The profile's `vip_progress`: the rank, the next one and the XP each starts at.
+    fn apply_vip(&self, user: &Value) {
+        if let Some(vip) = vip_status(user) {
+            send_vip(&self.events, &self.last_vip, vip);
         }
     }
 
@@ -386,6 +469,32 @@ impl Casino for Goated {
         CasinoId::Goated
     }
 
+    /// The VIP rewards waiting (claimed on Goated, which asks for a reCAPTCHA) and the daily bonus
+    /// (claimed here).
+    async fn rewards(&self) -> Result<Vec<Reward>, CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let (vip, daily) = tokio::join!(self.signed(reqwest::Method::GET, VIP_REWARDS, None), self.signed(reqwest::Method::GET, DAILY_BONUS, None));
+        let mut out = rewards_of(&vip?, SystemTime::now());
+        if let Some(d) = daily.ok().and_then(|d| daily_of(&d, SystemTime::now())) {
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    async fn claim_reward(&self, id: &str, _currency: &str) -> Result<String, CasinoError> {
+        if id != "daily" {
+            return Err(CasinoError::Server("Claim this one on Goated: it asks for a captcha there".into()));
+        }
+        let data = self.signed(reqwest::Method::POST, DAILY_BONUS_CLAIM, Some(json!({}))).await?;
+        let _ = self.refresh_balances().await;
+        Ok(match data.get("amount").and_then(f64_from_json) {
+            Some(usd) => format!("Claimed {}", crate::money::fmt_usd(usd)),
+            None => "Claimed".into(),
+        })
+    }
+
     fn set_token(&self, token: Option<String>) {
         let next = token.as_deref().and_then(Creds::parse);
         {
@@ -446,12 +555,29 @@ impl Casino for Goated {
         self.seeds().await
     }
 
-    async fn list_slots(&self, _filter: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
-        Ok(vec![])
+    /// Goated hands out every game of the providers asked for in one go, so the list is fetched
+    /// once (and again every few minutes) and searched and paged here.
+    async fn list_slots(&self, f: SlotFilter) -> Result<Vec<crate::slots::SlotGame>, CasinoError> {
+        let all = self.slot_list().await?;
+        let q = f.query.as_deref().map(|q| q.trim().to_ascii_lowercase()).filter(|q| !q.is_empty());
+        Ok(all
+            .into_iter()
+            .filter(|g| f.producer.as_deref().is_none_or(|p| g.producer == p))
+            .filter(|g| q.as_deref().is_none_or(|q| g.name.to_ascii_lowercase().contains(q)))
+            .skip(f.skip)
+            .take(f.limit.max(1))
+            .collect())
     }
 
-    async fn launch_slot(&self, _catalog_id: &str, _demo: bool, _currency: &str, _fiat: &str) -> Result<String, CasinoError> {
-        Err(CasinoError::Server("Slots aren't available on Goated yet".into()))
+    async fn launch_slot(&self, catalog_id: &str, demo: bool, currency: &str, fiat: &str) -> Result<String, CasinoError> {
+        let cur = currency.trim().to_ascii_uppercase();
+        if !demo && (cur.is_empty() || cur == "POINTS") {
+            return Err(CasinoError::Server("Pick a coin in the wallet to play for real (points can't pay for slots)".into()));
+        }
+        let fiat = if fiat.is_empty() { "USD".to_string() } else { fiat.to_ascii_uppercase() };
+        let body = json!({ "currency": if cur.is_empty() || cur == "POINTS" { "USDT".to_string() } else { cur }, "platform": "GPL_DESKTOP", "fiat": fiat, "game_id": catalog_id, "demo_mode": demo, "locale": "en" });
+        let data = self.signed(reqwest::Method::POST, LAUNCH, Some(body)).await?;
+        data.get("url").and_then(Value::as_str).map(str::to_string).ok_or_else(|| CasinoError::BadReply(data.to_string().chars().take(200).collect()))
     }
 
     async fn original_bet(&self, game: Game, currency: &str, amount: Units, params: Value, auto: bool) -> Result<Round, CasinoError> {
@@ -620,6 +746,106 @@ fn parse_reply(status: u16, body: &str) -> Result<Value, CallError> {
 }
 
 /// `refresh_token=<value>; Path=…` -> the value.
+/// `/main/games`' `SLOTS` category -> the slots, as Goated lists them (its most popular first).
+fn slots_of(data: &Value) -> Vec<crate::slots::SlotGame> {
+    let groups = data.as_array().map(Vec::as_slice).unwrap_or_default();
+    let slots = groups.iter().find(|g| g.get("category").and_then(Value::as_str) == Some("SLOTS"));
+    slots
+        .and_then(|g| g.get("games"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|g| {
+            let code = g.get("pr").and_then(Value::as_str)?;
+            let producer = PROVIDERS.iter().find(|(c, _)| *c == code).map_or(code, |(_, ours)| *ours);
+            let known = crate::slots::Provider::display_producer(producer) != producer;
+            Some(crate::slots::SlotGame {
+                id: g.get("id")?.as_str()?.to_string(),
+                name: g.get("ti").or(g.get("name")).and_then(Value::as_str)?.trim().to_string(),
+                producer: producer.to_string(),
+                // `p` is the tile's path, already escaped
+                image: g.get("p").and_then(Value::as_str).map(|p| format!("https://firebasestorage.googleapis.com/v0/b/g3casino.appspot.com/o/hub88gametiles{p}?alt=media")).unwrap_or_default(),
+                demo: true,
+                rtp: g.get("rtp").and_then(f64_from_json).unwrap_or(0.0),
+                provider_game_id: None,
+                studio: if known { None } else { g.get("pn").and_then(Value::as_str).map(str::to_string) },
+            })
+        })
+        .collect()
+}
+
+/// `/user/vip-rewards`' `claimable` list -> the reward cards, all claimed on Goated's VIP page.
+/// Rakeback is always shown, empty or not.
+fn rewards_of(data: &Value, now: SystemTime) -> Vec<Reward> {
+    let mut out = Vec::new();
+    for r in data.get("claimable").and_then(Value::as_array).into_iter().flatten() {
+        if r["claimed"].as_bool() == Some(true) {
+            continue;
+        }
+        let expires = r.get("expires_at").and_then(f64_from_json).filter(|e| *e > 0.0).map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms as u64));
+        if expires.is_some_and(|e| e <= now) {
+            continue;
+        }
+        let ty = r.get("reward_type").and_then(Value::as_str).unwrap_or("");
+        let kind = match ty {
+            "RAKEBACK_SELF" => RewardKind::Rakeback,
+            "DAILY_BONUS" => RewardKind::Daily,
+            "WEEKLY_BONUS" => RewardKind::Weekly,
+            "MONTHLY_BONUS" => RewardKind::Monthly,
+            t if t.contains("LEVEL_UP") || t.starts_with("TIER_UP") => RewardKind::LevelUp,
+            t if t.contains("RELOAD") => RewardKind::Reload,
+            _ => RewardKind::Bonus,
+        };
+        let coins: Vec<(String, f64)> = r
+            .get("amount")
+            .and_then(Value::as_object)
+            .map(|o| o.iter().filter_map(|(c, a)| Some((c.clone(), f64_from_json(a)?))).filter(|(_, a)| *a > 0.0).collect())
+            .unwrap_or_default();
+        out.push(Reward {
+            title: r.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| kind.name().to_string()),
+            link: Some(VIP_PAGE.into()),
+            usd: r.get("amount_usd").and_then(f64_from_json),
+            detail: if coins.is_empty() { "Claimed on Goated, which asks for a captcha".into() } else { coins_text(&coins) },
+            claimable: true,
+            expires,
+            ..Reward::new(r.get("id").and_then(Value::as_str).unwrap_or(ty), kind)
+        });
+    }
+    if !out.iter().any(|r| r.kind == RewardKind::Rakeback) {
+        out.insert(0, Reward { usd: Some(0.0), detail: "Nothing waiting yet".into(), link: Some(VIP_PAGE.into()), ..Reward::new("RAKEBACK_SELF", RewardKind::Rakeback) });
+    }
+    out
+}
+
+/// `/user/daily-bonus` -> the daily bonus card, when Goated runs one for the account.
+fn daily_of(d: &Value, now: SystemTime) -> Option<Reward> {
+    if d["enabled"].as_bool() != Some(true) {
+        return None;
+    }
+    let ready = d["eligible"].as_bool() == Some(true) && d["claimed_today"].as_bool() != Some(true);
+    let next = d.get("next_claim_at").and_then(f64_from_json).filter(|ms| *ms > 0.0).map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms as u64)).filter(|t| *t > now);
+    let streak = d.get("streak_day").and_then(Value::as_u64).unwrap_or(0);
+    let detail = match d.get("ineligible_reason").and_then(Value::as_str) {
+        Some(why) if !ready && d["eligible"].as_bool() != Some(true) => why.to_string(),
+        _ if streak > 0 => format!("Day {streak} of the streak"),
+        _ => "Comes back every day".into(),
+    };
+    Some(Reward { detail, claimable: ready, next_at: if ready { None } else { next }, ..Reward::new("daily", RewardKind::Daily) })
+}
+
+/// `/user/`'s `vip_progress {xp, current_rank, next_rank, current_rank_xp, next_rank_xp}`, with
+/// `stats.total_wagered` for the XP per dollar.
+fn vip_status(user: &Value) -> Option<VipStatus> {
+    let v = user.get("vip_progress").filter(|v| v.is_object())?;
+    let xp = v.get("xp").and_then(f64_from_json)?;
+    let rank = v.get("current_rank").and_then(Value::as_str).unwrap_or("Unranked").to_string();
+    let start = v.get("current_rank_xp").and_then(f64_from_json).unwrap_or(0.0);
+    let next = v.get("next_rank").and_then(Value::as_str).filter(|n| !n.is_empty()).and_then(|n| Some((n.to_string(), v.get("next_rank_xp").and_then(f64_from_json)?)));
+    let wagered = user.pointer("/stats/total_wagered").and_then(f64_from_json).unwrap_or(0.0);
+    Some(VipStatus::ranked(rank, xp, start, next, Some(xp_rate(xp, wagered))))
+}
+
 fn refresh_cookie(set_cookie: &str) -> Option<String> {
     let (name, value) = set_cookie.split(';').next()?.split_once('=')?;
     (name.trim() == REFRESH_COOKIE && !value.trim().is_empty()).then(|| value.trim().to_string())
@@ -684,6 +910,50 @@ impl Drop for InFlight<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_list() {
+        let data = json!([{"category": "ORIGINALS", "games": []}, {"category": "SLOTS", "games": [
+            {"id": "hsg_levampire", "ti": "Le Vampire", "pr": "hsg", "pn": "Hacksaw Gaming", "p": "%2Fhacksaw-gaming%2Fhsg_levampire.png", "c": "bd8d35", "xx": "US"},
+            {"id": "bmg_x", "ti": "X", "pr": "bmg", "pn": "Booming Games", "p": "%2Fbooming%2Fx.png"}]}]);
+        let list = slots_of(&data);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].id.as_str(), list[0].name.as_str(), list[0].producer.as_str()), ("hsg_levampire", "Le Vampire", "hacksawgaming"));
+        assert_eq!(list[0].image, "https://firebasestorage.googleapis.com/v0/b/g3casino.appspot.com/o/hub88gametiles%2Fhacksaw-gaming%2Fhsg_levampire.png?alt=media");
+        assert!(list[0].studio.is_none());
+        // a provider without a driver keeps its own name to show
+        assert_eq!(list[1].studio.as_deref(), Some("Booming Games"));
+    }
+
+    #[test]
+    fn rewards_lists() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_148_400);
+        // the account's claimable list that day: some rakeback
+        let data = json!({"claimable": [{"id": "RAKEBACK_SELF", "reward_type": "RAKEBACK_SELF", "name": "Rakeback", "amount": {"USDC": 0.0000172, "USDT": 0.0000084}, "amount_usd": 0.0000256, "created_at": 1792147464856u64, "expires_at": -1, "claimed": false}]});
+        let list = rewards_of(&data, now);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].claimable && list[0].link.as_deref() == Some(VIP_PAGE) && list[0].usd == Some(0.0000256) && list[0].expires.is_none());
+        assert_eq!(list[0].detail, "0.0000172 USDC + 0.0000084 USDT");
+        // nothing waiting: an empty rakeback card
+        let list = rewards_of(&json!({"claimable": []}), now);
+        assert!(list.len() == 1 && !list[0].claimable && list[0].kind == RewardKind::Rakeback);
+        // the daily bonus is off for this account
+        assert!(daily_of(&json!({"enabled": false, "eligible": false}), now).is_none());
+        let d = daily_of(&json!({"enabled": true, "eligible": true, "claimed_today": false, "streak_day": 3, "next_claim_at": 0}), now).unwrap();
+        assert!(d.claimable && d.link.is_none() && d.detail == "Day 3 of the streak");
+    }
+
+    #[test]
+    fn vip_from_profile() {
+        let user = json!({"vip_progress": {"xp": 1872, "level": 1, "current_rank": "Bronze 1", "next_rank": "Bronze 2", "current_rank_xp": 1000, "next_rank_xp": 2000},
+            "stats": {"total_wagered": 1872.764068956265}});
+        let v = vip_status(&user).unwrap();
+        assert_eq!(v.rank, "Bronze 1");
+        assert_eq!(v.next_rank, Some(("Bronze 2".to_string(), 2000.0)));
+        assert!((v.rank_progress() - 0.872).abs() < 1e-9);
+        assert!((v.xp_per_usd.unwrap() - 1872.0 / 1872.764068956265).abs() < 1e-9);
+        assert!(vip_status(&json!({"stats": {}})).is_none());
+    }
 
     #[test]
     fn replies() {
