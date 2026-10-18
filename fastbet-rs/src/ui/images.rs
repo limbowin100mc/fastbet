@@ -98,7 +98,7 @@ fn cache_name(url: &str) -> String {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.cache_dir().join("images"))
+    crate::paths::cache_dir().map(|d| d.join("images"))
 }
 
 /// The image's file, from the disk cache or downloaded (and then cached). Blocks: call it off

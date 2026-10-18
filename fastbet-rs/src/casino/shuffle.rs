@@ -81,6 +81,8 @@ const REWARDS: &str = "query FastbetRewards { vipRewardsAggregate { dailyRakebac
     weeklyBonus { usdValue nextClaimDate eligible } monthlyBonus { usdValue nextClaimDate eligible } instantRakebackBonus { currency amount } \
     vipUpgradeBonuses { upgradeBonusUsdAmount vipLevel createdAt id } challengeRewards { claimedAt expiredAt challenge { id amount currency game { name } } } } }";
 const CLAIM_RAKEBACK: &str = "mutation FastbetClaimRakeback { instantRakebackClaim { currency amount } }";
+/// The site's own vault deposit (`VaultDeposit`), amount as a decimal string.
+const VAULT_DEPOSIT: &str = "mutation FastbetVaultDeposit($data: VaultDepositInput!) { vaultDeposit(data: $data) { id currency amount afterVaultBalance } }";
 const CLAIM_DAILY_RAKEBACK: &str = "mutation FastbetClaimDailyRakeback { vipRewardsClaimDailyRakeback { nextClaimDate eligible currencyAmounts { amount currency } } }";
 const CLAIM_WEEKLY: &str = "mutation FastbetClaimWeekly($currency: Currency!) { vipRewardsClaimWeeklyBonus(currency: $currency) { claimedAmount { currency amount } nextClaimDate } }";
 const CLAIM_MONTHLY: &str = "mutation FastbetClaimMonthly($currency: Currency!) { vipRewardsClaimMonthlyBonus(currency: $currency) { claimedAmount { currency amount } nextClaimDate } }";
@@ -751,6 +753,19 @@ impl Casino for Shuffle {
     async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
         let data = self.gql(CHALLENGES, json!({}), self.ready.load(Ordering::SeqCst)).await?;
         Ok(challenges_of(&data, &|c: &str| self.usd_price(c)))
+    }
+
+    async fn vault_deposit(&self, currency: &str, amount: Units) -> Result<(), CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let vars = json!({ "data": { "currency": currency.to_ascii_uppercase(), "amount": format_units(amount, DECIMALS, DECIMALS) } });
+        let data = self.gql(VAULT_DEPOSIT, vars, true).await?;
+        if data.pointer("/vaultDeposit/id").is_none() {
+            return Err(CasinoError::BadReply(data.to_string().chars().take(200).collect()));
+        }
+        self.refresh_me().await;
+        Ok(())
     }
 
     fn set_token(&self, token: Option<String>) {

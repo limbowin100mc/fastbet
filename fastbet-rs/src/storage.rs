@@ -46,21 +46,18 @@ impl Report {
     }
 }
 
-fn project() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("gg", "fastbet", "FastBet")
-}
 
 /// The folder with settings.json (and the backups next to it).
 pub fn settings_dir() -> Option<PathBuf> {
-    project().map(|d| d.config_dir().to_path_buf())
+    crate::paths::config_dir()
 }
 
 fn pictures_dir() -> Option<PathBuf> {
-    project().map(|d| d.cache_dir().join("images"))
+    crate::paths::cache_dir().map(|d| d.join("images"))
 }
 
 fn browser_dir() -> Option<PathBuf> {
-    project().map(|d| d.data_local_dir().join("webview"))
+    crate::paths::data_local_dir().map(|d| d.join("webview"))
 }
 
 /// Where the updater saves installers (an AppImage updates next to itself instead: not ours to clear).

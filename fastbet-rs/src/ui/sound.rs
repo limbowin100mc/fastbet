@@ -18,6 +18,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// What the file picker offers. Videos (mp4, m4v, mov) play their AAC or ALAC sound.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub const EXTENSIONS: &[&str] = &["mp3", "mp4", "m4a", "m4v", "mov", "aac", "wav", "ogg", "flac"];
 
 const NO_SOUND: &str = "it has no sound FastBet can read";

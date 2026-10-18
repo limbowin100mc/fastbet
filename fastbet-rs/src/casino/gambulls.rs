@@ -592,6 +592,7 @@ impl Casino for Gambulls {
 /// `fastbet --gambulls-test [bets]`: connects the way the app does and prints the account, the
 /// balance and the seeds. With `FASTBET_GAMBULLS_DEMO=1` it also plays `bets` Limbo rounds of
 /// 0.01 demo dollars at 2×; with a login (`FASTBET_GAMBULLS_TOKEN`, the session cookie) it never bets.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub async fn self_test(bets: usize) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let token = std::env::var("FASTBET_GAMBULLS_TOKEN").ok().filter(|t| !t.is_empty());

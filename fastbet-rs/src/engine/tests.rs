@@ -25,6 +25,8 @@ struct Mock {
     /// Peak number of bets the mock saw in flight at once.
     inflight: AtomicU32,
     peak_inflight: AtomicU32,
+    /// Vault deposits made.
+    vaulted: Mutex<Vec<(String, Units)>>,
 }
 
 impl Mock {
@@ -42,6 +44,7 @@ impl Mock {
             step_ms: AtomicU32::new(0),
             inflight: AtomicU32::new(0),
             peak_inflight: AtomicU32::new(0),
+            vaulted: Mutex::new(vec![]),
         })
     }
 }
@@ -130,6 +133,10 @@ impl Casino for Mock {
             state: params,
         })
     }
+    async fn vault_deposit(&self, currency: &str, amount: Units) -> Result<(), CasinoError> {
+        self.vaulted.lock().push((currency.into(), amount));
+        Ok(())
+    }
     async fn original_step(&self, game: Game, step: Step, _params: serde_json::Value) -> Result<Round, CasinoError> {
         let done = step == Step::Cashout;
         Ok(Round { game, id: "r1".into(), active: !done, currency: "btc".into(), amount: 1000, amount_mult: 1.0, payout: if done { 3000 } else { 0 }, multiplier: if done { 3.0 } else { 0.0 }, state: serde_json::Value::Null })
@@ -157,7 +164,19 @@ fn cfg(base: Units, target: f64) -> AutoConfig {
         stop_loss: None,
         max_bet: None,
         hit_line: None,
+        rules: vec![],
+        target_range: (1.01, 1_000_000.0),
+        script: None,
     }
+}
+
+fn script(code: &str) -> Option<ScriptConfig> {
+    Some(ScriptConfig { code: code.into(), per_unit: 100.0, unit: "USD".into(), game: "limbo".into() })
+}
+
+/// Condition Builder rules for a run, amounts in the mock's units.
+fn rules(list: &[crate::rules::Rule]) -> Vec<crate::rules::Compiled> {
+    crate::rules::compile(list, |v| crate::money::parse_units(v, 2), true).unwrap()
 }
 
 async fn wait_stopped(e: &Engine) -> AutoState {
@@ -716,4 +735,101 @@ async fn slot_stops_before_free_spins_when_asked() {
     // off: free spins are just another spin
     let (st, spins) = run_slot(false).await;
     assert_eq!((spins, st.done, st.held, st.msg.as_str()), (6, 6, false, "Done"));
+}
+
+#[tokio::test]
+async fn conditions_change_the_bet_and_the_target() {
+    use crate::rules::{Act, Every, Of, Rule};
+    // loss, loss, win, loss at a 2× target
+    let (e, rx) = engine_with(Mock::new(&[1.0, 1.5, 9.0, 1.0]));
+    let mut c = cfg(100, 2.0);
+    c.limit = 4;
+    c.rules = rules(&[
+        Rule { every: Every::Every, n: "1".into(), of: Of::Losses, then: Act::BetUp, by: "100".into(), ..Rule::default() },
+        Rule { every: Every::Every, n: "1".into(), of: Of::Losses, then: Act::TargetAdd, by: "1".into(), ..Rule::default() },
+        Rule { every: Every::Every, n: "1".into(), of: Of::Wins, then: Act::BetReset, by: String::new(), ..Rule::default() },
+        Rule { every: Every::Every, n: "1".into(), of: Of::Wins, then: Act::TargetReset, by: String::new(), ..Rule::default() },
+    ]);
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    let sent: Vec<_> = bets(&rx).iter().map(|b| (b.amount, b.target)).collect();
+    assert_eq!(sent, vec![(100, 2.0), (200, 3.0), (400, 4.0), (100, 2.0)]);
+    assert_eq!(a.fired, vec![3, 3, 1, 1]);
+    assert_eq!((a.loss_streak, a.win_streak), (1, 0));
+}
+
+#[tokio::test]
+async fn a_condition_stops_the_run_and_changes_the_seed() {
+    use crate::rules::{Act, Cmp, Every, Of, Rule, When};
+    let mock = Mock::new(&[1.0, 1.0, 1.0, 50.0, 1.0]);
+    let (e, _rx) = engine_with(mock.clone());
+    let mut c = cfg(100, 2.0);
+    c.rules = rules(&[
+        Rule { every: Every::First, n: "3".into(), of: Of::Losses, then: Act::Seed, ..Rule::default() },
+        Rule { when: When::Result, cmp: Cmp::Ge, value: "20".into(), then: Act::Stop, ..Rule::default() },
+    ]);
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    assert_eq!(a.msg, "Condition 2 stopped the run");
+    assert_eq!(a.done, 4);
+    assert_eq!(mock.rotations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_script_sets_every_bet() {
+    // loss, loss, win, loss
+    let (e, rx) = engine_with(Mock::new(&[1.0, 1.5, 9.0, 1.0]));
+    let mut c = cfg(100, 2.0);
+    c.limit = 4;
+    c.script = script("function onBet(b) { betSize = b.win ? baseBet : betSize * 2; target = b.win ? 2 : target + 1; }");
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    assert_eq!(a.msg, "Done");
+    let sent: Vec<_> = bets(&rx).iter().map(|b| (b.amount, b.target)).collect();
+    assert_eq!(sent, vec![(100, 2.0), (200, 3.0), (400, 4.0), (100, 2.0)]);
+}
+
+#[tokio::test]
+async fn a_script_stops_the_run_and_its_errors_end_it() {
+    let (e, rx) = engine_with(Mock::new(&[1.0, 1.0, 1.0]));
+    let mut c = cfg(100, 2.0);
+    c.script = script("log('start'); function onBet(b) { if (losses >= 2) stop('two down'); }");
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    assert_eq!(a.msg, "Script: two down");
+    assert_eq!(a.done, 2);
+    let logged: Vec<String> = rx.try_iter().filter_map(|ev| match ev {
+        Event::Script(lines) => Some(lines.into_iter().map(|l| l.text)),
+        _ => None,
+    }).flatten().collect();
+    assert_eq!(logged, vec!["start".to_string()]);
+
+    let (e, _rx) = engine_with(Mock::new(&[1.0, 1.0, 1.0]));
+    let mut c = cfg(100, 2.0);
+    c.script = script("function onBet(b) { missing(); }");
+    e.force_restart.store(true, Ordering::SeqCst);
+    e.start_auto(c);
+    let a = wait_stopped(&e).await;
+    assert!(a.msg.starts_with("Script error"), "{}", a.msg);
+    assert_eq!(a.done, 1, "a script error stops the run even with force restart");
+}
+
+#[tokio::test]
+async fn auto_vault_puts_away_a_share_of_each_profit_step() {
+    // win +100, loss -100, win, win (+200 since: deposit 100), win, win (+200: deposit 100)
+    let mock = Mock::new(&[3.0, 1.0, 3.0, 3.0, 3.0, 3.0]);
+    let (e, _rx) = engine_with(mock.clone());
+    e.vault.lock().0 = Some(VaultPolicy { currency: "btc".into(), step: 200, pct: 50.0 });
+    let mut c = cfg(100, 2.0);
+    c.limit = 6;
+    e.start_auto(c);
+    wait_stopped(&e).await;
+    for _ in 0..100 {
+        if mock.vaulted.lock().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(*mock.vaulted.lock(), vec![("btc".to_string(), 100), ("btc".to_string(), 100)]);
+    assert_eq!(e.vault.lock().1, 0);
 }

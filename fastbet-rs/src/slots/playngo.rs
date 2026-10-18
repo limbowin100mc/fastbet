@@ -388,7 +388,7 @@ async fn grid_units(http: &reqwest::Client, l: &Launch, game: &Game) -> Result<i
 }
 
 fn units_file() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("gg", "fastbet", "FastBet").map(|d| d.cache_dir().join("playngo-units.json"))
+    crate::paths::cache_dir().map(|d| d.join("playngo-units.json"))
 }
 
 fn saved_units() -> &'static Mutex<HashMap<String, i64>> {

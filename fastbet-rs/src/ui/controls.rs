@@ -1,15 +1,59 @@
 //! The settings column every game page shares: the bet card, then the auto-run cards that fold
 //! away (strategy, bets and speed, stops, force restart), seeds and sound. Limbo's own panel too.
 
-use egui::{vec2, Align, Frame, Layout, Margin, RichText, Ui};
+use egui::{pos2, vec2, Align, Frame, Layout, Margin, Rect, RichText, Ui};
 
 use super::theme::{self, MUTED, TEXT2};
 use super::widgets::{self, caption, caption_help, card, check_field_help, chip_button_sized, field, fold, readout, segmented, text_box, toggle_help, Btn, FIELD_H};
 use super::App;
 use crate::money::{self, fmt_multi, mul_f};
-use crate::settings::{Adjust, Mode, Unit};
+use crate::settings::{Adjust, Mode, Strategy, Unit};
 
 const QUICK_TARGETS: &[&str] = &["1.5", "2", "3", "5", "10", "50", "100"];
+
+/// The page's tabs: a manual bet, an auto run with the simple strategy, with conditions, or
+/// with a script.
+const MODE_TABS: [(&str, &str); 4] = [("cursor", "Manual Bet"), ("loop", "Automatic"), ("branch", "Conditions"), ("code", "Code")];
+
+/// Manual Bet / Automatic / Conditions, which set the mode and the auto run's strategy. Centred
+/// over the stage (`cx`) in the header, between what it shows on the left (up to `left`) and on the
+/// right (from `right`); short of room they shrink to their icons.
+pub(super) fn mode_tabs(app: &mut App, ui: &mut Ui, cx: f32, left: f32, right: f32, enabled: bool) {
+    let hr = ui.max_rect();
+    let compact = widgets::icon_tabs_width(ui, &MODE_TABS, false) > right - left - 24.0;
+    let w = widgets::icon_tabs_width(ui, &MODE_TABS, compact);
+    let x = (cx - w / 2.0).min(right - 12.0 - w).max(left + 12.0);
+    let rect = Rect::from_min_size(pos2(x, hr.center().y - 18.0), vec2(w, 36.0));
+    // a child ui does not move the parent's cursor
+    let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
+    let sel = match (app.settings.mode, app.settings.strategy) {
+        (Mode::Manual, _) => 0,
+        (Mode::Auto, Strategy::Conditions) => 2,
+        (Mode::Auto, Strategy::Code) => 3,
+        (Mode::Auto, _) => 1,
+    };
+    if let Some(i) = widgets::icon_tabs(&mut tui, &MODE_TABS, sel, enabled, compact) {
+        app.settings.mode = if i == 0 { Mode::Manual } else { Mode::Auto };
+        if i > 0 {
+            app.settings.strategy = match i {
+                2 => Strategy::Conditions,
+                3 => Strategy::Code,
+                _ => Strategy::Simple,
+            };
+        }
+        app.mark_dirty();
+    }
+}
+
+/// The auto run's strategy card: the Condition Builder, or increase on win / loss.
+pub(super) fn auto_strategy(app: &mut App, ui: &mut Ui, w: f32, limbo: bool) {
+    match app.settings.strategy {
+        Strategy::Conditions => super::conditions::card(app, ui, w, limbo),
+        // the script is on the right, in place of the stage
+        Strategy::Code => {}
+        Strategy::Simple => strategy(app, ui, w),
+    }
+}
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     let panel_w = ui.available_width();
@@ -21,11 +65,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ui.set_max_width(w);
             general(app, ui, w);
             if app.settings.mode == Mode::Auto {
-                strategy(app, ui, w);
+                auto_strategy(app, ui, w, true);
                 bets_and_speed(app, ui, w);
                 stops(app, ui, w);
                 force_restart(app, ui, w);
             }
+            vault(app, ui, w);
             seed(app, ui, w);
             notifications(app, ui, w);
         });
@@ -46,7 +91,7 @@ fn general(app: &mut App, ui: &mut Ui, w: f32) {
 pub(super) fn bet_card(app: &mut App, ui: &mut Ui, w: f32) {
     let cur = app.active_currency();
     let other = app.to_base(&app.settings.amount, &cur).map(|b| app.sec(b, &cur, false)).unwrap_or_default();
-    let right = (!other.is_empty()).then(|| widgets::semi(format!("≈ {other}"), 11.5, MUTED));
+    let right = (!other.is_empty() && !cur.eq_ignore_ascii_case(&app.fiat())).then(|| widgets::semi(format!("≈ {other}"), 11.5, MUTED));
     card(ui, w, "Bet", None, right, |ui| bet_size(app, ui));
 }
 
@@ -75,7 +120,11 @@ fn bet_size(app: &mut App, ui: &mut Ui) {
                 app.adjust_amount(true);
             }
         });
-        // unit
+        // unit; none to pick where the wallet already holds the fiat (Metaspins' dollars), or for a
+        // coin without a price (Stake.us Gold Coins)
+        if cur_up == fiat_up || app.info(&cur).is_some_and(|i| i.price <= 0.0) {
+            return;
+        }
         widgets::row(ui, 32.0, |ui| {
             caption(ui, "Unit");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -131,7 +180,7 @@ fn target(app: &mut App, ui: &mut Ui, locked: bool) {
     }
 }
 
-pub(super) fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
+fn strategy(app: &mut App, ui: &mut Ui, w: f32) {
     let locked = app.auto.running;
     let active = app.settings.on_win != Adjust::Reset || app.settings.on_loss != Adjust::Reset;
     let pct = |adj: Adjust, v: &str| (adj == Adjust::Increase).then(|| format!("{}%", v.trim()));
@@ -320,6 +369,78 @@ pub(super) fn force_restart(app: &mut App, ui: &mut Ui, w: f32) {
     if open != app.settings.open.restart {
         app.settings.open.restart = open;
         app.mark_dirty();
+    }
+}
+
+/// Auto vault (casinos with a vault): profit goes to the vault as it builds up, from manual and
+/// auto bets alike.
+pub(super) fn vault(app: &mut App, ui: &mut Ui, w: f32) {
+    if !app.casino().has_vault() {
+        return;
+    }
+    let unit = if app.fiat_mode() { app.fiat().to_uppercase() } else { app.active_currency().to_uppercase() };
+    let on = app.settings.vault_on;
+    let summary = if on { format!("{}% of every {} {unit}", app.settings.vault_pct.trim(), app.settings.vault_every.trim()) } else { "Off".into() };
+    let mut open = app.settings.open.vault;
+    fold(ui, w, "Auto vault", &summary, on, &mut open, |ui| {
+        let mut en = on;
+        let help = "Every time the profit in the coin you bet with grows by this much (since the last deposit), that share \
+                    of it goes to the casino's vault, out of reach of the next bets. Manual and auto bets both count, losses \
+                    count against it.";
+        if toggle_help(ui, "Put profit in the vault", Some(help), &mut en, true) {
+            app.settings.vault_on = en;
+            app.mark_dirty();
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let fw = (ui.available_width() - 8.0) / 2.0;
+            ui.scope(|ui| {
+                ui.set_min_width(fw);
+                ui.set_max_width(fw);
+                if field(ui, "Every profit of", &mut app.settings.vault_every, "10", Some(&unit), true).changed() {
+                    app.mark_dirty();
+                }
+            });
+            ui.scope(|ui| {
+                ui.set_min_width(fw);
+                ui.set_max_width(fw);
+                if field(ui, "Vault", &mut app.settings.vault_pct, "50", Some("%"), true).changed() {
+                    app.mark_dirty();
+                }
+            });
+        });
+        let cur = app.active_currency();
+        match app.vault_policy() {
+            Some(p) => progress(ui, app, &cur, &p),
+            None if on && app.ready() => super::originals::readout_bad(ui, "Enter a profit step and a share above 0"),
+            None => {}
+        }
+        if app.vault.deposits > 0 {
+            let total: Vec<String> = app.vault.total.iter().map(|(c, v)| app.prim(*v, c, false)).collect();
+            readout(ui, format!("Vaulted {}  ·  {} deposit{}", total.join(" + "), app.vault.deposits, if app.vault.deposits == 1 { "" } else { "s" }), TEXT2, theme::G1);
+        }
+    });
+    if open != app.settings.open.vault {
+        app.settings.open.vault = open;
+        app.mark_dirty();
+    }
+}
+
+/// How far the profit is toward the next deposit: a slim bar and the numbers.
+fn progress(ui: &mut Ui, app: &App, cur: &str, p: &crate::engine::VaultPolicy) {
+    let since = app.vault.since.max(0);
+    let t = (since as f64 / p.step as f64).clamp(0.0, 1.0) as f32;
+    let w = ui.available_width();
+    let (r, _) = ui.allocate_exact_size(vec2(w, 34.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.text(r.left_top() + vec2(0.0, 7.0), egui::Align2::LEFT_CENTER, "Next deposit", theme::font_semi(11.0), MUTED);
+    let nums = format!("{} / {}", app.prim(since, cur, false), app.prim(p.step, cur, false));
+    painter.text(r.right_top() + vec2(0.0, 7.0), egui::Align2::RIGHT_CENTER, nums, theme::font_semi(11.0), TEXT2);
+    let bar = Rect::from_min_size(pos2(r.left(), r.bottom() - 8.0), vec2(w, 6.0));
+    painter.rect_filled(bar, egui::CornerRadius::same(3), theme::BG3);
+    if t > 0.0 {
+        let fill = Rect::from_min_size(bar.min, vec2((w * t).max(6.0), 6.0));
+        painter.rect_filled(fill, egui::CornerRadius::same(3), theme::G1);
     }
 }
 

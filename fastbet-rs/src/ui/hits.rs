@@ -51,7 +51,7 @@ pub struct Hit {
 }
 
 impl Hit {
-    fn card(&self) -> hitcard::Card {
+    pub(crate) fn card(&self) -> hitcard::Card {
         hitcard::Card {
             game: self.game.clone(),
             byline: self.byline.clone(),
@@ -97,7 +97,7 @@ pub fn record_bet(app: &mut App, n: u64, rec: &BetRecord) {
 }
 
 /// The card's facts about bet `n`.
-fn bet_hit(app: &App, n: u64, rec: &BetRecord) -> Hit {
+pub(crate) fn bet_hit(app: &App, n: u64, rec: &BetRecord) -> Hit {
     let casino = app.casino();
     let (game, slug) = match rec.game {
         Some(g) => (casino.original_name(g).to_string(), g.slug()),
@@ -126,7 +126,7 @@ pub fn record_spin(app: &mut App, n: u64, rec: &SpinRecord) {
 }
 
 /// The card's facts about spin `n` of the open game.
-fn spin_hit(app: &App, n: u64, rec: &SpinRecord) -> Option<Hit> {
+pub(crate) fn spin_hit(app: &App, n: u64, rec: &SpinRecord) -> Option<Hit> {
     let game = app.slot.game.as_ref()?;
     Some(Hit {
         key: HitKey::Spin(n),
@@ -317,6 +317,13 @@ pub fn open(app: &mut App, hit: Hit) {
     app.card = Some(CardView { hit, rx: Some(rx), tex: None, image: None, png: None, error: None, note: None, saved: None });
 }
 
+/// The card as a PNG, with the game's artwork fetched (or taken from the disk cache). Blocks:
+/// alerts call it on their own thread.
+pub(crate) fn card_png(card: &hitcard::Card, art: &str) -> Result<Vec<u8>, String> {
+    let bytes = if art.is_empty() { None } else { images::bytes(&big(art)).or_else(|| images::bytes(art)) };
+    hitcard::png(&hitcard::render(card, bytes.as_deref())?)
+}
+
 /// The artwork at twice the size where the CDN resizes on request (imgix: Stake, Shuffle).
 fn big(url: &str) -> String {
     let Some((base, query)) = url.split_once('?').filter(|_| url.contains(".imgix.net/")) else { return url.to_string() };
@@ -411,8 +418,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 /// Saves the card into Downloads (or the home folder) and returns its path.
 fn save(view: &CardView) -> Result<PathBuf, String> {
     let png = view.png.as_ref().ok_or("The card isn't ready yet")?;
-    let dirs = directories::UserDirs::new().ok_or("No home folder")?;
-    let dir = dirs.download_dir().unwrap_or(dirs.home_dir()).to_path_buf();
+    let dir = crate::paths::downloads_dir().ok_or("No home folder")?;
+    let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(file_name(&view.hit));
     std::fs::write(&path, png).map_err(|e| format!("Couldn't save the card: {e}"))?;
     Ok(path)

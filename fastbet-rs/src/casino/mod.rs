@@ -6,9 +6,11 @@ pub mod chipsgg;
 pub mod creds;
 pub mod gambulls;
 pub mod goated;
+pub mod housebets;
 pub mod metaspins;
 pub mod shuffle;
 pub mod stake;
+pub mod thrill;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,23 +29,30 @@ use crate::originals::{Game, Round, Step, Tables};
 pub enum CasinoId {
     ChipsGg,
     Stake,
+    /// Stake's US sweepstakes site: the same API on stake.us, played with Gold Coins and Sweeps Coins.
+    StakeUs,
     Shuffle,
     Goated,
     Gambulls,
     Metaspins,
+    Thrill,
+    Housebets,
 }
 
 impl CasinoId {
-    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake, CasinoId::Shuffle, CasinoId::Goated, CasinoId::Gambulls, CasinoId::Metaspins];
+    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake, CasinoId::StakeUs, CasinoId::Shuffle, CasinoId::Goated, CasinoId::Gambulls, CasinoId::Metaspins, CasinoId::Thrill, CasinoId::Housebets];
 
     pub fn key(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "chipsgg",
             CasinoId::Stake => "stake",
+            CasinoId::StakeUs => "stakeus",
             CasinoId::Shuffle => "shuffle",
             CasinoId::Goated => "goated",
             CasinoId::Gambulls => "gambulls",
             CasinoId::Metaspins => "metaspins",
+            CasinoId::Thrill => "thrill",
+            CasinoId::Housebets => "housebets",
         }
     }
 
@@ -51,13 +60,17 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "Chips.gg",
             CasinoId::Stake => "Stake.com",
+            CasinoId::StakeUs => "Stake.us",
             CasinoId::Shuffle => "Shuffle.com",
             CasinoId::Goated => "Goated.com",
             CasinoId::Gambulls => "Gambulls.com",
             CasinoId::Metaspins => "Metaspins.com",
+            CasinoId::Thrill => "Thrill.com",
+            CasinoId::Housebets => "Housebets.com",
         }
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|id| id.key() == key)
     }
@@ -65,7 +78,7 @@ impl CasinoId {
     /// Domains the casino can be reached on; empty when there is only one.
     pub fn mirrors(self) -> &'static [&'static str] {
         match self {
-            CasinoId::ChipsGg | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => &[],
+            CasinoId::ChipsGg | CasinoId::StakeUs | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => &[],
             CasinoId::Stake => stake::MIRRORS,
             CasinoId::Shuffle => shuffle::MIRRORS,
         }
@@ -77,29 +90,29 @@ impl CasinoId {
 
     /// Sits behind Cloudflare checks, so the user can hand over a clearance cookie from their browser.
     pub fn behind_cloudflare(self) -> bool {
-        matches!(self, CasinoId::Stake)
+        matches!(self, CasinoId::Stake | CasinoId::StakeUs)
     }
 
     /// An auto bet on `game` settles its round in one request (the tiles go up front), so an auto
     /// run can have several in flight, like Limbo's: Mines on Stake (`mines/bet` with the tiles)
     /// and Shuffle (`minesAuto`).
     pub fn auto_settles(self, game: Game) -> bool {
-        matches!(self, CasinoId::Stake | CasinoId::Shuffle) && game == Game::Mines
+        matches!(self, CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Thrill | CasinoId::Housebets) && game == Game::Mines
     }
 
     /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated, chips.gg).
     pub fn zero_bets(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Thrill | CasinoId::Housebets)
     }
 
     /// Whether the account can also be linked through the embedded login window.
     pub fn window_login(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets)
     }
 
     /// Linked through the login window: the casino has no API keys to paste (Shuffle, Goated, Gambulls, Metaspins).
     pub fn window_only(self) -> bool {
-        matches!(self, CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins)
+        matches!(self, CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets)
     }
 
     /// The site's tokens can also be pasted by hand: the access token and the refresh token (Goated).
@@ -109,6 +122,7 @@ impl CasinoId {
 
     /// A cookie the login window reads from its browser (it is HttpOnly, out of the page's reach)
     /// and hands over as the refresh token: (a URL it is sent to, its name).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn login_cookie(self) -> Option<(&'static str, &'static str)> {
         match self {
             CasinoId::Goated => Some(("https://apis.goated.com/user/auth/token/refresh", goated::REFRESH_COOKIE)),
@@ -118,16 +132,31 @@ impl CasinoId {
 
     /// The login is a cookie the login window reads from its browser (HttpOnly) and hands over
     /// as the token once it exists: (a URL it is sent to, its name).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn cookie_login(self) -> Option<(&'static str, &'static str)> {
         match self {
             CasinoId::Gambulls => Some(("https://gambulls.com/", gambulls::SESSION_COOKIE)),
             CasinoId::Metaspins => Some(("https://services.metaspins.com/api/session", metaspins::SESSION_COOKIE)),
+            // the HttpOnly `token` on .thrill.com; guests have none
+            CasinoId::Thrill => Some(("https://thrill.com/", thrill::TOKEN_COOKIE)),
+            _ => None,
+        }
+    }
+
+    /// The login is several cookies the window reads together, kept as one `name=value; …` token
+    /// (Housebets): (the URLs whose cookies to read, the names to keep; the first must be there).
+    /// It counts once the page reports it is logged in.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub fn login_jar(self) -> Option<(&'static [&'static str], &'static [&'static str])> {
+        match self {
+            CasinoId::Housebets => Some((housebets::LOGIN_URLS, housebets::LOGIN_COOKIES)),
             _ => None,
         }
     }
 
     /// The `cookie_login` cookie exists before the login too (Metaspins hands guests one): it only
     /// counts once the page reports it is logged in.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn cookie_needs_page_login(self) -> bool {
         matches!(self, CasinoId::Metaspins)
     }
@@ -156,7 +185,7 @@ impl CasinoId {
             ],
             // Stake Engine and the providers Stake carries (`stake::PROVIDER_GROUPS`); Relax isn't
             // available on Stake, Fantasma there is on its own server
-            CasinoId::Stake => &[
+            CasinoId::Stake | CasinoId::StakeUs => &[
                 crate::slots::STAKE_ENGINE,
                 "pragmaticplay",
                 "hacksawgaming",
@@ -216,7 +245,7 @@ impl CasinoId {
                 "play'ngo",
                 "retrogaming",
             ],
-            CasinoId::Gambulls | CasinoId::Metaspins => &[],
+            CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => &[],
         }
     }
 
@@ -228,8 +257,10 @@ impl CasinoId {
     pub fn originals(self) -> Vec<Game> {
         match self {
             CasinoId::Gambulls | CasinoId::Metaspins => vec![],
+            CasinoId::Thrill => vec![Game::Keno, Game::Mines],
+            CasinoId::Housebets => vec![Game::Dice, Game::Keno, Game::Mines],
             CasinoId::ChipsGg => vec![Game::Keno, Game::Mines, Game::Hilo],
-            CasinoId::Stake => Game::stake().collect(),
+            CasinoId::Stake | CasinoId::StakeUs => Game::stake().collect(),
             CasinoId::Goated => vec![Game::Dice, Game::Mines],
             CasinoId::Shuffle => vec![Game::Dice, Game::Mines, Game::Keno, Game::Plinko, Game::Blitz, Game::DragonTower, Game::Chicken],
         }
@@ -267,17 +298,22 @@ impl CasinoId {
 
     /// The account has a VIP level the casino reports live ([`CasinoEvent::Vip`]).
     pub fn has_vip(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated)
     }
 
     /// Rakeback and VIP bonuses the app can claim ([`Casino::rewards`]).
     pub fn has_rewards(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated)
     }
 
     /// Public slot challenges and King of the Hill rounds ([`Casino::challenges`]).
+    /// A vault to put winnings away in ([`Casino::vault_deposit`]).
+    pub fn has_vault(self) -> bool {
+        matches!(self, CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle)
+    }
+
     pub fn has_challenges(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle)
     }
 
     /// Slot artwork is landscape (chips.gg's 4:3 thumbnails), so the lobby's tiles are too.
@@ -289,8 +325,8 @@ impl CasinoId {
     pub fn key_label(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "API key",
-            CasinoId::Stake => "API token",
-            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => "login",
+            CasinoId::Stake | CasinoId::StakeUs => "API token",
+            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => "login",
         }
     }
 
@@ -299,11 +335,14 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "https://chips.gg/".into(),
             CasinoId::Stake => format!("https://{}/", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
+            CasinoId::StakeUs => format!("https://{}/", stake::US_DOMAIN),
             CasinoId::Shuffle => format!("https://{}/", mirror.unwrap_or(shuffle::DEFAULT_MIRROR)),
             CasinoId::Goated => "https://www.goated.com/".into(),
             // straight to the site's login dialog
             CasinoId::Gambulls => "https://gambulls.com/en?login=open".into(),
             CasinoId::Metaspins => "https://metaspins.com/#sign-in".into(),
+            CasinoId::Thrill => "https://thrill.com/".into(),
+            CasinoId::Housebets => "https://www.housebets.com/".into(),
         }
     }
 
@@ -312,7 +351,8 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "https://chips.gg/settings/api-keys".into(),
             CasinoId::Stake => format!("https://{}/settings/security", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
-            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => self.login_url(mirror),
+            CasinoId::StakeUs => format!("https://{}/settings/security", stake::US_DOMAIN),
+            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => self.login_url(mirror),
         }
     }
 
@@ -320,6 +360,7 @@ impl CasinoId {
     /// `{"token": "...", "loggedIn": bool}` through `window.ipc.postMessage`
     /// whenever either value changes. `loggedIn` has to mean "logged in as a
     /// user", not "has a guest token".
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn token_watch_script(self) -> &'static str {
         match self {
             // chips.gg keeps the same tokenid before and after login (it is
@@ -489,8 +530,50 @@ impl CasinoId {
   }, 1000);
 })();"#
             }
+            // Thrill's login is the HttpOnly cookie `token` the window reads itself (`cookie_login`);
+            // the page only reports now and then so the window looks for it. On a new browser
+            // profile Thrill's first visit often fails to load its scripts (its bot check) and the
+            // page shows just "500 Internal Error": it is loaded again, three times at most.
+            CasinoId::Thrill => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  function broken() {
+    var t = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+    return /^500 Internal Error$/i.test(t);
+  }
+  setInterval(function () {
+    try {
+      if (broken()) {
+        var n = Number(sessionStorage.getItem('__fastbetReloads') || 0);
+        if (n < 3) { sessionStorage.setItem('__fastbetReloads', String(n + 1)); location.reload(); return; }
+      }
+      window.ipc.postMessage(JSON.stringify({ token: '', loggedIn: false }));
+    } catch (e) {}
+  }, 1000);
+})();"#
+            }
+            // Housebets' login is its cookies, which the window reads itself (`login_jar`); the
+            // page reports whether the site takes them (`/api/v1/auth/me` answers 200).
+            CasinoId::Housebets => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  var busy = false;
+  setInterval(function () {
+    if (busy) return;
+    busy = true;
+    fetch('/api/v1/auth/me', { credentials: 'include', cache: 'no-store' })
+      .then(function (r) { return r.ok; }, function () { return false; })
+      .then(function (ok) {
+        busy = false;
+        try { window.ipc.postMessage(JSON.stringify({ token: '', loggedIn: ok, ua: navigator.userAgent })); } catch (e) {}
+      });
+  }, 2000);
+})();"#
+            }
             // Stake links with an API token only
-            CasinoId::Stake => "",
+            CasinoId::Stake | CasinoId::StakeUs => "",
         }
     }
 
@@ -499,29 +582,32 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "On chips.gg open Settings → API Keys → Create API Key, copy the key (it is shown only once) and paste it here.",
             CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
+            CasinoId::StakeUs => "On Stake.us open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
             CasinoId::Shuffle => "Shuffle has no API keys: log in to Shuffle in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Goated => "Goated has no API keys: log in to Goated in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Gambulls => "Gambulls has no API keys: log in to Gambulls in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Metaspins => "Metaspins has no API keys: log in to Metaspins in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
+            CasinoId::Housebets => "Housebets has no API keys: log in to Housebets in the window that opens with the button below (Google and X work there too). FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
+            CasinoId::Thrill => "Thrill has no API keys: log in to Thrill in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
         }
     }
 
     pub fn min_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => 1.01,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => 1.01,
         }
     }
 
     pub fn max_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => 1_000_000.0,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => 1_000_000.0,
         }
     }
 
     /// Payout multiplier at which the house edge is already deducted (99% RTP).
     pub fn win_chance(self, target: f64) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins => 99.0 / target,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets => 99.0 / target,
         }
     }
 }
@@ -892,6 +978,11 @@ pub trait Casino: Send + Sync {
     async fn challenges(&self) -> Result<Vec<Challenge>, CasinoError> {
         Ok(vec![])
     }
+    /// Moves `amount` of `currency` from the balance into the account's vault
+    /// ([`CasinoId::has_vault`]).
+    async fn vault_deposit(&self, _currency: &str, _amount: Units) -> Result<(), CasinoError> {
+        Err(CasinoError::Server("This casino has no vault".into()))
+    }
 }
 
 /// Spawns the casino's connection tasks on the current tokio runtime.
@@ -899,10 +990,13 @@ pub fn connect(id: CasinoId, setup: Setup, events: mpsc::UnboundedSender<CasinoE
     match id {
         CasinoId::ChipsGg => chipsgg::ChipsGg::spawn(setup.token, events),
         CasinoId::Stake => stake::Stake::spawn(setup, events),
+        CasinoId::StakeUs => stake::Stake::spawn_us(setup, events),
         CasinoId::Shuffle => shuffle::Shuffle::spawn(setup, events),
         CasinoId::Goated => goated::Goated::spawn(setup, events),
         CasinoId::Gambulls => gambulls::Gambulls::spawn(setup, events),
         CasinoId::Metaspins => metaspins::Metaspins::spawn(setup, events),
+        CasinoId::Thrill => thrill::Thrill::spawn(setup, events),
+        CasinoId::Housebets => housebets::Housebets::spawn(setup, events),
     }
 }
 

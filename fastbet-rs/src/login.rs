@@ -93,6 +93,8 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
         .with_url(url.map(str::to_string).unwrap_or_else(|| id.login_url(None)))
         .with_initialization_script(script)
         .with_devtools(true)
+        // "Continue with Google / X" open the provider in a popup that hands the login back
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Allow)
         .with_ipc_handler(move |req| {
             let _ = proxy.send_event(UserEvent::Token(req.body().clone()));
         });
@@ -105,7 +107,15 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::Token(t)) => {
+                // FASTBET_LOGIN_DEBUG=1: the page's own reports too, handy when adding a casino
+                if std::env::var_os("FASTBET_LOGIN_DEBUG").is_some() {
+                    eprintln!("REPORT {t}");
+                }
                 let t = match (id.login_cookie(), id.cookie_login()) {
+                    _ if id.login_jar().is_some() => match id.login_jar() {
+                        Some((urls, names)) if reports_login(&t) => jar_token(&webview, urls, names, &t),
+                        _ => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
+                    },
                     (Some((url, name)), _) => with_cookie(&webview, &t, url, name, &mut misses),
                     (None, Some(_)) if id.cookie_needs_page_login() && !reports_login(&t) => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
                     (None, Some((url, name))) => cookie_token(&webview, url, name),
@@ -160,6 +170,27 @@ fn cookie_token(webview: &wry::WebView, url: &str, name: &str) -> String {
     }
 }
 
+/// A login that is several cookies (Housebets): the ones in `names`, from the cookies sent to
+/// any of `urls`, with the page's User Agent (`ua` in its report), as one token
+/// `{"cookies": "name=value; …", "ua": …}`; logged in once the first of them is there.
+fn jar_token(webview: &wry::WebView, urls: &[&str], names: &[&str], report: &str) -> String {
+    let mut found: Vec<(String, String)> = vec![];
+    for url in urls {
+        for c in webview.cookies_for_url(url).unwrap_or_default() {
+            if names.contains(&c.name()) && !c.value().is_empty() && !found.iter().any(|(n, _)| n == c.name()) {
+                found.push((c.name().to_string(), c.value().to_string()));
+            }
+        }
+    }
+    if !found.iter().any(|(n, _)| n == names[0]) {
+        return serde_json::json!({ "token": "", "loggedIn": false }).to_string();
+    }
+    let cookies = found.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
+    let ua = serde_json::from_str::<serde_json::Value>(report).ok().and_then(|v| v["ua"].as_str().map(str::to_string));
+    let token = serde_json::json!({ "cookies": cookies, "ua": ua }).to_string();
+    serde_json::json!({ "token": token, "loggedIn": true }).to_string()
+}
+
 /// The page's report says it is logged in.
 fn reports_login(report: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(report).is_ok_and(|v| v["loggedIn"].as_bool() == Some(true))
@@ -194,6 +225,8 @@ pub fn run_capture(url: &str) -> Result<(), String> {
         .with_url(url)
         .with_initialization_script(script)
         .with_devtools(true)
+        // sign-in popups (Google, X) open as their own windows
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Allow)
         .with_ipc_handler(move |req| {
             let _ = proxy.send_event(UserEvent::Line(req.body().clone()));
         });

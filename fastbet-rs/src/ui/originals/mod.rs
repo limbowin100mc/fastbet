@@ -326,6 +326,11 @@ pub fn times(m: f64) -> String {
     }
 }
 
+/// Multiplier with two decimals, thousands grouped: "3,203,384.80×".
+pub fn times_full(m: f64) -> String {
+    format!("{}×", crate::money::group_thousands(&format!("{m:.2}")))
+}
+
 // ------------------------------------------------------------------ drawing
 
 /// How a tile looks.

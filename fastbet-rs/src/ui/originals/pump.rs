@@ -4,10 +4,10 @@
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Shape, Stroke, Ui};
 use serde_json::{json, Value};
 
-use super::super::theme::{self, alpha, mix, BG2, GOLD, MUTED, TEXT};
-use super::super::widgets::{button, caption, field, segmented, Btn};
+use super::super::theme::{self, alpha, mix, BG2, G1, GOLD, MUTED, TEXT};
+use super::super::widgets::{button, caption, segmented, select, Btn};
 use super::super::App;
-use super::{chip, times};
+use super::{chip, times, times_full};
 use crate::originals::{pump_multiplier, pump_pops, Game, Round, Step};
 use crate::settings::Mode;
 
@@ -28,16 +28,16 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
         app.mark_dirty();
     }
     if app.settings.mode == Mode::Auto {
-        let mut s = app.settings.orig.pump_pumps.to_string();
-        let max = max_pumps(&app.settings.orig.pump_difficulty);
-        if field(ui, "Pumps per bet", &mut s, "3", None, !locked).changed() {
-            if let Ok(n) = s.trim().parse::<u32>() {
-                app.settings.orig.pump_pumps = n.clamp(1, max) as u8;
-                app.mark_dirty();
-            }
+        // every pump count the level allows, with what cashing out there pays
+        caption(ui, "Pumps per bet");
+        let d = app.settings.orig.pump_difficulty.clone();
+        let max = max_pumps(&d);
+        let items: Vec<String> = (1..=max).map(|n| format!("{n}  -  {}", times_full(pump_multiplier(&d, n)))).collect();
+        let sel = (app.settings.orig.pump_pumps as u32).clamp(1, max) as usize - 1;
+        if let Some(i) = select(ui, "pump-pumps", &items, sel, !locked) {
+            app.settings.orig.pump_pumps = (i + 1) as u8;
+            app.mark_dirty();
         }
-        let n = app.settings.orig.pump_pumps as u32;
-        super::readout(ui, format!("Cashes out after {} at {}", super::count(n as u64, "pump"), times(pump_multiplier(&app.settings.orig.pump_difficulty, n))));
     }
 }
 
@@ -112,10 +112,15 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
         }
     }
 
-    // the multiplier ladder
+    // the multiplier ladder, with the auto run's cash-out pump in view and outlined
     let p = ui.painter();
     let shown_n = max.min(12);
-    let first = pumps.saturating_sub(4).min(max.saturating_sub(shown_n)) + 1;
+    let target = (app.settings.mode == Mode::Auto && difficulty == app.settings.orig.pump_difficulty).then(|| (app.settings.orig.pump_pumps as u32).clamp(1, max));
+    let mut first = pumps.saturating_sub(4);
+    if let Some(t) = target.filter(|t| *t > first + shown_n) {
+        first = t + 1 - shown_n;
+    }
+    let first = first.min(max.saturating_sub(shown_n)) + 1;
     let strip = Rect::from_min_max(pos2(rect.left() + 24.0, rect.bottom() - ladder_h), pos2(rect.right() - 24.0, rect.bottom() - 14.0));
     let w = (strip.width() - 4.0 * (shown_n as f32 - 1.0)) / shown_n as f32;
     for k in 0..shown_n {
@@ -124,7 +129,10 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
         let done = n <= pumps && !popped;
         let fill = if done { alpha(GOLD, 60) } else { BG2 };
         chip(p, cell, &times(pump_multiplier(&difficulty, n)), fill, if done { GOLD } else { TEXT });
-        p.text(pos2(cell.center().x, cell.bottom() + 10.0), Align2::CENTER_CENTER, format!("{n}"), theme::font(10.0), MUTED);
+        let aim = target == Some(n);
+        if aim {
+            p.rect_stroke(cell, CornerRadius::same(6), Stroke::new(1.2, G1), egui::StrokeKind::Inside);
+        }
+        p.text(pos2(cell.center().x, cell.bottom() + 10.0), Align2::CENTER_CENTER, format!("{n}"), theme::font(10.0), if aim { G1 } else { MUTED });
     }
-    let _ = CornerRadius::ZERO;
 }

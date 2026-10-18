@@ -14,6 +14,17 @@ pub enum Mode {
     Auto,
 }
 
+/// How an auto run changes its bets: the simple win / loss strategy, the Condition Builder's
+/// rules, or a script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Strategy {
+    #[default]
+    Simple,
+    Conditions,
+    Code,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Unit {
@@ -41,11 +52,12 @@ pub struct Sections {
     pub keys: bool,
     pub account: bool,
     pub restart: bool,
+    pub vault: bool,
 }
 
 impl Default for Sections {
     fn default() -> Self {
-        Self { general: true, strategy: false, count: false, stops: false, seed: false, keys: false, account: false, restart: false }
+        Self { general: true, strategy: false, count: false, stops: false, seed: false, keys: false, account: false, restart: false, vault: false }
     }
 }
 
@@ -101,6 +113,12 @@ pub struct Settings {
     pub clearances: BTreeMap<String, Clearance>,
 
     pub mode: Mode,
+    /// What an auto run (`Mode::Auto`) changes its bets with.
+    pub strategy: Strategy,
+    /// The Condition Builder's rules, in the order they are checked.
+    pub rules: Vec<crate::rules::Rule>,
+    /// Code Mode's script (JavaScript).
+    pub script: String,
     /// Empty = follow the currency selected on the site.
     pub currency: String,
     pub unit: Unit,
@@ -141,6 +159,19 @@ pub struct Settings {
     pub force_restart: bool,
     /// Force restart on errors: an error doesn't end an auto run, it bets on.
     pub restart_on_error: bool,
+    /// Auto vault: every `vault_every` of profit (in the panel's unit), `vault_pct` percent of it
+    /// goes to the casino's vault.
+    pub vault_on: bool,
+    pub vault_every: String,
+    pub vault_pct: String,
+    /// Settings → Alerts: a Telegram bot (token, chat id) and / or a Discord webhook, and what
+    /// they hear about.
+    pub alert_tg_token: String,
+    pub alert_tg_chat: String,
+    pub alert_discord: String,
+    pub alert_hits: bool,
+    pub alert_runs: bool,
+    pub alert_vault: bool,
 
     // slots
     pub slot_demo: bool,
@@ -360,6 +391,9 @@ impl Default for Settings {
             mirrors: Default::default(),
             clearances: Default::default(),
             mode: Mode::Manual,
+            strategy: Strategy::Simple,
+            rules: vec![],
+            script: crate::script::EXAMPLES[0].1.to_string(),
             currency: String::new(),
             unit: Unit::Coin,
             fiat: "usd".into(),
@@ -390,6 +424,15 @@ impl Default for Settings {
             async_bets: 1,
             force_restart: false,
             restart_on_error: false,
+            vault_on: false,
+            vault_every: "10".into(),
+            vault_pct: "50".into(),
+            alert_tg_token: String::new(),
+            alert_tg_chat: String::new(),
+            alert_discord: String::new(),
+            alert_hits: true,
+            alert_runs: true,
+            alert_vault: false,
             slot_demo: true,
             slot_stop_mult_on: false,
             slot_stop_mult: "100".into(),
@@ -412,13 +455,14 @@ impl Settings {
         if let Ok(p) = std::env::var("FASTBET_SETTINGS") {
             return Some(PathBuf::from(p));
         }
-        let dirs = directories::ProjectDirs::from("gg", "fastbet", "FastBet")?;
-        Some(dirs.config_dir().join("settings.json"))
+        Some(crate::paths::config_dir()?.join("settings.json"))
     }
 
     pub fn load() -> Self {
         let mut s = Self::load_file();
         s.migrate();
+        // a count the async picker no longer offers comes back as the highest one it does
+        s.async_bets = s.async_bets.clamp(1, crate::engine::MAX_CONCURRENCY);
         if let Some(c) = s.active().map(|a| a.casino) {
             s.casino = c;
         }

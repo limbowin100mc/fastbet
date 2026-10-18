@@ -660,6 +660,121 @@ pub fn segmented(ui: &mut Ui, items: &[&str], selected: usize, enabled: bool) ->
     changed
 }
 
+/// A dropdown drawn like the text fields. It opens a list under itself with a tick by the
+/// picked entry (and a search box on top when the list is long). Returns the index clicked.
+pub fn select(ui: &mut Ui, id_salt: &str, items: &[String], selected: usize, enabled: bool) -> Option<usize> {
+    select_opt(ui, id_salt, items, Some(selected), "–", enabled)
+}
+
+/// [`select`] that may have nothing picked: it then shows `placeholder`.
+pub fn select_opt(ui: &mut Ui, id_salt: &str, items: &[String], selected: Option<usize>, placeholder: &str, enabled: bool) -> Option<usize> {
+    const ROW: f32 = 30.0;
+    let id = ui.make_persistent_id(id_salt);
+    let (open_id, search_id, fresh_id) = (id.with("open"), id.with("search"), id.with("fresh"));
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, FIELD_H), if enabled { Sense::click() } else { Sense::hover() });
+    let mut open = enabled && ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    if resp.clicked() {
+        open = !open;
+        ui.data_mut(|d| {
+            d.insert_temp(search_id, String::new());
+            d.insert_temp(fresh_id, open);
+        });
+    }
+    let hovered = enabled && resp.hovered();
+    let p = ui.painter();
+    let stroke = if open { alpha(G1, 170) } else if hovered { LINE2 } else { LINE };
+    p.rect(rect, CornerRadius::same(RADIUS), if enabled { BG } else { alpha(BG, 120) }, Stroke::new(1.0, stroke), StrokeKind::Inside);
+    let (text, color) = match selected.and_then(|i| items.get(i)) {
+        Some(t) => (t.as_str(), if enabled { TEXT } else { MUTED }),
+        None => (placeholder, if enabled { TEXT2 } else { DIM }),
+    };
+    fit_text(p, pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, text, theme::font_semi(13.0), color, rect.width() - 44.0);
+    let c = pos2(rect.right() - 16.0, rect.center().y);
+    let dir = if open { -1.0 } else { 1.0 };
+    let color = if enabled { MUTED } else { DIM };
+    p.line_segment([c + vec2(-4.0, -2.0 * dir), c + vec2(0.0, 2.0 * dir)], Stroke::new(1.6, color));
+    p.line_segment([c + vec2(0.0, 2.0 * dir), c + vec2(4.0, -2.0 * dir)], Stroke::new(1.6, color));
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    if !open {
+        ui.data_mut(|d| d.insert_temp(open_id, false));
+        return None;
+    }
+
+    let mut picked = None;
+    let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+    let fresh = ui.data_mut(|d| d.remove_temp::<bool>(fresh_id)).unwrap_or(false);
+    let searchable = items.len() > 10;
+    // as wide as the field, or as its longest entry
+    let widest = items.iter().map(|t| ui.painter().layout_no_wrap(t.clone(), theme::font_semi(12.5), TEXT).size().x).fold(0.0, f32::max);
+    let w = w.max(widest + 64.0).min(360.0);
+    let area = egui::Area::new(id.with("list")).fixed_pos(pos2(rect.left(), rect.bottom() + 4.0)).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+        Frame::new()
+            .fill(BG1)
+            .stroke(Stroke::new(1.0, LINE2))
+            .corner_radius(CornerRadius::same(RADIUS))
+            .inner_margin(Margin::same(6))
+            .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(160) })
+            .show(ui, |ui| {
+                ui.set_width(w - 12.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if searchable {
+                    let sr = text_box(ui, &mut search, "Search…", None, true, false);
+                    if fresh {
+                        sr.request_focus();
+                    }
+                    if sr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let q = search.trim().to_lowercase();
+                        picked = (0..items.len()).find(|&i| items[i].to_lowercase().contains(&q));
+                    }
+                }
+                let q = search.trim().to_lowercase();
+                let shown: Vec<usize> = (0..items.len()).filter(|&i| q.is_empty() || items[i].to_lowercase().contains(&q)).collect();
+                egui::ScrollArea::vertical().max_height(ROW * 8.5).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let rw = ui.available_width();
+                    for &i in &shown {
+                        let (r, rr) = ui.allocate_exact_size(vec2(rw, ROW), Sense::click());
+                        if fresh && Some(i) == selected {
+                            ui.scroll_to_rect(r, Some(Align::Center));
+                        }
+                        let on = Some(i) == selected;
+                        let p = ui.painter();
+                        if rr.hovered() {
+                            p.rect_filled(r, CornerRadius::same(RADIUS_SM), BG3);
+                        }
+                        fit_text(p, pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, &items[i], theme::font_semi(12.5), if on || rr.hovered() { TEXT } else { TEXT2 }, rw - 40.0);
+                        if on {
+                            let t = pos2(r.right() - 18.0, r.center().y);
+                            p.line_segment([t + vec2(-5.0, 0.0), t + vec2(-1.5, 3.5)], Stroke::new(1.8, G1));
+                            p.line_segment([t + vec2(-1.5, 3.5), t + vec2(5.0, -4.0)], Stroke::new(1.8, G1));
+                        }
+                        if rr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            picked = Some(i);
+                        }
+                    }
+                    if shown.is_empty() {
+                        let (r, _) = ui.allocate_exact_size(vec2(rw, ROW), Sense::hover());
+                        ui.painter().text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, "No match", theme::font_semi(12.5), MUTED);
+                    }
+                });
+            });
+    });
+    // a pick, a click outside or Escape closes it
+    let list = area.response.rect;
+    let outside = ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !list.contains(p) && !rect.contains(p)));
+    if picked.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        open = false;
+    }
+    ui.data_mut(|d| {
+        d.insert_temp(open_id, open);
+        d.insert_temp(search_id, search);
+    });
+    picked
+}
+
 /// Page tabs like "Manual Bet | Automatic". Returns the new index on change.
 pub fn tab_bar(ui: &mut Ui, items: &[&str], selected: usize, enabled: bool) -> Option<usize> {
     let mut changed = None;
@@ -695,6 +810,132 @@ pub fn tab_bar(ui: &mut Ui, items: &[&str], selected: usize, enabled: bool) -> O
         }
     }
     changed
+}
+
+fn icon_tab_w(ui: &Ui, text: &str, compact: bool) -> f32 {
+    if compact {
+        return 13.0 + 28.0;
+    }
+    ui.painter().layout_no_wrap(text.to_string(), theme::font_semi(12.5), TEXT).size().x + 14.0 + 7.0 + 28.0
+}
+
+/// How wide [`icon_tabs`] is for `items`.
+pub fn icon_tabs_width(ui: &Ui, items: &[(&str, &str)], compact: bool) -> f32 {
+    items.iter().map(|(_, t)| icon_tab_w(ui, t, compact)).sum::<f32>() + 8.0
+}
+
+/// Page tabs with an icon before each label (`(icon, label)`), each as wide as its label; the
+/// highlight slides to the selected one. `compact`: icons only, the label on hover. Returns the
+/// new index on change.
+pub fn icon_tabs(ui: &mut Ui, items: &[(&str, &str)], selected: usize, enabled: bool, compact: bool) -> Option<usize> {
+    let mut changed = None;
+    let font = theme::font_semi(12.5);
+    let widths: Vec<f32> = items.iter().map(|(_, t)| icon_tab_w(ui, t, compact)).collect();
+    let (rect, resp) = ui.allocate_exact_size(vec2(icon_tabs_width(ui, items, compact), FIELD_H + 2.0), Sense::hover());
+    let lefts: Vec<f32> = widths.iter().scan(rect.left() + 4.0, |x, w| {
+        let l = *x;
+        *x += w;
+        Some(l)
+    }).collect();
+    let sel = selected.min(items.len().saturating_sub(1));
+    let p = ui.painter();
+    p.rect(rect, CornerRadius::same(10), BG1, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    let x = ui.ctx().animate_value_with_time(resp.id.with("tab-x"), lefts[sel], 0.14);
+    let w = ui.ctx().animate_value_with_time(resp.id.with("tab-w"), widths[sel], 0.14);
+    let hl = Rect::from_min_size(pos2(x, rect.top() + 4.0), vec2(w, rect.height() - 8.0));
+    shadow(p, hl, 7, 1.0, 6.0, 70);
+    p.rect(hl, CornerRadius::same(7), BG3, Stroke::new(1.0, LINE2), StrokeKind::Inside);
+    for (i, (icon_name, text)) in items.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(lefts[i], rect.top() + 4.0), vec2(widths[i], rect.height() - 8.0));
+        let tr = ui.interact(r, resp.id.with(("itab", i)), if enabled { Sense::click() } else { Sense::hover() });
+        let on = i == sel;
+        let color = if on {
+            TEXT
+        } else if !enabled {
+            DIM
+        } else if tr.hovered() {
+            TEXT2
+        } else {
+            MUTED
+        };
+        let p = ui.painter();
+        let ir = Rect::from_center_size(pos2(r.left() + 14.0 + 6.5, r.center().y), vec2(13.0, 13.0));
+        icon(p, ir, icon_name, if on { G2 } else { color });
+        let tr = if compact {
+            tr.on_hover_text(*text)
+        } else {
+            p.text(pos2(ir.right() + 7.0, r.center().y), Align2::LEFT_CENTER, *text, font.clone(), color);
+            tr
+        };
+        if tr.clicked() && enabled && !on {
+            changed = Some(i);
+        }
+        if enabled && !on {
+            tr.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+    }
+    changed
+}
+
+/// A full-width button outlined with a dashed line, for adding things ("+ Add condition").
+pub fn dashed_button(ui: &mut Ui, text: &str, height: f32, enabled: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), if enabled { Sense::click() } else { Sense::hover() });
+    let hovered = enabled && resp.hovered();
+    let p = ui.painter();
+    if hovered {
+        p.rect_filled(rect, CornerRadius::same(RADIUS), alpha(G1, 14));
+    }
+    // the outline: straight edges and quarter circles at the corners
+    let rad = RADIUS as f32;
+    let r = rect.shrink(0.5);
+    let mut pts = vec![];
+    for (c, a0) in [
+        (pos2(r.right() - rad, r.top() + rad), -90.0f32),
+        (pos2(r.right() - rad, r.bottom() - rad), 0.0),
+        (pos2(r.left() + rad, r.bottom() - rad), 90.0),
+        (pos2(r.left() + rad, r.top() + rad), 180.0),
+    ] {
+        for k in 0..=6 {
+            let a = (a0 + 15.0 * k as f32).to_radians();
+            pts.push(pos2(c.x + rad * a.cos(), c.y + rad * a.sin()));
+        }
+    }
+    pts.push(pts[0]);
+    let stroke = Stroke::new(1.0, if hovered { alpha(G1, 200) } else { LINE2 });
+    p.extend(egui::Shape::dashed_line(&pts, stroke, 5.0, 4.0));
+    let color = if !enabled {
+        DIM
+    } else if hovered {
+        G2
+    } else {
+        TEXT2
+    };
+    let g = p.layout_no_wrap(text.to_string(), theme::font_semi(12.5), color);
+    let total = 12.0 + 7.0 + g.size().x;
+    let x = rect.center().x - total / 2.0;
+    icon(p, Rect::from_center_size(pos2(x + 6.0, rect.center().y), vec2(11.0, 11.0)), "plus", color);
+    p.galley(pos2(x + 19.0, rect.center().y - g.size().y / 2.0), g, color);
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// A small on / off switch. Returns true when clicked (and enabled).
+pub fn switch(ui: &mut Ui, on: bool, enabled: bool) -> bool {
+    let size = vec2(30.0, 16.0);
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    let t = ui.ctx().animate_bool(resp.id, on);
+    let p = ui.painter();
+    let fill = mix(BG3, G1, t * 0.9);
+    p.rect(rect, CornerRadius::same(8), if enabled { fill } else { alpha(fill, 120) }, Stroke::new(1.0, mix(LINE2, G1, t)), StrokeKind::Inside);
+    let knob = pos2(rect.left() + 8.0 + t * (size.x - 16.0), rect.center().y);
+    p.circle_filled(knob, 5.5, mix(MUTED, INK, t));
+    if enabled {
+        resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked() && enabled
 }
 
 /// On/off switch with a label to its left.
@@ -1142,6 +1383,67 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
                 });
                 p.add(egui::Shape::line(pts.collect(), s));
             }
+        }
+        "cursor" => {
+            // a pointer arrow, its tail to the bottom right
+            let tip = [at(0.16, 0.04), at(0.16, 0.8), at(0.36, 0.62), at(0.52, 0.96), at(0.66, 0.9), at(0.5, 0.56), at(0.78, 0.56)];
+            p.add(egui::Shape::closed_line(tip.to_vec(), s));
+        }
+        "loop" => {
+            // two arrows chasing each other round a circle
+            let c = r.center();
+            let rad = r.width() * 0.42;
+            for start in [0.15f32, std::f32::consts::PI + 0.15] {
+                let pts: Vec<Pos2> = (0..=10).map(|i| start + i as f32 / 10.0 * 2.5).map(|a| pos2(c.x + rad * a.cos(), c.y + rad * a.sin())).collect();
+                let end = *pts.last().unwrap_or(&c);
+                let a = start + 2.5;
+                let dir = vec2(-a.sin(), a.cos());
+                let side = vec2(a.cos(), a.sin());
+                p.add(egui::Shape::line(pts, s));
+                let w = r.width() * 0.16;
+                p.add(egui::Shape::line(vec![end - dir * w + side * w, end, end - dir * w - side * w], s));
+            }
+        }
+        "branch" => {
+            // a flow: one node splitting into two
+            let (a, b, c) = (at(0.5, 0.14), at(0.18, 0.86), at(0.82, 0.86));
+            let mid = at(0.5, 0.5);
+            p.add(egui::Shape::line(vec![a, mid, pos2(b.x, mid.y + r.height() * 0.08), b], s));
+            p.add(egui::Shape::line(vec![mid, pos2(c.x, mid.y + r.height() * 0.08), c], s));
+            for q in [a, b, c] {
+                p.circle_filled(q, r.width() * 0.13, color);
+            }
+        }
+        "code" => {
+            p.add(egui::Shape::line(vec![at(0.3, 0.2), at(0.02, 0.5), at(0.3, 0.8)], s));
+            p.add(egui::Shape::line(vec![at(0.7, 0.2), at(0.98, 0.5), at(0.7, 0.8)], s));
+            p.line_segment([at(0.58, 0.08), at(0.42, 0.92)], s);
+        }
+        "up" => {
+            p.add(egui::Shape::line(vec![at(0.15, 0.68), at(0.5, 0.32), at(0.85, 0.68)], s));
+        }
+        "down" => {
+            p.add(egui::Shape::line(vec![at(0.15, 0.32), at(0.5, 0.68), at(0.85, 0.32)], s));
+        }
+        "copy" => {
+            p.rect_stroke(Rect::from_min_max(at(0.32, 0.32), at(0.96, 0.96)), CornerRadius::same(2), s, StrokeKind::Middle);
+            p.add(egui::Shape::line(vec![at(0.68, 0.18), at(0.68, 0.04), at(0.04, 0.04), at(0.04, 0.68), at(0.18, 0.68)], s));
+        }
+        "bell" => {
+            // a bell: dome, flared rim, clapper
+            let pts: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 12.0);
+                    pos2(r.center().x + r.width() * 0.3 * a.cos(), r.top() + r.height() * 0.42 + r.height() * 0.3 * a.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(pts, s));
+            p.add(egui::Shape::line(vec![at(0.2, 0.42), at(0.16, 0.72), at(0.04, 0.8), at(0.96, 0.8), at(0.84, 0.72), at(0.8, 0.42)], s));
+            p.circle_filled(at(0.5, 0.92), r.width() * 0.09, color);
+        }
+        "plus" => {
+            p.line_segment([at(0.5, 0.08), at(0.5, 0.92)], s);
+            p.line_segment([at(0.08, 0.5), at(0.92, 0.5)], s);
         }
         _ => {}
     }

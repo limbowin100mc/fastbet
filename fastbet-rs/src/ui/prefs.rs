@@ -23,16 +23,18 @@ pub enum Tab {
     #[default]
     Seed,
     Sound,
+    Alerts,
     Storage,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Seed, Tab::Sound, Tab::Storage];
+    const ALL: [Tab; 4] = [Tab::Seed, Tab::Sound, Tab::Alerts, Tab::Storage];
 
     fn name(self) -> &'static str {
         match self {
             Tab::Seed => "Seed",
             Tab::Sound => "Sound",
+            Tab::Alerts => "Alerts",
             Tab::Storage => "Storage",
         }
     }
@@ -41,9 +43,29 @@ impl Tab {
         match self {
             Tab::Seed => "seed",
             Tab::Sound => "sound",
+            Tab::Alerts => "bell",
             Tab::Storage => "stack",
         }
     }
+}
+
+/// Settings → Alerts: a test or a chat lookup on its way, and what they found.
+#[derive(Default)]
+pub struct AlertsView {
+    test: Option<mpsc::Receiver<Result<String, String>>>,
+    tested: Vec<Result<String, String>>,
+    find: Option<mpsc::Receiver<Result<(String, String), String>>>,
+    found: Option<Result<String, String>>,
+    /// Where "Save icon" put the app's icon.
+    icon: Option<Result<PathBuf, String>>,
+}
+
+/// The app's icon, saved to Downloads for the bot's picture.
+fn save_icon() -> Result<PathBuf, String> {
+    let dir = crate::paths::downloads_dir().ok_or("No Downloads folder")?;
+    let path = dir.join("FastBet icon.png");
+    std::fs::write(&path, include_bytes!("../../assets/icon.png")).map_err(|e| format!("Couldn't save the icon: {e}"))?;
+    Ok(path)
 }
 
 /// Settings → Sound: the file picker while it's open, and what the last check of the picked file found.
@@ -113,6 +135,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     match app.prefs_tab {
                         Tab::Seed => seed(app, ui, w),
                         Tab::Sound => sound_page(app, ui, w),
+                        Tab::Alerts => alerts_page(app, ui, w),
                         Tab::Storage => storage_page(app, ui, w),
                     }
                 });
@@ -288,15 +311,26 @@ fn pick_sound(app: &mut App) {
     let repaint = app.repaint.clone();
     let dir = app.settings.hit_sound_file().and_then(|p| p.parent().map(Path::to_path_buf));
     std::thread::spawn(move || {
+        // no file picker on the phone yet
+        #[cfg(target_os = "android")]
+        {
+            let _ = (dir, tx.send(None));
+            repaint();
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
         let mut dialog = rfd::FileDialog::new()
             .set_title("Choose the hit sound")
             .add_filter("Sound or video", sound::EXTENSIONS)
             .add_filter("All files", &["*"]);
-        if let Some(dir) = dir {
-            dialog = dialog.set_directory(dir);
+        #[cfg(not(target_os = "android"))]
+        {
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+            let _ = tx.send(dialog.pick_file());
+            repaint();
         }
-        let _ = tx.send(dialog.pick_file());
-        repaint();
     });
     app.sound_view.pick = Some(rx);
 }
@@ -382,6 +416,155 @@ fn sound_page(app: &mut App, ui: &mut Ui, w: f32) {
                 app.sound.stop();
             } else {
                 app.sound.play(file.clone());
+            }
+        }
+    });
+}
+
+fn alerts_page(app: &mut App, ui: &mut Ui, w: f32) {
+    use crate::alerts::{self, discord_url_ok, telegram_token_ok};
+    heading(ui, "Alerts", "A message on your phone when a bet hits or a run ends, through Telegram or Discord.");
+    // answers from a test or a chat lookup
+    let v = &mut app.alerts_view;
+    if let Some(rx) = &v.test {
+        while let Ok(r) = rx.try_recv() {
+            v.tested.push(r);
+        }
+    }
+    let found = v.find.as_ref().and_then(|rx| rx.try_recv().ok());
+    if let Some(r) = found {
+        app.alerts_view.find = None;
+        app.alerts_view.found = Some(match r {
+            Ok((id, name)) => {
+                app.settings.alert_tg_chat = id.clone();
+                app.mark_dirty();
+                Ok(format!("Found {name} (chat {id})"))
+            }
+            Err(e) => Err(e),
+        });
+    }
+    if app.alerts_view.test.is_some() || app.alerts_view.find.is_some() {
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+    }
+    let on = |ok: bool| if ok { widgets::semi("On", 11.5, G2) } else { widgets::semi("Off", 11.5, DIM) };
+
+    // Telegram
+    let tg_ok = telegram_token_ok(&app.settings.alert_tg_token) && !app.settings.alert_tg_chat.trim().is_empty();
+    let help = "1. In Telegram, open @BotFather, send /newbot and follow it: it gives you a token.\n2. Paste the token here.\n\
+                3. Open your new bot in Telegram and send it any message.\n4. Click Find my chat.";
+    widgets::card(ui, w, "Telegram", Some(help), Some(on(tg_ok)), |ui| {
+        let token = &mut app.settings.alert_tg_token;
+        if labelled(ui, "Bot token (from @BotFather)", |ui| widgets::text_box(ui, token, "123456789:AA…", None, true, true)).changed() {
+            app.mark_dirty();
+        }
+        if !app.settings.alert_tg_token.trim().is_empty() && !telegram_token_ok(&app.settings.alert_tg_token) {
+            widgets::readout(ui, "That doesn't look like a bot token: digits, a colon, then a long code", theme::TEXT2, GOLD);
+        }
+        widgets::caption(ui, "Chat");
+        let finding = app.alerts_view.find.is_some();
+        let mut find = false;
+        widgets::row(ui, widgets::FIELD_H, |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let can = telegram_token_ok(&app.settings.alert_tg_token) && !finding;
+                find = widgets::button(ui, if finding { "Looking…" } else { "Find my chat" }, Btn::Ghost, can, Some(120.0)).clicked();
+                if widgets::text_box(ui, &mut app.settings.alert_tg_chat, "Send your bot a message, then Find my chat", None, true, false).changed() {
+                    app.mark_dirty();
+                }
+            });
+        });
+        if find {
+            let (tx, rx) = mpsc::channel();
+            let token = app.settings.alert_tg_token.clone();
+            app.alerts_view.find = Some(rx);
+            app.alerts_view.found = None;
+            std::thread::spawn(move || {
+                let _ = tx.send(alerts::find_chat(&token));
+            });
+        }
+        match &app.alerts_view.found {
+            Some(Ok(m)) => widgets::readout(ui, m.clone(), TEXT2, G1),
+            Some(Err(e)) => widgets::readout(ui, e.clone(), TEXT2, GOLD),
+            None => {}
+        }
+        // a bot's picture is only set in @BotFather: hand over the icon to pick there
+        let mut save = false;
+        widgets::row(ui, widgets::FIELD_H, |ui| {
+            ui.label(RichText::new("Bot picture: send /setuserpic to @BotFather").size(11.5).color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                save = widgets::button(ui, "Save icon", Btn::Ghost, true, Some(96.0)).on_hover_text("Saves the FastBet icon to Downloads, to send to @BotFather").clicked();
+            });
+        });
+        if save {
+            app.alerts_view.icon = Some(save_icon());
+        }
+        match &app.alerts_view.icon {
+            Some(Ok(path)) => widgets::readout(ui, format!("Saved {}", path.display()), TEXT2, G1),
+            Some(Err(e)) => widgets::readout(ui, e.clone(), TEXT2, GOLD),
+            None => {}
+        }
+    });
+    ui.add_space(12.0);
+
+    // Discord
+    let dc_ok = discord_url_ok(&app.settings.alert_discord);
+    let help = "In your Discord server: Server Settings → Integrations → Webhooks → New Webhook. Pick the channel, then Copy Webhook URL \
+                and paste it here. FastBet names the webhook FastBet and gives it the app's icon the first time it sends.";
+    widgets::card(ui, w, "Discord", Some(help), Some(on(dc_ok)), |ui| {
+        let url = &mut app.settings.alert_discord;
+        if labelled(ui, "Webhook URL", |ui| widgets::text_box(ui, url, "https://discord.com/api/webhooks/…", None, true, true)).changed() {
+            app.mark_dirty();
+        }
+        if !app.settings.alert_discord.trim().is_empty() && !dc_ok {
+            widgets::readout(ui, "That isn't a Discord webhook link (https://discord.com/api/webhooks/…)", theme::TEXT2, GOLD);
+        }
+    });
+    ui.add_space(12.0);
+
+    // what to send
+    let any = app.alert_targets().any();
+    widgets::card(ui, w, "Send an alert when", None, None, |ui| {
+        for (label, help, which) in [
+            ("A bet hits", "A bet reaches Stop on hit (a slot spin: its stop multiplier).", 0),
+            ("A run ends by itself", "Stop profit or loss, a condition or the script stopping it, an error, the number of bets. Not when you press Stop.", 1),
+            ("Auto vault puts profit away", "Every deposit auto vault makes.", 2),
+        ] {
+            let flag = match which {
+                0 => &mut app.settings.alert_hits,
+                1 => &mut app.settings.alert_runs,
+                _ => &mut app.settings.alert_vault,
+            };
+            if widgets::toggle_help(ui, label, Some(help), flag, true) {
+                app.mark_dirty();
+            }
+        }
+        let testing = app.alerts_view.test.is_some() && app.alerts_view.tested.len() < (app.alert_targets().telegram.is_some() as usize + app.alert_targets().discord.is_some() as usize);
+        if widgets::button(ui, if testing { "Sending…" } else { "Send a test" }, Btn::Ghost, any && !testing, Some(ui.available_width())).clicked() {
+            let (tx, rx) = mpsc::channel();
+            app.alerts_view.test = Some(rx);
+            app.alerts_view.tested.clear();
+            let lines = vec![app.alert_where("FastBet"), "Alerts work. Hits come with their card, like this one.".to_string()];
+            let card = super::hitcard::Card {
+                game: "Limbo".into(),
+                byline: format!("Originals · {}", app.casino().name()),
+                multiplier: 1000.0,
+                win: "$10.00".into(),
+                bet: "$0.01".into(),
+                when: "A sample card".into(),
+                demo: false,
+                hit: true,
+            };
+            let art = app.orig.catalog.iter().find(|c| c.id == "limbo").map(|c| c.image.clone()).unwrap_or_default();
+            let picture = Some(alerts::Picture { card, art });
+            alerts::send(app.alert_targets(), alerts::Alert { kind: alerts::Kind::Test, title: "Test alert".into(), lines, picture }, Some(tx));
+        }
+        if !any {
+            widgets::readout(ui, "Set up Telegram or Discord above first", MUTED, LINE);
+        }
+        for r in &app.alerts_view.tested {
+            match r {
+                Ok(m) => widgets::readout(ui, m.clone(), TEXT2, G1),
+                Err(e) => widgets::readout(ui, e.clone(), TEXT2, theme::RED),
             }
         }
     });

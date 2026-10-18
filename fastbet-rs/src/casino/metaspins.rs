@@ -714,6 +714,7 @@ impl Casino for Metaspins {
 /// `FASTBET_METASPINS_TOKEN` and prints the account, the paying coin, the Limbo session, the
 /// balance and the seeds.
 /// It never bets.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub async fn self_test() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let token = std::env::var("FASTBET_METASPINS_TOKEN").ok().filter(|t| !t.is_empty());

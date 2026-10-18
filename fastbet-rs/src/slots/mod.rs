@@ -244,6 +244,7 @@ pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 
 /// `fastbet --slot-test <producer> <launch-url> [spins] [feature]`: opens a session the
 /// way the app does and spins it (demo launch URLs only, unless you mean it).
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub async fn self_test(producer: &str, launch_url: &str, spins: usize, feature: Option<&str>) {
     let Some(provider) = Provider::for_producer(producer) else {
         eprintln!("no driver for {producer}");
@@ -342,6 +343,7 @@ pub struct SessionInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub struct SpinResult {
     pub round_id: String,
     /// What was charged, in minor units (bet level × feature cost).

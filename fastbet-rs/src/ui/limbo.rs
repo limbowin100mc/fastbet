@@ -7,7 +7,7 @@ use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Marg
 
 use super::stats::{clock, HistEntry};
 use super::theme::{self, alpha, BG, BG1, DIM, GOLD, GREEN, LINE, MUTED, RED, STAGE, TEXT, TEXT2};
-use super::widgets::{self, button, button_key, tab_bar, Btn};
+use super::widgets::{self, button, button_key, Btn};
 use super::{controls, App};
 use crate::engine::BetRecord;
 use crate::money::{fmt_int, fmt_multi, fmt_time};
@@ -46,7 +46,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         .frame(Frame::new().fill(BG).inner_margin(Margin { left: 2, right: PAD as i8, top: 2, bottom: PAD as i8 }))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 12.0;
-            stage(app, ui);
+            if app.code_mode() {
+                let h = (ui.available_height() * 0.6).clamp(300.0, 640.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+                ui.painter().rect(rect, CornerRadius::same(14), STAGE, Stroke::new(1.0, LINE), StrokeKind::Inside);
+                super::code::panel(app, ui, rect, "limbo");
+            } else {
+                stage(app, ui);
+            }
             table(app, ui);
         });
 }
@@ -54,19 +61,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 fn header(app: &mut App, ui: &mut Ui) {
     let hr = ui.max_rect();
     let running = app.auto.running;
-    // mode tabs, centred over the stage (everything right of the settings panel)
-    let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
-    let right_w = if running { 360.0 } else { 140.0 };
-    let tabs_w = 236.0;
-    let x = (cx - tabs_w / 2.0).min(hr.right() - right_w - tabs_w - 12.0);
-    let tabs_rect = Rect::from_min_size(pos2(x, hr.center().y - 18.0), vec2(tabs_w, 36.0));
-    // a child ui does not move the parent's cursor, so the row below stays on the same line
-    let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(tabs_rect).layout(Layout::left_to_right(Align::Center)));
-    let sel = if app.settings.mode == Mode::Auto { 1 } else { 0 };
-    if let Some(i) = tab_bar(&mut tabs_ui, &["Manual Bet", "Automatic"], sel, !running) {
-        app.settings.mode = if i == 1 { Mode::Auto } else { Mode::Manual };
-        app.mark_dirty();
-    }
+    let (mut left, mut right) = (hr.left(), hr.right());
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(widgets::bold("Limbo", 21.0, TEXT));
@@ -77,14 +72,15 @@ fn header(app: &mut App, ui: &mut Ui) {
         };
         widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
         widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
-        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto {
+        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && !app.strategy_sequential(true) {
             widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
                 .on_hover_text("Bets in flight at once. Set it under No. of bets, delay & async.");
         }
         controls::restarts_chip(app, ui);
+        left = ui.min_rect().right();
 
         // right: start / running controls
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if running {
                 if button(ui, "Stop", Btn::Danger, true, Some(84.0)).clicked() {
@@ -108,8 +104,14 @@ fn header(app: &mut App, ui: &mut Ui) {
                     app.manual_bet();
                 }
             }
-        });
+        })
+        .response
+        .rect
+        .left();
     });
+    // mode tabs, centred over the stage (everything right of the settings panel)
+    let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
+    controls::mode_tabs(app, ui, cx, left, right, !running);
 }
 
 fn stage(app: &mut App, ui: &mut Ui) {

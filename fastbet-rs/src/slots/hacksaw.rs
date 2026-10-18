@@ -335,6 +335,7 @@ impl HacksawSession {
 }
 
 /// `fastbet --bridge-test [gameId]`: authenticate the demo and spin a few times.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub async fn self_test(game_id: u64, spins: usize) {
     let t0 = std::time::Instant::now();
     let s = match HacksawSession::open(Launch::demo(game_id)).await {

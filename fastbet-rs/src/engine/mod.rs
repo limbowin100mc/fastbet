@@ -61,6 +61,8 @@ pub enum Command {
     StopSlot,
     PauseSlot,
     SlotStopOnNextWin,
+    /// Auto vault: how profit goes to the vault, or off.
+    Vault(Option<VaultPolicy>),
     /// Rakeback and bonuses; answered with `Event::Rewards`.
     Rewards,
     /// Claims a reward in `currency`; answered with `Event::RewardClaimed`, then `Event::Rewards`.
@@ -122,6 +124,21 @@ pub enum Event {
     Rewards(Result<Vec<casino::Reward>, String>),
     RewardClaimed { id: String, result: Result<String, String> },
     Challenges(Result<Vec<casino::Challenge>, String>),
+    /// Code Mode: what the script logged.
+    Script(Vec<ScriptLine>),
+    /// Auto vault: profit counted toward the next deposit.
+    VaultProgress(Units),
+    /// Auto vault: a deposit went through, or why it didn't.
+    Vaulted { currency: String, amount: Units, result: Result<(), String> },
+}
+
+/// Auto vault: every time the profit in `currency` grows by `step` since the last deposit,
+/// `pct` percent of it goes to the vault.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultPolicy {
+    pub currency: String,
+    pub step: Units,
+    pub pct: f64,
 }
 
 /// A bet on an original, before the casino adds its own fields.
@@ -209,6 +226,31 @@ pub struct AutoConfig {
     pub stop_loss: Option<Units>,
     pub max_bet: Option<Units>,
     pub hit_line: Option<f64>,
+    /// Condition Builder rules, checked after every settled bet (empty: `on_win` / `on_loss`).
+    pub rules: Vec<crate::rules::Compiled>,
+    /// The casino's lowest and highest Limbo target, for rules that change it.
+    pub target_range: (f64, f64),
+    /// Code Mode: the user's script decides every bet.
+    pub script: Option<ScriptConfig>,
+}
+
+/// A Code Mode run's script, and how its amounts (in the panel's unit) map to the currency's.
+#[derive(Clone, Debug)]
+pub struct ScriptConfig {
+    pub code: String,
+    /// Units of the currency in one unit of the panel (one dollar, one coin).
+    pub per_unit: f64,
+    pub unit: String,
+    /// "limbo" or the original's slug.
+    pub game: String,
+}
+
+/// A line the script logged, or why it failed.
+#[derive(Clone, Debug)]
+pub struct ScriptLine {
+    pub at: SystemTime,
+    pub text: String,
+    pub error: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,6 +270,12 @@ pub struct AutoState {
     pub restarts: u32,
     /// Errors the run bet on through (force restart on errors).
     pub errors: u32,
+    /// Limbo's target for the next bet (rules can change it).
+    pub target: f64,
+    pub win_streak: u32,
+    pub loss_streak: u32,
+    /// Times each Condition Builder rule fired, by its place in the list.
+    pub fired: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -306,6 +354,9 @@ struct Engine {
     force_restart: AtomicBool,
     restart_on_error: AtomicBool,
 
+    /// Auto vault, and the profit counted since its last deposit.
+    vault: Mutex<(Option<VaultPolicy>, Units)>,
+
     slot: Mutex<slots::SlotState>,
     slot_session: tokio::sync::Mutex<Option<Arc<dyn crate::slots::SlotSession>>>,
     slot_run: AtomicU64,
@@ -339,6 +390,7 @@ impl Engine {
             auto_wake: Notify::new(),
             force_restart: AtomicBool::new(false),
             restart_on_error: AtomicBool::new(false),
+            vault: Mutex::new((None, 0)),
             slot: Mutex::new(slots::SlotState::default()),
             slot_session: tokio::sync::Mutex::new(None),
             slot_run: AtomicU64::new(0),
@@ -502,6 +554,14 @@ impl Engine {
                     self.emit_seed();
                 }
                 Command::ClientSeed(seed) => *self.client_seed.lock() = seed,
+                Command::Vault(policy) => {
+                    let mut v = self.vault.lock();
+                    if v.0 != policy {
+                        *v = (policy, 0);
+                        drop(v);
+                        self.emit(Event::VaultProgress(0));
+                    }
+                }
                 Command::SetConcurrency(n) => {
                     let n = n.clamp(1, MAX_CONCURRENCY);
                     if self.concurrency.swap(n, Ordering::SeqCst) != n {
@@ -738,7 +798,7 @@ impl Engine {
                     return Ok(None);
                 }
                 let record = BetRecord::from_round(&round, ms, hit_line);
-                self.emit(Event::Bet(record.clone()));
+                self.settled(&record);
                 return Ok(Some(record));
             }
             (Wager::Original(_), Reply::Limbo(_)) => unreachable!("a Limbo reply to an original's bet"),
@@ -766,7 +826,7 @@ impl Engine {
             game: None,
             round: None,
         };
-        self.emit(Event::Bet(record.clone()));
+        self.settled(&record);
         Ok(Some(record))
     }
 
@@ -811,7 +871,7 @@ impl Engine {
             Ok((round, ms)) => {
                 self.emit(Event::Round(round.clone()));
                 if !round.active {
-                    self.emit(Event::Bet(BetRecord::from_round(&round, ms, None)));
+                    self.settled(&BetRecord::from_round(&round, ms, None));
                 }
             }
             Err(e) => {
@@ -848,6 +908,10 @@ impl Engine {
                 stop_on_win: false,
                 restarts: 0,
                 errors: 0,
+                target: cfg.target,
+                win_streak: 0,
+                loss_streak: 0,
+                fired: vec![0; cfg.rules.iter().map(|r| r.index + 1).max().unwrap_or(0)],
             };
         }
         *self.auto_cfg.lock() = Some(cfg.clone());
@@ -931,6 +995,7 @@ impl Engine {
                 a.done = 0;
                 a.profit = 0;
                 a.stake = cfg.base;
+                a.target = cfg.target;
                 a.hits = 0;
                 a.restarts += 1;
                 a.msg = format!("Restarted: {msg}");
@@ -950,7 +1015,41 @@ impl Engine {
         // original with steps (the casino holds one round of it at a time), unless its auto bet
         // settles the round in one request (Mines on Stake and Shuffle).
         let one_round = cfg.original.as_ref().is_some_and(|(g, _)| g.has_steps() && !self.casino().is_ok_and(|c| c.auto_settles(*g)));
-        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some() || one_round;
+        let progressive = cfg.on_win.is_some() || cfg.on_loss.is_some() || one_round || cfg.rules.iter().any(|r| r.action.progressive()) || cfg.script.is_some();
+        // what the rules count starts over with every pass
+        let mut counters = crate::rules::Counters::default();
+        let limits = crate::rules::Limits { base: cfg.base, base_target: cfg.target, min_target: cfg.target_range.0, max_target: cfg.target_range.1 };
+        {
+            let mut a = self.auto.lock();
+            a.win_streak = 0;
+            a.loss_streak = 0;
+        }
+        // Code Mode: the script's top level runs first, and sets the first bet
+        let mut script = None;
+        let mut wagered: Units = 0;
+        if let Some(sc) = &cfg.script {
+            let setup = crate::script::Setup {
+                code: sc.code.clone(),
+                bet: cfg.base as f64 / sc.per_unit,
+                target: cfg.target,
+                game: sc.game.clone(),
+                unit: sc.unit.clone(),
+                currency: cfg.currency.clone(),
+            };
+            match crate::script::Script::start(setup).await {
+                Ok((s, first)) => {
+                    self.apply_script(cfg, sc, &first);
+                    if let Some(why) = first.stop {
+                        return (Ending::Stuck(script_stopped(&why)), 0);
+                    }
+                    script = Some(s);
+                }
+                Err(e) => {
+                    self.script_error(&e);
+                    return (Ending::Stuck(format!("Script error: {e}")), 0);
+                }
+            }
+        }
         let mut inflight: u32 = 0;
         let mut launched: u32 = 0;
         let mut settled: u32 = 0;
@@ -964,7 +1063,10 @@ impl Engine {
             let width = if progressive { 1 } else { self.concurrency.load(Ordering::SeqCst).max(1) };
             let under_limit = cfg.limit == 0 || launched < cfg.limit;
             if !paused && inflight < width && under_limit {
-                let amount = self.auto.lock().stake;
+                let (amount, target) = {
+                    let a = self.auto.lock();
+                    (a.stake, a.target)
+                };
                 // a run that starts at 0 plays for free on purpose; one that shrank to 0 is over
                 if amount <= 0 && cfg.base > 0 {
                     break Ending::Over("Bet size hit 0".into());
@@ -976,7 +1078,7 @@ impl Engine {
                 }
                 let wager = match &cfg.original {
                     Some((game, params)) => Wager::Original(OriginalBet { game: *game, currency: cfg.currency.clone(), amount, params: params.clone(), auto: true }),
-                    None => Wager::Limbo(BetRequest { currency: cfg.currency.clone(), amount, target: cfg.target }),
+                    None => Wager::Limbo(BetRequest { currency: cfg.currency.clone(), amount, target }),
                 };
                 let me = self.clone();
                 let k = keep.clone();
@@ -1054,20 +1156,70 @@ impl Engine {
             if self.auto_run.load(Ordering::SeqCst) != run {
                 break Ending::Stopped;
             }
-            let (profit, done, hit, stop_on_win) = {
-                let mut a = self.auto.lock();
+            let (profit, done, hit, stop_on_win, fx) = {
+                let mut guard = self.auto.lock();
+                let a = &mut *guard;
                 a.done += 1;
                 a.profit += r.profit;
-                let pct = if r.win { cfg.on_win } else { cfg.on_loss };
-                a.stake = match pct {
-                    Some(p) => scale_pct(a.stake, p),
-                    None => cfg.base,
-                };
+                let mut fx = crate::rules::Effects::default();
+                if cfg.rules.is_empty() {
+                    let pct = if r.win { cfg.on_win } else { cfg.on_loss };
+                    a.stake = match pct {
+                        Some(p) => scale_pct(a.stake, p),
+                        None => cfg.base,
+                    };
+                } else {
+                    counters.record(r.win, r.profit);
+                    fx = crate::rules::apply(&cfg.rules, &mut counters, r.win, r.outcome, &mut a.stake, &mut a.target, &limits, &mut a.fired);
+                    a.win_streak = counters.win_streak;
+                    a.loss_streak = counters.loss_streak;
+                }
                 if r.hit {
                     a.hits += 1;
                 }
-                (a.profit, a.done, r.hit, a.stop_on_win)
+                (a.profit, a.done, r.hit, a.stop_on_win, fx)
             };
+            // Code Mode: the script hears about the bet and sets the next one
+            let mut fx = fx;
+            if let (Some(s), Some(sc)) = (&script, &cfg.script) {
+                counters.record(r.win, r.profit);
+                wagered += r.amount;
+                let u = |v: Units| v as f64 / sc.per_unit;
+                let bet = crate::script::Bet { win: r.win, amount: u(r.amount), payout: u(r.payout), profit: u(r.profit), multiplier: r.outcome, target: r.target };
+                let stats = crate::script::Stats {
+                    profit: u(profit),
+                    wagered: u(wagered),
+                    bets: counters.bets,
+                    wins: counters.wins,
+                    losses: counters.losses,
+                    win_streak: counters.win_streak,
+                    loss_streak: counters.loss_streak,
+                };
+                match s.on_bet(bet, stats).await {
+                    Ok(d) => {
+                        self.apply_script(cfg, sc, &d);
+                        {
+                            let mut a = self.auto.lock();
+                            a.win_streak = counters.win_streak;
+                            a.loss_streak = counters.loss_streak;
+                        }
+                        fx.seed |= d.seed;
+                        if let Some(why) = d.stop {
+                            if self.auto_live(run) {
+                                break Ending::Over(script_stopped(&why));
+                            }
+                            break Ending::Stopped;
+                        }
+                    }
+                    Err(e) => {
+                        if !self.auto_live(run) {
+                            break Ending::Stopped;
+                        }
+                        self.script_error(&e);
+                        break Ending::Stuck(format!("Script error: {e}"));
+                    }
+                }
+            }
             if hit && self.auto_live(run) {
                 self.auto.lock().last_hit = Some(r.outcome);
             }
@@ -1081,6 +1233,16 @@ impl Engine {
             }
             if !self.auto_live(run) {
                 break Ending::Stopped;
+            }
+            if let Some(i) = fx.stop {
+                break Ending::Over(format!("Condition {} stopped the run", i + 1));
+            }
+            if fx.seed {
+                // the bets still in flight finish first
+                let _w = self.lane.write().await;
+                if let Err(e) = self.rotate_seed("condition").await {
+                    self.flash(e.to_string());
+                }
             }
             if let Some(sp) = cfg.stop_profit {
                 if profit >= sp {
@@ -1101,6 +1263,70 @@ impl Engine {
             }
         };
         (ending, settled)
+    }
+}
+
+impl Engine {
+    /// A bet settled: the UI hears of it, and auto vault counts its profit.
+    fn settled(&self, rec: &BetRecord) {
+        self.emit(Event::Bet(rec.clone()));
+        let deposit = {
+            let mut v = self.vault.lock();
+            let Some(policy) = v.0.clone() else { return };
+            if !rec.currency.eq_ignore_ascii_case(&policy.currency) || policy.step <= 0 {
+                return;
+            }
+            v.1 += rec.profit;
+            let since = v.1;
+            let amount = (since as f64 * policy.pct.clamp(0.0, 100.0) / 100.0).floor() as Units;
+            if since >= policy.step && amount > 0 {
+                v.1 = 0;
+                Some((policy.currency, amount))
+            } else {
+                None
+            }
+        };
+        self.emit(Event::VaultProgress(self.vault.lock().1));
+        let (Some((currency, amount)), Ok(casino)) = (deposit, self.casino()) else { return };
+        let (events, repaint) = (self.events.clone(), self.repaint.clone());
+        // off the bet lane: betting goes on while the deposit is made
+        tokio::spawn(async move {
+            let result = casino.vault_deposit(&currency, amount).await.map_err(|e| e.to_string());
+            if let Err(e) = &result {
+                tracing::warn!("vault deposit failed: {e}");
+            }
+            let _ = events.send(Event::Vaulted { currency, amount, result });
+            repaint();
+        });
+    }
+
+    /// A script's decision: its bet and target for the next bet, and its log lines.
+    fn apply_script(&self, cfg: &AutoConfig, sc: &ScriptConfig, d: &crate::script::Decision) {
+        {
+            let mut a = self.auto.lock();
+            a.stake = (d.bet * sc.per_unit).round() as Units;
+            if cfg.original.is_none() {
+                a.target = ((d.target * 100.0).round() / 100.0).clamp(cfg.target_range.0, cfg.target_range.1);
+            }
+        }
+        if !d.logs.is_empty() {
+            let at = SystemTime::now();
+            self.emit(Event::Script(d.logs.iter().map(|t| ScriptLine { at, text: t.clone(), error: false }).collect()));
+        }
+    }
+
+    fn script_error(&self, e: &str) {
+        tracing::warn!("script error: {e}");
+        self.emit(Event::Script(vec![ScriptLine { at: SystemTime::now(), text: e.to_string(), error: true }]));
+    }
+}
+
+/// How a run the script stopped reads.
+fn script_stopped(why: &str) -> String {
+    if why.trim().is_empty() {
+        "The script stopped the run".into()
+    } else {
+        format!("Script: {}", why.trim())
     }
 }
 

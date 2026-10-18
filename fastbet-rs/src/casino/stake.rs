@@ -46,6 +46,8 @@ const PROFILE: &str = "stake";
 const PROFILE_MANUAL: &str = "stake-cf";
 
 pub const DEFAULT_MIRROR: &str = "stake.com";
+/// Stake.us, the US sweepstakes site: one domain, no mirrors.
+pub const US_DOMAIN: &str = "stake.us";
 
 /// Stake and its official mirrors. Every one reaches the same account.
 pub const MIRRORS: &[&str] = &[
@@ -102,6 +104,8 @@ const FLAGS: &[(&str, &str, f64)] = &[
 const REWARDS: &str = "query FastbetRewards { claimableSelfServeBonuses { bonusCodeId code category availableAt } \
     user { id rakeback { enabled balances { currency availableAmount } } reload: faucet { id active claimInterval lastClaim expireAt value } } }";
 const CLAIM_RAKEBACK: &str = "mutation FastbetClaimRakeback { claimRakeback { id currency amount } }";
+/// The site's own vault deposit (`CreateVaultDeposit`), amount in coins.
+const VAULT_DEPOSIT: &str = "mutation FastbetVaultDeposit($currency: CurrencyEnum!, $amount: Float!) { createVaultDeposit(currency: $currency, amount: $amount) { id amount currency } }";
 /// The open challenges (Stake refuses the list in some regions).
 const CHALLENGES: &str = "query FastbetChallenges { challengeGlobalList(limit: 50, offset: 0, sort: prize) { id active targetMultiplier minBetUsd award currency \
     expireAt game { name slug thumbnailUrl providerGroup { name slug } groupGames { group { slug } } } } }";
@@ -236,6 +240,8 @@ struct Link {
 }
 
 pub struct Stake {
+    /// Stake.com, or Stake.us (fixed to its one domain).
+    id: CasinoId,
     token: Mutex<Option<String>>,
     mirror: Mutex<String>,
     clearance: Mutex<Option<Clearance>>,
@@ -267,8 +273,18 @@ pub struct Stake {
 
 impl Stake {
     pub fn spawn(setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
-        let mirror = setup.mirror.map(|m| normalize_mirror(&m)).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MIRROR.into());
+        let mirror = setup.mirror.clone().map(|m| normalize_mirror(&m)).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_MIRROR.into());
+        Self::start(CasinoId::Stake, mirror, setup, events)
+    }
+
+    /// Stake.us: the same API on stake.us.
+    pub fn spawn_us(setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
+        Self::start(CasinoId::StakeUs, US_DOMAIN.into(), setup, events)
+    }
+
+    fn start(id: CasinoId, mirror: String, setup: Setup, events: mpsc::UnboundedSender<CasinoEvent>) -> Arc<dyn Casino> {
         let me = Arc::new(Self {
+            id,
             token: Mutex::new(clean_token(setup.token)),
             mirror: Mutex::new(mirror),
             clearance: Mutex::new(setup.clearance.filter(Clearance::is_complete)),
@@ -361,9 +377,10 @@ impl Stake {
             Some(c) => {
                 let cookies = c.cookies().into_iter().map(|(name, value)| BridgeCookie { name, value, domain: format!(".{mirror}") }).collect();
                 let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies };
-                Bridge::open_with(&page, Some(PROFILE_MANUAL), &setup).await?
+                Bridge::open_with(&page, Some(if self.id == CasinoId::StakeUs { "stakeus-cf" } else { PROFILE_MANUAL }), &setup).await?
             }
-            None => Bridge::open_profile(&page, Some(PROFILE)).await?,
+            // Stake.us keeps its own cookies, apart from Stake.com's
+            None => Bridge::open_profile(&page, Some(if self.id == CasinoId::StakeUs { "stakeus" } else { PROFILE })).await?,
         };
         let link = Link { gen: self.link_gen.fetch_add(1, Ordering::SeqCst) + 1, transport: Transport::Bridge(bridge), origin };
         self.broken_flag.store(false, Ordering::SeqCst);
@@ -478,7 +495,8 @@ impl Stake {
         let price = self.market.lock().currencies.get(&cur).map(|i| i.price).unwrap_or(0.0);
         if price > 0.0 {
             price
-        } else if matches!(cur.as_str(), "usdt" | "usdc" | "usd") {
+        } else if matches!(cur.as_str(), "usdt" | "usdc" | "usd" | "sweeps") {
+            // Stake.us Sweeps Coins redeem one for one
             1.0
         } else {
             0.0
@@ -763,7 +781,7 @@ impl Stake {
 #[async_trait]
 impl Casino for Stake {
     fn id(&self) -> CasinoId {
-        CasinoId::Stake
+        self.id
     }
 
     /// Rakeback claims here; the reload and the weekly / monthly bonuses only on Stake itself,
@@ -791,12 +809,29 @@ impl Casino for Stake {
         Ok(challenges_of(&data, &|c: &str| self.usd_price(c)))
     }
 
+    async fn vault_deposit(&self, currency: &str, amount: Units) -> Result<(), CasinoError> {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Err(CasinoError::NotConnected);
+        }
+        let vars = json!({ "currency": currency.to_ascii_lowercase(), "amount": to_f64(amount, DECIMALS) });
+        let data = self.gql(VAULT_DEPOSIT, vars, true).await?;
+        if data.pointer("/createVaultDeposit/id").is_none() {
+            return Err(CasinoError::BadReply(data.to_string().chars().take(200).collect()));
+        }
+        self.refresh_me().await;
+        Ok(())
+    }
+
     fn set_token(&self, token: Option<String>) {
         *self.token.lock() = clean_token(token);
         self.wake.notify_one();
     }
 
     fn set_mirror(&self, mirror: &str) {
+        // Stake.us has one domain
+        if self.id == CasinoId::StakeUs {
+            return;
+        }
         let m = normalize_mirror(mirror);
         if m.is_empty() {
             return;

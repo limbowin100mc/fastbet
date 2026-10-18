@@ -1,9 +1,14 @@
 [package]
 name = "fastbet"
-version = "3.16.1"
+version = "3.17.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false
+
+# The app is a library: the PC exe (src/main.rs) and the Android app (android/) both run it.
+[lib]
+name = "fastbet"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fastbet"
@@ -31,20 +36,20 @@ parking_lot = "0.12"
 thiserror = "2"
 
 # http + images (slot providers, game tiles)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking", "cookies", "multipart"] }
+# the app icon as the Discord webhook's picture (a data URI)
+base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # casino logos (bundled SVGs, rasterised at the size they're drawn) and the hit card (text in Saira)
 resvg = { version = "0.48", default-features = false, features = ["text"] }
 
-# embedded login window (child process)
-wry = "0.57"
-tao = "0.37"
 
 # sound: the hit ding, or the user's own sound file (or a video's sound), decoded by symphonia
 rodio = { version = "0.20", default-features = false }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "adpcm", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
-# file picker (Settings → Sound)
-rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
+
+# Code Mode: the user's strategy scripts, in JavaScript (pure Rust, no C compiler needed)
+boa_engine = { version = "0.22", default-features = false }
 
 # logging
 tracing = "0.1"
@@ -57,6 +62,19 @@ embed-resource = "3.0"
 [target.'cfg(unix)'.dependencies]
 # local time zone for bet history times
 libc = "0.2"
+
+# PC only: the login window and the browser bridge (child processes), the file picker
+[target.'cfg(not(target_os = "android"))'.dependencies]
+wry = "0.57"
+tao = "0.37"
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
+
+# Android: the app runs inside Google's GameActivity (android/ has the Java side)
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.35", features = ["android-game-activity"] }
+winit = { version = "0.30", features = ["android-game-activity"] }
+# calls into the activity's Java side (the clipboard)
+jni = "0.21"
 
 # Installers, built by .github/workflows/release.yml with cargo-packager:
 # NSIS setup .exe on Windows, .deb and AppImage on Linux.

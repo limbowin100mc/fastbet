@@ -3,7 +3,9 @@
 
 pub mod accounts;
 pub mod challenges;
+pub mod code;
 pub mod coins;
+pub mod conditions;
 pub mod controls;
 pub mod hitcard;
 pub mod hits;
@@ -13,6 +15,10 @@ pub mod lobby;
 pub mod logos;
 pub mod original;
 pub mod originals;
+#[cfg(target_os = "android")]
+pub mod keyboard;
+#[cfg(target_os = "android")]
+pub mod paste;
 pub mod prefs;
 pub mod rewards;
 pub mod slot;
@@ -74,10 +80,26 @@ pub enum Stage {
     Login(LoginSession),
 }
 
+/// What auto vault has done this session.
+#[derive(Default)]
+pub struct VaultView {
+    /// Put away, per currency.
+    pub total: std::collections::BTreeMap<String, Units>,
+    pub deposits: u32,
+    /// Profit counted toward the next deposit.
+    pub since: Units,
+}
+
 pub struct App {
     pub settings: Settings,
     engine: EngineHandle,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    /// The phone's hold-to-paste bubble for text fields.
+    #[cfg(target_os = "android")]
+    paste: paste::Paste,
+    /// What the phone's keyboard types into the focused text field.
+    #[cfg(target_os = "android")]
+    keyboard: keyboard::Keyboard,
 
     pub screen: Screen,
     pub stage: Stage,
@@ -146,6 +168,7 @@ pub struct App {
     /// Settings → Storage: sizes on disk, and clearing.
     pub storage: prefs::StorageView,
     pub sound_view: prefs::SoundView,
+    pub alerts_view: prefs::AlertsView,
     /// The seed name field has the focus: the name is only used once typing is done.
     pub seed_name_editing: bool,
     /// The client seed the engine was last given.
@@ -175,6 +198,13 @@ pub struct App {
 
     // originals
     pub orig: originals::State,
+
+    /// Code Mode's console and editor state.
+    pub code: code::State,
+
+    /// Auto vault: the rule the engine was last given, and what it has put away this session.
+    vault_sent: Option<Option<engine::VaultPolicy>>,
+    pub vault: VaultView,
 
     // VIP level, rewards and slot challenges (casinos that have them)
     pub vip: Option<crate::casino::VipStatus>,
@@ -231,6 +261,10 @@ impl App {
             settings,
             engine,
             repaint,
+            #[cfg(target_os = "android")]
+            paste: paste::Paste::default(),
+            #[cfg(target_os = "android")]
+            keyboard: keyboard::Keyboard::default(),
             screen,
             stage: Stage::Idle,
             onboard_error: None,
@@ -276,14 +310,16 @@ impl App {
             update_open: false,
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
-            // FASTBET_PREFS=storage / sound opens it on that page
+            // FASTBET_PREFS=storage / sound / alerts opens it on that page
             prefs_tab: match std::env::var("FASTBET_PREFS").as_deref() {
                 Ok("storage") => prefs::Tab::Storage,
                 Ok("sound") => prefs::Tab::Sound,
+                Ok("alerts") => prefs::Tab::Alerts,
                 _ => prefs::Tab::default(),
             },
             storage: prefs::StorageView::default(),
             sound_view: prefs::SoundView::default(),
+            alerts_view: Default::default(),
             seed_name_editing: false,
             seed_sent: None,
             seed_applied: None,
@@ -301,6 +337,9 @@ impl App {
             slot_stats: Stats::fresh("USD", 2),
             slot_pop: None,
             orig: originals::State::default(),
+            code: Default::default(),
+            vault_sent: None,
+            vault: VaultView::default(),
             vip: None,
             // FASTBET_VIP=1: the VIP dropdown opens at start (UI work)
             vip_open: std::env::var("FASTBET_VIP").is_ok(),
@@ -359,6 +398,10 @@ impl App {
         // FASTBET_UPDATE=1: run "Check for updates" at start (UI work)
         if std::env::var("FASTBET_UPDATE").is_ok() {
             app.check_updates();
+        }
+        // FASTBET_LOGIN=1: open the active account's login window at start (testing a casino's login)
+        if std::env::var("FASTBET_LOGIN").is_ok() {
+            app.start_login();
         }
         app
     }
@@ -466,8 +509,10 @@ impl App {
     }
 
     /// Amounts are shown and typed in fiat (see [`App::fiat`]) rather than in the coin.
+    /// Amounts are typed and shown in fiat: the unit picked, for a coin that has a price
+    /// (Stake.us Gold Coins have none, so they stay in coins).
     pub fn fiat_mode(&self) -> bool {
-        self.settings.unit == Unit::Fiat
+        self.settings.unit == Unit::Fiat && !self.info(&self.active_currency()).is_some_and(|i| i.price <= 0.0)
     }
 
     /// The fiat amounts are in: the one picked in the wallet when this casino offers it, else USD.
@@ -655,17 +700,19 @@ impl App {
             Ok(v) => v,
             Err(e) => return self.flash(e),
         };
-        let cfg = match self.auto_config(cur, amount, target) {
+        let cfg = match self.auto_config(cur, amount, target, true) {
             Ok(c) => c,
             Err(e) => return self.flash(e),
         };
         self.hit_badge_n = None;
         self.flash = None;
+        self.code_run_started(&cfg);
         self.engine.send(Command::StartAuto(cfg));
     }
 
-    /// An auto run from the panel's strategy, stops and limits, betting `amount` on Limbo's `target`.
-    fn auto_config(&self, cur: String, amount: Units, target: f64) -> Result<AutoConfig, String> {
+    /// An auto run from the panel's strategy, stops and limits, betting `amount` on Limbo's `target`
+    /// (`limbo` false: an original's run, where the rules have no target to change).
+    fn auto_config(&self, cur: String, amount: Units, target: f64, limbo: bool) -> Result<AutoConfig, String> {
         let s = &self.settings;
         let opt = |v: &str, name: &str| -> Result<Option<Units>, String> {
             if v.trim().is_empty() {
@@ -686,6 +733,24 @@ impl App {
             }
         }
         let pct = |a: Adjust, v: &str| if a == Adjust::Increase { Some(money::num(v).unwrap_or(0.0)) } else { None };
+        let script = (s.strategy == crate::settings::Strategy::Code).then(|| {
+            let per_unit = self.to_base("1", &cur).filter(|u| *u > 0).ok_or("Currency data not loaded yet")?;
+            let unit = if self.fiat_mode() { self.fiat().to_uppercase() } else { cur.to_uppercase() };
+            Ok::<_, String>(engine::ScriptConfig { code: s.script.clone(), per_unit: per_unit as f64, unit, game: "limbo".into() })
+        });
+        let script = script.transpose()?;
+        let (on_win, on_loss, rules) = match s.strategy {
+            crate::settings::Strategy::Code => (None, None, vec![]),
+            crate::settings::Strategy::Conditions => {
+                let rules = crate::rules::compile(&s.rules, |v| self.to_base(v, &cur), limbo)?;
+                if rules.is_empty() {
+                    return Err("Add a condition first (or switch one on)".into());
+                }
+                (None, None, rules)
+            }
+            _ => (pct(s.on_win, &s.on_win_pct), pct(s.on_loss, &s.on_loss_pct), vec![]),
+        };
+        let id = self.casino();
         Ok(AutoConfig {
             currency: cur,
             target,
@@ -693,17 +758,121 @@ impl App {
             base: amount,
             limit: s.count.trim().parse().unwrap_or(0),
             delay_ms: money::num(&s.delay).unwrap_or(0.0).max(0.0) as u64,
-            on_win: pct(s.on_win, &s.on_win_pct),
-            on_loss: pct(s.on_loss, &s.on_loss_pct),
+            on_win,
+            on_loss,
             stop_profit,
             stop_loss,
             max_bet,
             hit_line: self.hit_line(target),
+            rules,
+            target_range: (id.min_target(), id.max_target()),
+            script,
         })
     }
 
     pub fn stop_auto(&mut self) {
         self.engine.send(Command::StopAuto);
+    }
+
+    /// Where alerts go, as Settings → Alerts has them.
+    pub fn alert_targets(&self) -> crate::alerts::Targets {
+        let s = &self.settings;
+        let tg = crate::alerts::telegram_token_ok(&s.alert_tg_token) && !s.alert_tg_chat.trim().is_empty();
+        crate::alerts::Targets {
+            telegram: tg.then(|| (s.alert_tg_token.trim().to_string(), s.alert_tg_chat.trim().to_string())),
+            discord: crate::alerts::discord_url_ok(&s.alert_discord).then(|| s.alert_discord.trim().to_string()),
+        }
+    }
+
+    /// Sends an alert, when its kind is switched on.
+    pub fn alert(&self, kind: crate::alerts::Kind, title: String, lines: Vec<String>) {
+        self.alert_with(kind, title, lines, None);
+    }
+
+    /// [`App::alert`] with a hit card attached.
+    pub fn alert_with(&self, kind: crate::alerts::Kind, title: String, lines: Vec<String>, picture: Option<crate::alerts::Picture>) {
+        use crate::alerts::Kind;
+        let s = &self.settings;
+        let on = match kind {
+            Kind::Hit => s.alert_hits,
+            Kind::RunEnded => s.alert_runs,
+            Kind::Vault => s.alert_vault,
+            Kind::Test => true,
+        };
+        if on {
+            crate::alerts::send(self.alert_targets(), crate::alerts::Alert { kind, title, lines, picture }, None);
+        }
+    }
+
+    /// "Limbo on Stake · Hound971".
+    pub fn alert_where(&self, game: &str) -> String {
+        let who = self.settings.active().and_then(|a| a.username.clone()).map(|u| format!("  ·  {u}")).unwrap_or_default();
+        format!("{game} on {}{who}", self.casino().name())
+    }
+
+    fn session_line(&self) -> String {
+        let cur = self.active_currency();
+        format!("Session {}  ·  {} bets", self.prim(self.stats.profit, &cur, true), money::group_thousands(&self.stats.bets.to_string()))
+    }
+
+    /// Bet `n` hit: its alert carries its card.
+    fn alert_hit(&self, n: u64, rec: &BetRecord) {
+        if !self.alert_targets().any() || !self.settings.alert_hits {
+            return;
+        }
+        let game = rec.game.map(|g| self.casino().original_name(g)).unwrap_or("Limbo");
+        let lines = vec![
+            self.alert_where(game),
+            format!("Bet {}  ·  profit {}", self.prim(rec.amount, &rec.currency, false), self.prim(rec.profit, &rec.currency, true)),
+            self.session_line(),
+        ];
+        let h = hits::bet_hit(self, n, rec);
+        let picture = crate::alerts::Picture { card: h.card(), art: h.art };
+        self.alert_with(crate::alerts::Kind::Hit, format!("HIT {}", money::fmt_multi(rec.outcome)), lines, Some(picture));
+    }
+
+    /// A run ended by itself (Stop is the user's own doing, and a hit has its own alert).
+    fn alert_run_end(&self, a: &AutoState) {
+        if a.msg.is_empty() || a.msg == "Stopped" || a.msg.starts_with("HIT") || !self.alert_targets().any() {
+            return;
+        }
+        let game = match self.screen {
+            Screen::Original(g) => self.casino().original_name(g),
+            _ => "Limbo",
+        };
+        let cur = self.active_currency();
+        let lines = vec![
+            self.alert_where(game),
+            format!("Run {}  ·  {} bets", self.prim(a.profit, &cur, true), money::group_thousands(&a.done.to_string())),
+            self.session_line(),
+        ];
+        self.alert(crate::alerts::Kind::RunEnded, format!("Run ended: {}", a.msg), lines);
+    }
+
+    /// The auto run is Code Mode's: the page shows the script, not the stage.
+    pub fn code_mode(&self) -> bool {
+        self.settings.mode == crate::settings::Mode::Auto && self.settings.strategy == crate::settings::Strategy::Code
+    }
+
+    /// A Code Mode run is starting: the console marks it.
+    fn code_run_started(&mut self, cfg: &AutoConfig) {
+        if cfg.script.is_some() {
+            self.code.undo = None;
+            self.code.status = None;
+            self.code.running = true;
+            self.code.push(vec![engine::ScriptLine { at: std::time::SystemTime::now(), text: "Run started".into(), error: false }]);
+        }
+    }
+
+    /// The auto strategy changes each bet from the last one's result, so bets go one at a time
+    /// whatever the async setting (`limbo`: target rules count too).
+    pub fn strategy_sequential(&self, limbo: bool) -> bool {
+        let s = &self.settings;
+        match s.strategy {
+            crate::settings::Strategy::Conditions => crate::rules::compile(&s.rules, |_| Some(0), limbo).is_ok_and(|r| r.iter().any(|r| r.action.progressive())),
+            crate::settings::Strategy::Code => true,
+            _ => s.on_win == Adjust::Increase || s.on_loss == Adjust::Increase,
+        }
     }
 
     // ------------------------------------------------------------ originals
@@ -789,11 +958,14 @@ impl App {
             Ok(v) => v,
             Err(e) => return self.flash(e),
         };
-        let mut cfg = match self.auto_config(cur, amount, 0.0) {
+        let mut cfg = match self.auto_config(cur, amount, 0.0, false) {
             Ok(c) => c,
             Err(e) => return self.flash(e),
         };
         cfg.original = Some((game, params));
+        if let Some(sc) = &mut cfg.script {
+            sc.game = game.slug().to_string();
+        }
         cfg.hit_line = self.orig_hit_line();
         // HiLo's Stop takes the winnings and ends the run: a hit
         if let Some(stop) = originals::stop_line(self, game) {
@@ -801,6 +973,7 @@ impl App {
         }
         self.hit_badge_n = None;
         self.flash = None;
+        self.code_run_started(&cfg);
         self.engine.send(Command::StartAuto(cfg));
     }
 
@@ -897,6 +1070,27 @@ impl App {
         self.settings.restart_on_error = on_error;
         self.mark_dirty();
         self.engine.send(Command::ForceRestart { always, on_error });
+    }
+
+    /// Auto vault's rule as the settings have it, for the coin in use (none when off, or where
+    /// the casino has no vault).
+    pub fn vault_policy(&self) -> Option<engine::VaultPolicy> {
+        let s = &self.settings;
+        if !s.vault_on || !self.casino().has_vault() || !self.ready() {
+            return None;
+        }
+        let currency = self.active_currency();
+        let step = self.to_base(&s.vault_every, &currency).filter(|v| *v > 0)?;
+        let pct = money::num(&s.vault_pct).filter(|p| *p > 0.0)?.min(100.0);
+        Some(engine::VaultPolicy { currency, step, pct })
+    }
+
+    fn sync_vault(&mut self) {
+        let want = self.vault_policy();
+        if self.vault_sent.as_ref() != Some(&want) {
+            self.vault_sent = Some(want.clone());
+            self.engine.send(Command::Vault(want));
+        }
     }
 
     pub fn sync_concurrency(&mut self) {
@@ -1383,6 +1577,12 @@ impl App {
         }
         if rec.hit {
             self.hit_sound();
+            let game = self.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "A slot".into());
+            let cur = rec.currency.clone();
+            let money = |v: i64| crate::slots::fmt_money(v, &cur, rec.decimals);
+            let lines = vec![self.alert_where(&game), format!("Spin {}  ·  won {}", money(rec.cost), money(rec.win))];
+            let picture = hits::spin_hit(self, n, &rec).map(|h| crate::alerts::Picture { card: h.card(), art: h.art });
+            self.alert_with(crate::alerts::Kind::Hit, format!("HIT {:.2}×", rec.multiplier), lines, picture);
         }
         self.spins.push_front(rec);
         if self.spins.len() > 500 {
@@ -1526,6 +1726,9 @@ impl App {
                     let n = self.history.push_bet(rec);
                     if let Some(r) = hit_rec {
                         hits::record_bet(self, n, &r);
+                        if hit {
+                            self.alert_hit(n, &r);
+                        }
                     }
                     if hit {
                         self.hit_badge_n = Some(n);
@@ -1545,9 +1748,33 @@ impl App {
                     if self.auto.running && !a.running && a.msg == engine::STOPPED_ON_WIN {
                         self.hit_sound();
                     }
+                    if self.auto.running && !a.running {
+                        self.alert_run_end(&a);
+                    }
+                    // Code Mode: the console says how the run ended (a script error says it already)
+                    if self.code.running && !a.running {
+                        self.code.running = false;
+                        if !a.msg.starts_with("Script error") {
+                            self.code.ended(&a.msg);
+                        }
+                    }
                     self.auto = a;
                 }
                 Event::Flash(m) => self.flash(m),
+                Event::Script(lines) => self.code.push(lines),
+                Event::VaultProgress(since) => self.vault.since = since,
+                Event::Vaulted { currency, amount, result } => match result {
+                    Ok(()) => {
+                        *self.vault.total.entry(currency.clone()).or_default() += amount;
+                        self.vault.deposits += 1;
+                        let shown = self.prim(amount, &currency, false);
+                        self.notice = Some((format!("Moved {shown} to the vault"), Instant::now()));
+                        let total = self.vault.total.get(&currency).copied().unwrap_or(0);
+                        let lines = vec![self.alert_where("Auto vault"), format!("{} put away this session", self.prim(total, &currency, false))];
+                        self.alert(crate::alerts::Kind::Vault, format!("Moved {shown} to the vault"), lines);
+                    }
+                    Err(e) => self.flash(format!("Vault deposit failed: {e}")),
+                },
                 Event::Slots { kind, skip, producer, games, error } => {
                     self.catalog.loading = self.catalog.loading.saturating_sub(1);
                     self.catalog.error = error.filter(|e| !e.contains("Not connected"));
@@ -1921,6 +2148,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.sync_own_seed();
+        self.sync_vault();
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
             self.go_lobby();
         }
@@ -1972,7 +2200,15 @@ impl eframe::App for App {
         }
     }
 
+    #[cfg(target_os = "android")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.keyboard.feed(ctx, raw_input);
+        self.paste.feed(raw_input);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        self.paste.show(ui.ctx());
         egui::Panel::top("titlebar")
             .exact_size(titlebar::HEIGHT)
             .frame(Frame::new().fill(BG))

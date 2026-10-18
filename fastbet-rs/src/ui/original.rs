@@ -9,7 +9,7 @@ use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Marg
 use super::originals::{self, times};
 use super::stats::{clock, HistEntry};
 use super::theme::{self, alpha, BG, BG1, DIM, GOLD, GREEN, LINE, MUTED, RED, STAGE, TEXT, TEXT2};
-use super::widgets::{self, button, button_key, tab_bar, Btn};
+use super::widgets::{self, button, button_key, Btn};
 use super::{controls, App};
 use crate::money::{fmt_int, fmt_time};
 use crate::originals::{dragon_multiplier, Game, Round, Step};
@@ -89,7 +89,11 @@ pub fn show(app: &mut App, ui: &mut Ui, game: Game) {
             let inner = rect.shrink(6.0);
             let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
             bui.set_clip_rect(inner);
-            originals::board(app, &mut bui, game, inner);
+            if app.code_mode() && game.auto() {
+                super::code::panel(app, &mut bui, inner, game.slug());
+            } else {
+                originals::board(app, &mut bui, game, inner);
+            }
             stage_badges(app, ui, game, rect);
             table(app, ui, game);
         });
@@ -100,19 +104,7 @@ fn header(app: &mut App, ui: &mut Ui, game: Game) {
     let running = app.auto.running;
     let open = app.orig.open(game).cloned();
     let busy = app.orig.busy.contains(&game);
-    if game.auto() {
-        let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
-        let right_w = if running { 360.0 } else { 170.0 };
-        let tabs_w = 236.0;
-        let x = (cx - tabs_w / 2.0).min(hr.right() - right_w - tabs_w - 12.0);
-        let tabs_rect = Rect::from_min_size(pos2(x, hr.center().y - 18.0), vec2(tabs_w, 36.0));
-        let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(tabs_rect).layout(Layout::left_to_right(Align::Center)));
-        let sel = if app.settings.mode == Mode::Auto { 1 } else { 0 };
-        if let Some(i) = tab_bar(&mut tabs_ui, &["Manual Bet", "Automatic"], sel, !running && open.is_none()) {
-            app.settings.mode = if i == 1 { Mode::Auto } else { Mode::Manual };
-            app.mark_dirty();
-        }
-    }
+    let (mut left, mut right) = (hr.left(), hr.right());
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(widgets::bold(app.casino().original_name(game), 21.0, TEXT));
@@ -124,13 +116,14 @@ fn header(app: &mut App, ui: &mut Ui, game: Game) {
         widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
         widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
         let runs_async = !game.has_steps() || app.casino().auto_settles(game);
-        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && game.auto() && runs_async {
+        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && game.auto() && runs_async && !app.strategy_sequential(false) {
             widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
                 .on_hover_text("Bets in flight at once. Set it under Bets, delay & async.");
         }
         controls::restarts_chip(app, ui);
+        left = ui.min_rect().right();
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if running {
                 if button(ui, "Stop", Btn::Danger, true, Some(84.0)).clicked() {
@@ -163,8 +156,15 @@ fn header(app: &mut App, ui: &mut Ui, game: Game) {
                     app.orig_bet(game);
                 }
             }
-        });
+        })
+        .response
+        .rect
+        .left();
     });
+    if game.auto() {
+        let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
+        controls::mode_tabs(app, ui, cx, left, right, !running && open.is_none());
+    }
 }
 
 fn settings(app: &mut App, ui: &mut Ui, game: Game) {
@@ -179,11 +179,12 @@ fn settings(app: &mut App, ui: &mut Ui, game: Game) {
             let help = originals::help(app.casino(), game);
             widgets::card(ui, w, app.casino().original_name(game), Some(&help), None, |ui| originals::params(app, ui, game, app.auto.running));
             if app.settings.mode == Mode::Auto && game.auto() {
-                controls::strategy(app, ui, w);
+                controls::auto_strategy(app, ui, w, false);
                 controls::bets_and_speed(app, ui, w);
                 controls::stops(app, ui, w);
                 controls::force_restart(app, ui, w);
             }
+            controls::vault(app, ui, w);
             controls::seed(app, ui, w);
             controls::notifications(app, ui, w);
         });
