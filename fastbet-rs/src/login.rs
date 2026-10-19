@@ -170,7 +170,7 @@ fn cookie_token(webview: &wry::WebView, url: &str, name: &str) -> String {
     }
 }
 
-/// A login that is several cookies (Housebets): the ones in `names`, from the cookies sent to
+/// A login that is several cookies (Housebets, Degen): the ones in `names`, from the cookies sent to
 /// any of `urls`, with the page's User Agent (`ua` in its report), as one token
 /// `{"cookies": "name=value; …", "ua": …}`; logged in once the first of them is there.
 fn jar_token(webview: &wry::WebView, urls: &[&str], names: &[&str], report: &str) -> String {
