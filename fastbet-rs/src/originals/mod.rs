@@ -486,7 +486,7 @@ pub fn dice_target(chance: f64, over: bool) -> f64 {
 }
 
 /// Blitz: cards drawn per bet.
-pub const BLITZ_PICKS: (u32, u32) = (5, 36);
+pub const BLITZ_PICKS: (u32, u32) = (1, 36);
 
 /// Blitz: pays when `picks` cards from an endless 52-card deck are all different (2% edge).
 pub fn blitz_multiplier(picks: u32) -> f64 {
@@ -500,6 +500,7 @@ pub fn blitz_multiplier(picks: u32) -> f64 {
 
 /// Blitz card index (0–51) -> (rank, suit) as the cards are drawn: twos first, aces last,
 /// suits in diamonds, hearts, spades, clubs order.
+#[cfg(test)]
 pub fn blitz_card(index: u32) -> (&'static str, &'static str) {
     const RANKS: [&str; 13] = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"];
     const SUITS: [&str; 4] = ["D", "H", "S", "C"];

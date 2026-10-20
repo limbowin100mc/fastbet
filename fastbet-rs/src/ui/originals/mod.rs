@@ -34,6 +34,7 @@ mod wheel;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use egui::emath::GuiRounding as _;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui};
 use serde_json::Value;
 
@@ -326,6 +327,17 @@ pub fn times(m: f64) -> String {
     }
 }
 
+/// Multiplier short enough for a tile: "22.61×", "2.74K×", "181.06K×", "1.25M×".
+pub fn times_short(m: f64) -> String {
+    if m >= 1e6 {
+        format!("{:.2}M×", m / 1e6)
+    } else if m >= 1e3 {
+        format!("{:.2}K×", m / 1e3)
+    } else {
+        format!("{m:.2}×")
+    }
+}
+
 /// Multiplier with two decimals, thousands grouped: "3,203,384.80×".
 pub fn times_full(m: f64) -> String {
     format!("{}×", crate::money::group_thousands(&format!("{m:.2}")))
@@ -399,6 +411,18 @@ pub fn gem(p: &Painter, c: Pos2, size: f32, color: Color32) {
         Stroke::NONE,
     ));
     p.add(Shape::convex_polygon(vec![pos2(c.x - w * 0.55, top), pos2(c.x, top), pos2(c.x - w * 0.35, girdle), pos2(c.x - w, girdle)], light, Stroke::NONE));
+}
+
+/// FastBet's F, `size` tall, centred on `c`: a safe tile.
+pub fn mark(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let r = Rect::from_center_size(c, vec2(size, size)).round_to_pixels(p.ctx().pixels_per_point());
+    super::logos::paint_icon(p, r, super::logos::Icon::Mark, color);
+}
+
+/// FastBet's skull, `size` tall, centred on `c`: a missed tile.
+pub fn miss(p: &Painter, c: Pos2, size: f32, color: Color32) {
+    let r = Rect::from_center_size(c, vec2(size, size)).round_to_pixels(p.ctx().pixels_per_point());
+    super::logos::paint_icon(p, r, super::logos::Icon::Miss, color);
 }
 
 /// A round bomb with a fuse and a spark.

@@ -26,7 +26,7 @@ pub fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
 }
 
 /// Colour of the captions over fields: quieter than values, louder than notes.
-const LABEL: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb8);
+const LABEL: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xab);
 
 /// Small caption like "Bet size".
 pub fn caption(ui: &mut Ui, text: &str) {
@@ -219,29 +219,6 @@ pub fn shadow(p: &Painter, rect: Rect, radius: u8, offset_y: f32, blur: f32, str
     p.add(s.as_shape(rect, CornerRadius::same(radius)));
 }
 
-/// The FastBet mark: a bolt in a rounded square.
-pub fn logo_mark(ui: &mut Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-    paint_logo(ui, rect);
-}
-
-pub fn paint_logo(ui: &Ui, rect: Rect) {
-    let p = ui.painter();
-    let r = (rect.height() * 0.28) as u8;
-    gradient_rect(p, rect, r, [G2, mix(G1, G2, 0.4), G1, mix(G1, INK, 0.12)]);
-    let pts = [(13.2, 2.0), (4.0, 13.6), (10.6, 13.6), (9.8, 22.0), (20.0, 9.9), (13.3, 9.9)];
-    let s = rect.height() / 24.0 * 0.76;
-    let o = rect.center() - vec2(12.0 * s, 12.0 * s);
-    let mut mesh = egui::Mesh::default();
-    for (x, y) in pts {
-        mesh.colored_vertex(o + vec2(x * s, y * s), INK);
-    }
-    for (a, b, c) in [(2, 3, 4), (2, 4, 5), (2, 5, 0), (2, 0, 1)] {
-        mesh.add_triangle(a, b, c);
-    }
-    p.add(egui::Shape::mesh(mesh));
-}
-
 /// Wordmark: "FASTBET" in a red-to-yellow gradient, letters `height` points tall.
 /// Its glow spills past the space it takes.
 pub fn wordmark(ui: &mut Ui, height: f32) {
@@ -310,7 +287,7 @@ pub fn meta_chip(ui: &mut Ui, icon_name: &str, text: &str, color: Color32) -> Re
     let w = tw + if has_icon { 38.0 } else { 20.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
     let p = ui.painter();
-    p.rect(rect, CornerRadius::same(RADIUS), BG1, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    p.rect_filled(rect, CornerRadius::same(RADIUS), BG1);
     let mut x = rect.left() + 10.0;
     if has_icon {
         let ir = Rect::from_center_size(pos2(x + 6.0, rect.center().y), vec2(12.0, 12.0));
@@ -344,12 +321,24 @@ pub fn button(ui: &mut Ui, text: &str, kind: Btn, enabled: bool, width: Option<f
 
 /// Button with an optional keyboard hint drawn as a keycap after the label.
 pub fn button_key(ui: &mut Ui, text: &str, key: Option<&str>, kind: Btn, enabled: bool, width: Option<f32>) -> Response {
-    let font = theme::font_bold(13.0);
+    button_sized(ui, text, key, kind, enabled, width, FIELD_H)
+}
+
+/// Height of [`action_button`].
+pub const ACTION_H: f32 = 44.0;
+
+/// The page's main action (Bet, Start, Cash out): a taller button with a larger label.
+pub fn action_button(ui: &mut Ui, text: &str, key: Option<&str>, kind: Btn, enabled: bool, width: f32) -> Response {
+    button_sized(ui, text, key, kind, enabled, Some(width), ACTION_H)
+}
+
+fn button_sized(ui: &mut Ui, text: &str, key: Option<&str>, kind: Btn, enabled: bool, width: Option<f32>, height: f32) -> Response {
+    let font = theme::font_bold(if height > FIELD_H { 14.5 } else { 13.0 });
     let measure = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_string(), f, TEXT).size().x;
     let text_w = measure(text, font.clone());
     let key_w = key.map(|k| measure(k, theme::font_semi(10.0)) + 12.0).unwrap_or(0.0);
     let content_w = text_w + if key.is_some() { key_w + 8.0 } else { 0.0 };
-    let size = vec2(width.unwrap_or(content_w + 32.0).max(content_w + 20.0), FIELD_H);
+    let size = vec2(width.unwrap_or(content_w + 32.0).max(content_w + 20.0), height);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let hovered = resp.hovered() && enabled;
     let pressed = resp.is_pointer_button_down_on() && enabled;
@@ -393,13 +382,13 @@ pub fn chip_button_sized(ui: &mut Ui, text: &str, on: bool, enabled: bool, size:
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     let (fill, stroke, fg) = if on {
-        (alpha(G1, 26), alpha(G1, 120), G1)
+        (alpha(G1, 26), Stroke::new(1.0, alpha(G1, 120)), G1)
     } else if resp.hovered() && enabled {
-        (BG3, LINE2, TEXT)
+        (BG3, Stroke::NONE, TEXT)
     } else {
-        (BG2, LINE, if enabled { TEXT2 } else { DIM })
+        (BG2, Stroke::NONE, if enabled { TEXT2 } else { DIM })
     };
-    p.rect(rect, CornerRadius::same(RADIUS_SM), fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+    p.rect(rect, CornerRadius::same(RADIUS_SM), fill, stroke, StrokeKind::Inside);
     p.text(rect.center(), Align2::CENTER_CENTER, text, theme::font_semi(11.5), fg);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -480,12 +469,11 @@ pub fn section(ui: &mut Ui, width: f32, title: &str, active: bool, open: &mut bo
     fold(ui, width, title, "", active, open, add);
 }
 
-/// The surface every settings card sits on.
+/// The surface every settings card sits on: a step lighter than the page, no outline.
 fn card_frame(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui, f32)) {
     ui.set_max_width(width);
     Frame::new()
         .fill(BG1)
-        .stroke(Stroke::new(1.0, LINE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
@@ -533,45 +521,93 @@ pub fn card(ui: &mut Ui, width: f32, title: &str, help: Option<&str>, right: Opt
     });
 }
 
-/// A settings card that folds away. Its header says what is set (`summary`, green while
-/// `active`), so a closed card still shows its state.
-pub fn fold(ui: &mut Ui, width: f32, title: &str, summary: &str, active: bool, open: &mut bool, add: impl FnOnce(&mut Ui)) {
+thread_local! {
+    /// Set while a [`fold_list`] draws its rows: whether the next fold is its first.
+    static FOLD_LIST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Settings that fold away, as the rows of one card with hairlines between them. The folds
+/// `add` draws (it gets the card's inner width) become its rows.
+pub fn fold_list(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui, f32)) {
     card_frame(ui, width, |ui, inner_w| {
-        let (rect, resp) = ui.allocate_exact_size(vec2(inner_w, 42.0), Sense::click());
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if resp.clicked() {
-            *open = !*open;
-        }
-        let t = ui.ctx().animate_bool_with_time(resp.id.with("open"), *open, 0.12);
-        let p = ui.painter();
-        if resp.hovered() {
-            let r = if *open { CornerRadius { nw: 11, ne: 11, sw: 0, se: 0 } } else { CornerRadius::same(11) };
-            p.rect_filled(rect.shrink(1.0), r, alpha(Color32::WHITE, 5));
-        }
-        let font = theme::font_semi(13.0);
-        let title_w = p.layout_no_wrap(title.to_string(), font.clone(), TEXT).size().x;
-        p.text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, title, font, if *open || resp.hovered() { TEXT } else { TEXT2 });
-        // chevron flips between down (closed) and up (open)
-        let c = pos2(rect.right() - 18.0, rect.center().y);
-        let dy = 2.2 - 4.4 * t;
-        let pts = [c + vec2(-4.5, -dy), c + vec2(0.0, dy), c + vec2(4.5, -dy)];
-        p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
-        if summary.is_empty() {
-            if active {
-                let c = pos2(rect.left() + 14.0 + title_w + 10.0, rect.center().y);
-                p.circle_filled(c, 5.5, alpha(G1, 40));
-                p.circle_filled(c, 3.0, G1);
-            }
-        } else {
-            // the state, right-aligned before the chevron, cut short rather than overlap the title
-            let room = rect.width() - title_w - 14.0 - 40.0 - 16.0;
-            let color = if active { G2 } else { DIM };
-            fit_text(p, pos2(rect.right() - 34.0, rect.center().y), Align2::RIGHT_CENTER, summary, theme::font_semi(11.5), color, room.max(40.0));
-        }
-        if *open {
-            card_body(ui, inner_w, add);
-        }
+        let outer = FOLD_LIST.replace(Some(true));
+        add(ui, inner_w);
+        FOLD_LIST.set(outer);
     });
+}
+
+/// A settings card that folds away. Its header says what is set (`summary`, green while
+/// `active`), so a closed card still shows its state. Inside a [`fold_list`] it is one of the
+/// list's rows instead of a card of its own.
+pub fn fold(ui: &mut Ui, width: f32, title: &str, summary: &str, active: bool, open: &mut bool, add: impl FnOnce(&mut Ui)) {
+    match FOLD_LIST.get() {
+        Some(first) => {
+            FOLD_LIST.set(Some(false));
+            fold_row(ui, width, Some(!first), title, summary, active, open, add);
+        }
+        None => card_frame(ui, width, |ui, inner_w| fold_row(ui, inner_w, None, title, summary, active, open, add)),
+    }
+}
+
+/// A fold's header row and, while open, its fields. `divided`: None on a card of its own, in a
+/// list whether a hairline goes above it (every row after the first).
+#[allow(clippy::too_many_arguments)]
+fn fold_row(ui: &mut Ui, inner_w: f32, divided: Option<bool>, title: &str, summary: &str, active: bool, open: &mut bool, add: impl FnOnce(&mut Ui)) {
+    let in_list = divided.is_some();
+    if divided == Some(true) {
+        let (sep, _) = ui.allocate_exact_size(vec2(inner_w, 1.0), Sense::hover());
+        ui.painter().hline(sep.x_range().shrink(14.0), sep.center().y, Stroke::new(1.0, LINE));
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(inner_w, 42.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        *open = !*open;
+    }
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("open"), *open, 0.12);
+    let p = ui.painter();
+    if resp.hovered() {
+        // a list's rows light up inside its rounded edges
+        let (r, cr) = if in_list {
+            (rect.shrink2(vec2(6.0, 3.0)), CornerRadius::same(RADIUS))
+        } else if *open {
+            (rect.shrink(1.0), CornerRadius { nw: 11, ne: 11, sw: 0, se: 0 })
+        } else {
+            (rect.shrink(1.0), CornerRadius::same(11))
+        };
+        p.rect_filled(r, cr, alpha(Color32::WHITE, 5));
+    }
+    let font = theme::font_semi(13.0);
+    let title_w = p.layout_no_wrap(title.to_string(), font.clone(), TEXT).size().x;
+    p.text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, title, font, if *open || resp.hovered() { TEXT } else { TEXT2 });
+    // chevron flips between down (closed) and up (open)
+    let c = pos2(rect.right() - 18.0, rect.center().y);
+    let dy = 2.2 - 4.4 * t;
+    let pts = [c + vec2(-4.5, -dy), c + vec2(0.0, dy), c + vec2(4.5, -dy)];
+    p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, if resp.hovered() { TEXT2 } else { MUTED })));
+    if summary.is_empty() {
+        if active {
+            let c = pos2(rect.left() + 14.0 + title_w + 10.0, rect.center().y);
+            p.circle_filled(c, 5.5, alpha(G1, 40));
+            p.circle_filled(c, 3.0, G1);
+        }
+    } else {
+        // the state, right-aligned before the chevron, cut short rather than overlap the title
+        let room = rect.width() - title_w - 14.0 - 40.0 - 16.0;
+        let color = if active { G2 } else { DIM };
+        fit_text(p, pos2(rect.right() - 34.0, rect.center().y), Align2::RIGHT_CENTER, summary, theme::font_semi(11.5), color, room.max(40.0));
+    }
+    if *open && in_list {
+        // a row's fields hang under its header; the next row's hairline closes them
+        Frame::new().inner_margin(Margin { left: 14, right: 14, top: 2, bottom: 14 }).show(ui, |ui| {
+            let w = inner_w - 28.0;
+            ui.set_max_width(w);
+            ui.set_width(w);
+            ui.spacing_mut().item_spacing.y = 10.0;
+            add(ui);
+        });
+    } else if *open {
+        card_body(ui, inner_w, add);
+    }
 }
 
 // ----------------------------------------------------------------- fields
@@ -583,6 +619,36 @@ pub fn field(ui: &mut Ui, caption_text: &str, value: &mut String, hint: &str, su
         text_box(ui, value, hint, suffix, enabled, false)
     })
     .inner
+}
+
+/// A whole-number [`field`] in `range`. What is typed stays as typed while the box has focus
+/// (so "13" can be typed past "1"), and the box shows the value again once left. ↑ / ↓ step
+/// it, held down they repeat; with `keys_anywhere` they also work while no other box takes
+/// typing. Returns true when the value changed.
+pub fn int_field(ui: &mut Ui, caption_text: &str, value: &mut u32, range: (u32, u32), enabled: bool, keys_anywhere: bool) -> bool {
+    let id = ui.make_persistent_id(("int-field", caption_text));
+    let before = *value;
+    let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.to_string());
+    let r = field(ui, caption_text, &mut text, &range.0.to_string(), Some(&format!("{}–{}", range.0, range.1)), enabled);
+    if r.changed() {
+        if let Ok(n) = text.trim().parse::<u32>() {
+            *value = n.clamp(range.0, range.1);
+        }
+    }
+    let typing_elsewhere = !r.has_focus() && ui.ctx().egui_wants_keyboard_input();
+    if enabled && (r.has_focus() || (keys_anywhere && !typing_elsewhere)) {
+        let step = ui.input(|i| i.num_presses(egui::Key::ArrowUp) as i64 - i.num_presses(egui::Key::ArrowDown) as i64);
+        if step != 0 {
+            *value = (*value as i64 + step).clamp(range.0 as i64, range.1 as i64) as u32;
+            text = value.to_string();
+        }
+    }
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    *value != before
 }
 
 /// Single-line input, recessed into the card, with an optional unit on the right.
@@ -1446,5 +1512,56 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.line_segment([at(0.08, 0.5), at(0.92, 0.5)], s);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One frame of an `int_field` for 1–36 cards, fed `events`.
+    fn frame(ctx: &egui::Context, value: &mut u32, events: Vec<egui::Event>) {
+        let input = egui::RawInput { events, screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(320.0, 200.0))), ..Default::default() };
+        let _ = ctx.run_ui(input, |ui| {
+            int_field(ui, "Cards", value, (1, 36), true, true);
+        });
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn text(s: &str) -> egui::Event {
+        egui::Event::Text(s.into())
+    }
+
+    #[test]
+    fn int_field_keeps_what_is_typed() {
+        let ctx = egui::Context::default();
+        let mut v = 10;
+        frame(&ctx, &mut v, vec![]);
+        frame(&ctx, &mut v, vec![key(egui::Key::Tab)]);
+        frame(&ctx, &mut v, vec![key(egui::Key::End), key(egui::Key::Backspace), key(egui::Key::Backspace)]);
+        assert_eq!(v, 10, "an empty box keeps the value");
+        frame(&ctx, &mut v, vec![text("1")]);
+        assert_eq!(v, 1);
+        frame(&ctx, &mut v, vec![text("3")]);
+        assert_eq!(v, 13, "typing goes on past the first digit");
+        frame(&ctx, &mut v, vec![key(egui::Key::ArrowUp), key(egui::Key::ArrowUp), key(egui::Key::ArrowDown)]);
+        assert_eq!(v, 14);
+        frame(&ctx, &mut v, vec![key(egui::Key::End), text("0")]);
+        assert_eq!(v, 36, "too many is the most");
+    }
+
+    #[test]
+    fn int_field_arrows_without_focus() {
+        let ctx = egui::Context::default();
+        let mut v = 2;
+        frame(&ctx, &mut v, vec![]);
+        frame(&ctx, &mut v, vec![key(egui::Key::ArrowDown)]);
+        frame(&ctx, &mut v, vec![key(egui::Key::ArrowDown)]);
+        assert_eq!(v, 1, "never below the least");
+        frame(&ctx, &mut v, vec![key(egui::Key::ArrowUp); 3]);
+        assert_eq!(v, 4);
     }
 }

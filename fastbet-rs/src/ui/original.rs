@@ -1,18 +1,16 @@
-//! An original's page, shaped like Limbo's: header (title, session chips, tabs,
-//! bet / cash out / start), settings on the left, the game's board and its bet
-//! table in the middle.
-
-use std::time::Instant;
+//! An original's page, shaped like Limbo's: header (title, tabs, session chips),
+//! settings on the left with bet / cash out / start pinned under them, the game's
+//! board and its bet table in the middle.
 
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, StrokeKind, Ui};
 
 use super::originals::{self, times};
 use super::stats::{clock, HistEntry};
 use super::theme::{self, alpha, BG, BG1, DIM, GOLD, GREEN, LINE, MUTED, RED, STAGE, TEXT, TEXT2};
-use super::widgets::{self, button, button_key, Btn};
+use super::widgets;
 use super::{controls, App};
-use crate::money::{fmt_int, fmt_time};
-use crate::originals::{dragon_multiplier, Game, Round, Step};
+use crate::money::fmt_int;
+use crate::originals::{dragon_multiplier, Game, Round};
 use crate::settings::Mode;
 
 const SETTINGS_W: f32 = 320.0;
@@ -77,7 +75,10 @@ pub fn show(app: &mut App, ui: &mut Ui, game: Game) {
         .exact_size(SETTINGS_W)
         .frame(Frame::new().fill(BG).inner_margin(Margin::ZERO))
         .show_separator_line(false)
-        .show(ui, |ui| settings(app, ui, game));
+        .show(ui, |ui| {
+            controls::action_bar(app, ui, Some(game));
+            settings(app, ui, game);
+        });
 
     egui::CentralPanel::default()
         .frame(Frame::new().fill(BG).inner_margin(Margin { left: 2, right: PAD as i8, top: 2, bottom: PAD as i8 }))
@@ -102,68 +103,28 @@ pub fn show(app: &mut App, ui: &mut Ui, game: Game) {
 fn header(app: &mut App, ui: &mut Ui, game: Game) {
     let hr = ui.max_rect();
     let running = app.auto.running;
-    let open = app.orig.open(game).cloned();
-    let busy = app.orig.busy.contains(&game);
+    let open = app.orig.open(game).is_some();
     let (mut left, mut right) = (hr.left(), hr.right());
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(widgets::bold(app.casino().original_name(game), 21.0, TEXT));
-        ui.add_space(8.0);
-        let elapsed = match (app.stats.started, app.stats.last_at) {
-            (Some(s), Some(l)) => (if running { Instant::now() } else { l }).duration_since(s).as_millis(),
-            _ => 0,
-        };
-        widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
-        widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
-        let runs_async = !game.has_steps() || app.casino().auto_settles(game);
-        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && game.auto() && runs_async && !app.strategy_sequential(false) {
-            widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
-                .on_hover_text("Bets in flight at once. Set it under Bets, delay & async.");
-        }
-        controls::restarts_chip(app, ui);
         left = ui.min_rect().right();
-
-        right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if running {
-                if button(ui, "Stop", Btn::Danger, true, Some(84.0)).clicked() {
-                    app.stop_auto();
-                }
-                let paused = app.auto.paused;
-                if button(ui, if paused { "Resume" } else { "Pause" }, Btn::Warn, true, Some(84.0)).clicked() {
-                    app.toggle_pause();
-                }
-                let armed = app.auto.stop_on_win;
-                if button(ui, if armed { "Stopping on win…" } else { "Stop on next win" }, Btn::Ghost, true, None).clicked() {
-                    app.stop_on_next_win();
-                }
-            } else if open.is_some() && game.step_path(Step::Cashout).is_none() {
-                // blackjack and video poker end on the board, not with a cash out
-                ui.label(widgets::semi("Round in play", 12.0, theme::GOLD));
-            } else if let Some(r) = &open {
-                let m = cashout_multiplier(r);
-                let label = if m > 0.0 { format!("Cash out  {}", times(m)) } else { "Cash out".to_string() };
-                if button(ui, &label, Btn::Primary, m > 0.0 && !busy, Some(170.0)).clicked() {
-                    app.orig_step(game, Step::Cashout, serde_json::json!({}));
-                }
-            } else if app.settings.mode == Mode::Auto && game.auto() {
-                if button(ui, "Start", Btn::Primary, app.ready(), Some(120.0)).clicked() {
-                    app.orig_start_auto(game);
-                }
-            } else {
-                let key = app.settings.hotkeys.then_some("Space");
-                if button_key(ui, "Bet", key, Btn::Primary, app.ready() && !busy, Some(132.0)).clicked() {
-                    app.orig_bet(game);
-                }
-            }
-        })
-        .response
-        .rect
-        .left();
+        // right: the session at a glance (the buttons are under the settings)
+        let runs_async = !game.has_steps() || app.casino().auto_settles(game);
+        let async_on = app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && game.auto() && runs_async && !app.strategy_sequential(false);
+        right = ui
+            .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                controls::session_chips(app, ui, async_on);
+            })
+            .response
+            .rect
+            .left();
     });
     if game.auto() {
-        let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
-        controls::mode_tabs(app, ui, cx, left, right, !running && open.is_none());
+        // the stage starts right of the settings (the header has its own left margin)
+        let stage = (hr.left() - PAD + SETTINGS_W + 2.0, hr.right());
+        controls::mode_tabs(app, ui, stage, left, right, !running && !open);
     }
 }
 
@@ -178,15 +139,7 @@ fn settings(app: &mut App, ui: &mut Ui, game: Game) {
             // the game's own settings, under its name; the "?" says how it plays
             let help = originals::help(app.casino(), game);
             widgets::card(ui, w, app.casino().original_name(game), Some(&help), None, |ui| originals::params(app, ui, game, app.auto.running));
-            if app.settings.mode == Mode::Auto && game.auto() {
-                controls::auto_strategy(app, ui, w, false);
-                controls::bets_and_speed(app, ui, w);
-                controls::stops(app, ui, w);
-                controls::force_restart(app, ui, w);
-            }
-            controls::vault(app, ui, w);
-            controls::seed(app, ui, w);
-            controls::notifications(app, ui, w);
+            controls::run_settings(app, ui, w, game.auto(), false);
         });
     });
 }
@@ -234,7 +187,7 @@ const COLS: &[Col] = &[
 
 fn table(app: &mut App, ui: &mut Ui, game: Game) {
     let (card, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-    ui.painter().rect(card, CornerRadius::same(14), BG1, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    ui.painter().rect_filled(card, CornerRadius::same(14), BG1);
     let inner = card.shrink2(vec2(8.0, 1.0));
     let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
     let ui = &mut tui;

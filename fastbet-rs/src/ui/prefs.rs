@@ -127,6 +127,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             }
         });
         let page = Rect::from_min_max(pos2(nav.right() + 1.0, body.top()), body.max);
+        // the page a step darker, so its cards stand out as they do on the main pages
+        ui.painter().rect_filled(page, CornerRadius { nw: 0, ne: 0, sw: 0, se: 11 }, theme::BG);
         ui.scope_builder(egui::UiBuilder::new().max_rect(page), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 Frame::new().inner_margin(Margin::symmetric(22, 18)).show(ui, |ui| {

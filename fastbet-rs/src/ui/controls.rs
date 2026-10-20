@@ -1,12 +1,16 @@
-//! The settings column every game page shares: the bet card, then the auto-run cards that fold
-//! away (strategy, bets and speed, stops, force restart), seeds and sound. Limbo's own panel too.
+//! The settings column every game page shares: the bet card, then one list of the settings that
+//! fold away (strategy, bets and speed, stops, force restart, vault, seeds and sound), and the
+//! page's main buttons pinned under it. Limbo's own panel too.
 
-use egui::{pos2, vec2, Align, Frame, Layout, Margin, Rect, RichText, Ui};
+use std::time::Instant;
 
-use super::theme::{self, MUTED, TEXT2};
+use egui::{pos2, vec2, Align, Align2, Frame, Layout, Margin, Rect, RichText, Ui};
+
+use super::theme::{self, BG, MUTED, TEXT2};
 use super::widgets::{self, caption, caption_help, card, check_field_help, chip_button_sized, field, fold, readout, segmented, text_box, toggle_help, Btn, FIELD_H};
 use super::App;
-use crate::money::{self, fmt_multi, mul_f};
+use crate::money::{self, fmt_int, fmt_multi, fmt_time, mul_f};
+use crate::originals::{Game, Step};
 use crate::settings::{Adjust, Mode, Strategy, Unit};
 
 const QUICK_TARGETS: &[&str] = &["1.5", "2", "3", "5", "10", "50", "100"];
@@ -16,13 +20,16 @@ const QUICK_TARGETS: &[&str] = &["1.5", "2", "3", "5", "10", "50", "100"];
 const MODE_TABS: [(&str, &str); 4] = [("cursor", "Manual Bet"), ("loop", "Automatic"), ("branch", "Conditions"), ("code", "Code")];
 
 /// Manual Bet / Automatic / Conditions, which set the mode and the auto run's strategy. Centred
-/// over the stage (`cx`) in the header, between what it shows on the left (up to `left`) and on the
-/// right (from `right`); short of room they shrink to their icons.
-pub(super) fn mode_tabs(app: &mut App, ui: &mut Ui, cx: f32, left: f32, right: f32, enabled: bool) {
+/// over the stage (`stage`, its left and right edge) in the header, or when the session chips
+/// leave no room for that, lined up with its left edge; they stay between what the header shows
+/// on the left (up to `left`) and on the right (from `right`), and short of room they shrink to
+/// their icons.
+pub(super) fn mode_tabs(app: &mut App, ui: &mut Ui, stage: (f32, f32), left: f32, right: f32, enabled: bool) {
     let hr = ui.max_rect();
     let compact = widgets::icon_tabs_width(ui, &MODE_TABS, false) > right - left - 24.0;
     let w = widgets::icon_tabs_width(ui, &MODE_TABS, compact);
-    let x = (cx - w / 2.0).min(right - 12.0 - w).max(left + 12.0);
+    let centred = (stage.0 + stage.1) / 2.0 - w / 2.0;
+    let x = if centred + w <= right - 12.0 { centred } else { stage.0 }.min(right - 12.0 - w).max(left + 12.0);
     let rect = Rect::from_min_size(pos2(x, hr.center().y - 18.0), vec2(w, 36.0));
     // a child ui does not move the parent's cursor
     let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
@@ -45,17 +52,32 @@ pub(super) fn mode_tabs(app: &mut App, ui: &mut Ui, cx: f32, left: f32, right: f
     }
 }
 
-/// The auto run's strategy card: the Condition Builder, or increase on win / loss.
-pub(super) fn auto_strategy(app: &mut App, ui: &mut Ui, w: f32, limbo: bool) {
-    match app.settings.strategy {
-        Strategy::Conditions => super::conditions::card(app, ui, w, limbo),
-        // the script is on the right, in place of the stage
-        Strategy::Code => {}
-        Strategy::Simple => strategy(app, ui, w),
+/// Everything under a game's own cards: the Condition Builder when the run follows rules, then
+/// the settings that fold away as one list (the auto run's only on an auto run). `auto`: the
+/// game has auto runs.
+pub(super) fn run_settings(app: &mut App, ui: &mut Ui, w: f32, auto: bool, limbo: bool) {
+    let auto = auto && app.settings.mode == Mode::Auto;
+    if auto && app.settings.strategy == Strategy::Conditions {
+        super::conditions::card(app, ui, w, limbo);
     }
+    widgets::fold_list(ui, w, |ui, w| {
+        if auto {
+            // a script sets the bets itself: its editor is on the right, in place of the stage
+            if app.settings.strategy == Strategy::Simple {
+                strategy(app, ui, w);
+            }
+            bets_and_speed(app, ui, w);
+            stops(app, ui, w);
+            force_restart(app, ui, w);
+        }
+        vault(app, ui, w);
+        seed(app, ui, w);
+        notifications(app, ui, w);
+    });
 }
 
 pub fn show(app: &mut App, ui: &mut Ui) {
+    action_bar(app, ui, None);
     let panel_w = ui.available_width();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         Frame::new().inner_margin(Margin { left: 14, right: 12, top: 2, bottom: 14 }).show(ui, |ui| {
@@ -64,17 +86,92 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.set_max_width(w);
             general(app, ui, w);
-            if app.settings.mode == Mode::Auto {
-                auto_strategy(app, ui, w, true);
-                bets_and_speed(app, ui, w);
-                stops(app, ui, w);
-                force_restart(app, ui, w);
-            }
-            vault(app, ui, w);
-            seed(app, ui, w);
-            notifications(app, ui, w);
+            run_settings(app, ui, w, true, true);
         });
     });
+}
+
+/// The page's main buttons, pinned under its settings: Bet or Start, or while a run goes, Stop
+/// with Pause and Stop on next win. `game`: an original's page (None: Limbo's), where an open
+/// round is cashed out here.
+pub(super) fn action_bar(app: &mut App, ui: &mut Ui, game: Option<Game>) {
+    egui::Panel::bottom(if game.is_some() { "orig-actions" } else { "limbo-actions" })
+        .frame(Frame::new().fill(BG).inner_margin(Margin { left: 14, right: 16, top: 10, bottom: 14 }))
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            actions(app, ui, game);
+        });
+}
+
+fn actions(app: &mut App, ui: &mut Ui, game: Option<Game>) {
+    let w = ui.available_width();
+    let keys = app.settings.hotkeys;
+    if app.auto.running {
+        if widgets::action_button(ui, "Stop", keys.then_some("Esc"), Btn::Danger, true, w).clicked() {
+            app.stop_auto();
+        }
+        ui.horizontal(|ui| {
+            let half = (w - 8.0) / 2.0;
+            let paused = app.auto.paused;
+            if widgets::button_key(ui, if paused { "Resume" } else { "Pause" }, keys.then_some("P"), Btn::Warn, true, Some(half)).clicked() {
+                app.toggle_pause();
+            }
+            let armed = app.auto.stop_on_win;
+            if widgets::button(ui, if armed { "Stopping on win…" } else { "Stop on next win" }, Btn::Ghost, true, Some(half)).clicked() {
+                app.stop_on_next_win();
+            }
+        });
+        return;
+    }
+    let open = game.and_then(|g| app.orig.open(g).cloned());
+    let busy = game.is_some_and(|g| app.orig.busy.contains(&g));
+    match (game, &open) {
+        // blackjack and video poker end on the board, not with a cash out
+        (Some(g), Some(_)) if g.step_path(Step::Cashout).is_none() => {
+            let (r, _) = ui.allocate_exact_size(vec2(w, widgets::ACTION_H), egui::Sense::hover());
+            ui.painter().rect_filled(r, egui::CornerRadius::same(theme::RADIUS), theme::alpha(theme::GOLD, 18));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Round in play", theme::font_semi(13.0), theme::GOLD);
+        }
+        (Some(g), Some(r)) => {
+            let m = super::original::cashout_multiplier(r);
+            let label = if m > 0.0 { format!("Cash out  {}", super::originals::times(m)) } else { "Cash out".to_string() };
+            if widgets::action_button(ui, &label, None, Btn::Primary, m > 0.0 && !busy, w).clicked() {
+                app.orig_step(g, Step::Cashout, serde_json::json!({}));
+            }
+        }
+        _ if app.settings.mode == Mode::Auto && game.is_none_or(Game::auto) => {
+            if widgets::action_button(ui, "Start", None, Btn::Primary, app.ready(), w).clicked() {
+                match game {
+                    Some(g) => app.orig_start_auto(g),
+                    None => app.start_auto(),
+                }
+            }
+        }
+        _ => {
+            if widgets::action_button(ui, "Bet", keys.then_some("Space"), Btn::Primary, app.ready() && !busy, w).clicked() {
+                match game {
+                    Some(g) => app.orig_bet(g),
+                    None => app.manual_bet(),
+                }
+            }
+        }
+    }
+}
+
+/// The session at a glance, for the header's right side (laid out right to left): session
+/// time, bets, bets in flight (`async_on`), and what force restart kept going.
+pub(super) fn session_chips(app: &App, ui: &mut Ui, async_on: bool) {
+    restarts_chip(app, ui);
+    if async_on {
+        widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2).on_hover_text("Bets in flight at once. Set it under Bets, delay & async.");
+    }
+    widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
+    let elapsed = match (app.stats.started, app.stats.last_at) {
+        (Some(s), Some(l)) => (if app.auto.running { Instant::now() } else { l }).duration_since(s).as_millis(),
+        _ => 0,
+    };
+    widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
 }
 
 fn general(app: &mut App, ui: &mut Ui, w: f32) {
@@ -495,7 +592,7 @@ fn kv(ui: &mut Ui, k: &str, v: String) {
 }
 
 /// Header chips of a run force restart kept going: restarts and errors bet through, hover for the last why.
-pub(super) fn restarts_chip(app: &App, ui: &mut Ui) {
+fn restarts_chip(app: &App, ui: &mut Ui) {
     let a = &app.auto;
     if !a.running {
         return;

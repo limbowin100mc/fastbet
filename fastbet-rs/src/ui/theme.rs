@@ -4,18 +4,19 @@ use std::sync::{Arc, OnceLock};
 
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, TextStyle, Vec2};
 
-// Deep navy base, one green accent, salmon red, amber for pause. Few borders, no noise.
-pub const BG: Color32 = Color32::from_rgb(0x07, 0x0b, 0x14);
-pub const BG1: Color32 = Color32::from_rgb(0x0b, 0x10, 0x1e);
-pub const BG2: Color32 = Color32::from_rgb(0x10, 0x17, 0x27);
-pub const BG3: Color32 = Color32::from_rgb(0x17, 0x20, 0x36);
-pub const STAGE: Color32 = Color32::from_rgb(0x04, 0x06, 0x0c);
-pub const LINE: Color32 = Color32::from_rgb(0x1a, 0x23, 0x36);
-pub const LINE2: Color32 = Color32::from_rgb(0x27, 0x32, 0x4b);
-pub const TEXT: Color32 = Color32::from_rgb(0xea, 0xee, 0xf7);
-pub const TEXT2: Color32 = Color32::from_rgb(0xc7, 0xcf, 0xdf);
-pub const MUTED: Color32 = Color32::from_rgb(0x8a, 0x94, 0xaa);
-pub const DIM: Color32 = Color32::from_rgb(0x59, 0x63, 0x78);
+// Near-black neutral base, one green accent, salmon red, amber for pause. Surfaces step up in
+// shade instead of carrying borders; outlines are for inputs.
+pub const BG: Color32 = Color32::from_rgb(0x0a, 0x0c, 0x10);
+pub const BG1: Color32 = Color32::from_rgb(0x12, 0x15, 0x1b);
+pub const BG2: Color32 = Color32::from_rgb(0x19, 0x1d, 0x24);
+pub const BG3: Color32 = Color32::from_rgb(0x22, 0x27, 0x30);
+pub const STAGE: Color32 = Color32::from_rgb(0x07, 0x08, 0x0b);
+pub const LINE: Color32 = Color32::from_rgb(0x1e, 0x23, 0x2b);
+pub const LINE2: Color32 = Color32::from_rgb(0x2c, 0x32, 0x3d);
+pub const TEXT: Color32 = Color32::from_rgb(0xed, 0xef, 0xf3);
+pub const TEXT2: Color32 = Color32::from_rgb(0xc6, 0xcb, 0xd3);
+pub const MUTED: Color32 = Color32::from_rgb(0x8c, 0x93, 0xa0);
+pub const DIM: Color32 = Color32::from_rgb(0x5b, 0x62, 0x6e);
 pub const G1: Color32 = Color32::from_rgb(0x1e, 0xd3, 0x80);
 pub const G2: Color32 = Color32::from_rgb(0x2b, 0xe4, 0xa6);
 pub const GREEN: Color32 = Color32::from_rgb(0x1e, 0xd3, 0x80);

@@ -76,6 +76,57 @@ pub fn paint_wordmark(p: &Painter, rect: Rect) {
     }
 }
 
+/// FastBet's own icons on the originals' boards.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Icon {
+    /// The wordmark's F, white: a safe tile (tinted when drawn).
+    Mark,
+    /// A skull, white: a missed tile (tinted when drawn).
+    Miss,
+    /// Chicken's piece: a pawn in the wordmark's colours with the F on it.
+    Pawn,
+}
+
+impl Icon {
+    fn svg(self) -> &'static [u8] {
+        match self {
+            Icon::Mark => include_bytes!("../../assets/mark.svg"),
+            Icon::Miss => include_bytes!("../../assets/miss.svg"),
+            Icon::Pawn => include_bytes!("../../assets/pawn.svg"),
+        }
+    }
+}
+
+/// Paints `icon` fitted and centred in `rect`, multiplied by `tint`.
+pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, tint: Color32) {
+    paint_icon_turned(p, rect, icon, tint, 0.0);
+}
+
+/// [`paint_icon`] turned by `angle` radians (clockwise) around the centre of `rect`.
+pub fn paint_icon_turned(p: &Painter, rect: Rect, icon: Icon, tint: Color32, angle: f32) {
+    let ppp = p.ctx().pixels_per_point();
+    let (w, h) = ((rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let id = Id::new(("icon", icon, w, h));
+    let tex = p.ctx().data_mut(|d| d.get_temp::<Option<TextureHandle>>(id)).unwrap_or_else(|| {
+        let tex = rasterise(icon.svg(), w, h).map(|img| p.ctx().load_texture(format!("icon-{icon:?}-{w}x{h}"), img, TextureOptions::LINEAR));
+        p.ctx().data_mut(|d| d.insert_temp(id, tex.clone()));
+        tex
+    });
+    let Some(t) = tex else { return };
+    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    if angle == 0.0 {
+        p.image(t.id(), rect, uv, tint);
+    } else {
+        let mut mesh = egui::Mesh::with_texture(t.id());
+        mesh.add_rect_with_uv(rect, uv, tint);
+        mesh.rotate(egui::emath::Rot2::from_angle(angle), rect.center());
+        p.add(mesh);
+    }
+}
+
 /// Renders the SVG into a `w`×`h` image, aspect kept, centred.
 pub(super) fn rasterise(data: &[u8], w: u32, h: u32) -> Option<ColorImage> {
     let tree = usvg::Tree::from_data(data, &usvg::Options::default()).ok()?;
@@ -97,6 +148,14 @@ mod tests {
         for id in CasinoId::ALL {
             let img = rasterise(svg(*id), 40, 40).unwrap_or_else(|| panic!("{} logo does not parse", id.name()));
             assert!(img.pixels.iter().any(|p| p.a() > 0), "{} logo is empty", id.name());
+        }
+    }
+
+    #[test]
+    fn icons_render() {
+        for icon in [Icon::Mark, Icon::Miss, Icon::Pawn] {
+            let img = rasterise(icon.svg(), 40, 40).unwrap_or_else(|| panic!("{icon:?} does not parse"));
+            assert!(img.pixels.iter().any(|p| p.a() > 0), "{icon:?} is empty");
         }
     }
 

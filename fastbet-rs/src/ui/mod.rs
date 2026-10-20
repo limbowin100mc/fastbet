@@ -454,6 +454,17 @@ impl App {
                 hits::record_bet(self, n, &r);
             }
         }
+        // FASTBET_PREVIEW_ROUND="<slug> <multiplier> <state json>": a made-up settled round on that board
+        if let Ok(v) = std::env::var("FASTBET_PREVIEW_ROUND") {
+            let mut it = v.splitn(3, ' ');
+            let game = it.next().and_then(crate::originals::Game::from_slug);
+            let multiplier = it.next().and_then(|m| m.parse::<f64>().ok());
+            let state = it.next().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+            if let (Some(game), Some(multiplier), Some(state)) = (game, multiplier, state) {
+                let round = crate::originals::Round { game, id: "preview".into(), active: false, currency: cur.clone(), amount: 0, amount_mult: 1.0, payout: 0, multiplier, state };
+                self.orig.last.insert(game, round);
+            }
+        }
         self.provable.client_seed = Some("d0a5a47351e87030faeb9675".into());
         self.provable.nonce = Some(n as u64);
         self.provable.server_seed_hash = Some("9f2c4be1a7d03e56c81f0b2a94d7e3c5a1b68f02d4e9c7a3b5f1e8d2c6a0b4f9".into());
@@ -1962,8 +1973,6 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.add_space(4.0);
-            widgets::logo_mark(ui, 32.0);
-            ui.add_space(18.0);
             if self.casino().has_rewards() {
                 let resp = widgets::rail_button(ui, self.screen == Screen::Rewards, "Rewards", widgets::paint_gift);
                 // something waits to be claimed

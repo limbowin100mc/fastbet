@@ -1,16 +1,16 @@
-//! The Limbo page: header (title, session chips, tabs, start/stop), settings
-//! on the left, the result stage and bet table in the middle.
+//! The Limbo page: header (title, tabs, session chips), settings on the left with
+//! bet / start / stop pinned under them, the result stage and bet table in the middle.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, StrokeKind, Ui};
 
 use super::stats::{clock, HistEntry};
 use super::theme::{self, alpha, BG, BG1, DIM, GOLD, GREEN, LINE, MUTED, RED, STAGE, TEXT, TEXT2};
-use super::widgets::{self, button, button_key, Btn};
+use super::widgets;
 use super::{controls, App};
 use crate::engine::BetRecord;
-use crate::money::{fmt_int, fmt_multi, fmt_time};
+use crate::money::{fmt_int, fmt_multi};
 use crate::settings::Mode;
 
 const TABLE_ROWS: usize = 150;
@@ -65,53 +65,21 @@ fn header(app: &mut App, ui: &mut Ui) {
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(widgets::bold("Limbo", 21.0, TEXT));
-        ui.add_space(8.0);
-        let elapsed = match (app.stats.started, app.stats.last_at) {
-            (Some(s), Some(l)) => (if running { Instant::now() } else { l }).duration_since(s).as_millis(),
-            _ => 0,
-        };
-        widgets::meta_chip(ui, "clock", &fmt_time(elapsed), TEXT2).on_hover_text("Session time");
-        widgets::meta_chip(ui, "stack", &fmt_int(app.stats.bets as i128), TEXT2).on_hover_text("Bets this session");
-        if app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && !app.strategy_sequential(true) {
-            widgets::meta_chip(ui, "layers", &format!("Async ×{}", app.settings.async_bets), theme::G2)
-                .on_hover_text("Bets in flight at once. Set it under No. of bets, delay & async.");
-        }
-        controls::restarts_chip(app, ui);
         left = ui.min_rect().right();
-
-        // right: start / running controls
-        right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if running {
-                if button(ui, "Stop", Btn::Danger, true, Some(84.0)).clicked() {
-                    app.stop_auto();
-                }
-                let paused = app.auto.paused;
-                if button(ui, if paused { "Resume" } else { "Pause" }, Btn::Warn, true, Some(84.0)).clicked() {
-                    app.toggle_pause();
-                }
-                let armed = app.auto.stop_on_win;
-                if button(ui, if armed { "Stopping on win…" } else { "Stop on next win" }, Btn::Ghost, true, None).clicked() {
-                    app.stop_on_next_win();
-                }
-            } else if app.settings.mode == Mode::Auto {
-                if button(ui, "Start", Btn::Primary, app.ready(), Some(120.0)).clicked() {
-                    app.start_auto();
-                }
-            } else {
-                let key = app.settings.hotkeys.then_some("Space");
-                if button_key(ui, "Bet", key, Btn::Primary, app.ready(), Some(132.0)).clicked() {
-                    app.manual_bet();
-                }
-            }
-        })
-        .response
-        .rect
-        .left();
+        // right: the session at a glance (the buttons are under the settings)
+        let async_on = app.settings.async_bets > 1 && app.settings.mode == Mode::Auto && !app.strategy_sequential(true);
+        right = ui
+            .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                controls::session_chips(app, ui, async_on);
+            })
+            .response
+            .rect
+            .left();
     });
-    // mode tabs, centred over the stage (everything right of the settings panel)
-    let cx = (hr.left() + SETTINGS_W + hr.right()) / 2.0;
-    controls::mode_tabs(app, ui, cx, left, right, !running);
+    // mode tabs over the stage, which starts right of the settings (the header has its own left margin)
+    let stage = (hr.left() - PAD + SETTINGS_W + 2.0, hr.right());
+    controls::mode_tabs(app, ui, stage, left, right, !running);
 }
 
 fn stage(app: &mut App, ui: &mut Ui) {
@@ -293,7 +261,7 @@ fn cell_pos(cell: Rect, right: bool) -> (egui::Pos2, Align2) {
 
 fn table(app: &mut App, ui: &mut Ui) {
     let (card, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-    ui.painter().rect(card, CornerRadius::same(14), BG1, Stroke::new(1.0, LINE), StrokeKind::Inside);
+    ui.painter().rect_filled(card, CornerRadius::same(14), BG1);
     let inner = card.shrink2(vec2(8.0, 1.0));
     let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
     let ui = &mut tui;
