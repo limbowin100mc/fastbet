@@ -7,7 +7,7 @@ use super::super::theme::{self, alpha, BG2, GREEN, LINE2, MUTED, RED, TEXT, TEXT
 use super::super::widgets::{caption, chip_button_sized, segmented, text_box};
 use super::super::App;
 use crate::money;
-use crate::originals::{dice_chance, dice_multiplier, dice_target, Game, Round};
+use crate::originals::{dice_chance, dice_multiplier_at, dice_target, Game, Round};
 
 const QUICK: &[f64] = &[1.1, 1.5, 2.0, 3.0, 5.0, 10.0];
 
@@ -51,7 +51,7 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
             let txt = match valid(app) {
                 Some(t) => {
                     let c = dice_chance(t, app.settings.orig.dice_over);
-                    format!("{c:.2}% win  ·  {:.4}×", dice_multiplier(c))
+                    format!("{c:.2}% win  ·  {:.4}×", dice_multiplier_at(app.casino().rtp(), c))
                 }
                 None => chance_range(app),
             };
@@ -66,11 +66,12 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
         ui.spacing_mut().item_spacing.x = gap;
         let n = QUICK.len() as f32;
         let cw = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
-        let cur = valid(app).map(|t| dice_multiplier(dice_chance(t, app.settings.orig.dice_over)));
+        let rtp = app.casino().rtp();
+        let cur = valid(app).map(|t| dice_multiplier_at(rtp, dice_chance(t, app.settings.orig.dice_over)));
         for m in QUICK {
             let on = cur.is_some_and(|c| (c - m).abs() < 0.005);
             if chip_button_sized(ui, &format!("{}×", super::trim(*m)), on, !locked, vec2(cw, 28.0)).clicked() {
-                let chance = 99.0 / m;
+                let chance = rtp / m;
                 app.settings.orig.dice_target = format!("{:.2}", dice_target(chance, app.settings.orig.dice_over));
                 app.mark_dirty();
             }
@@ -162,7 +163,7 @@ pub fn board(app: &mut App, ui: &mut Ui, rect: Rect) {
     // three readouts under the track
     let chance = dice_chance(t, over);
     let items = [
-        ("Multiplier", format!("{:.4}×", dice_multiplier(chance))),
+        ("Multiplier", format!("{:.4}×", dice_multiplier_at(app.casino().rtp(), chance))),
         (if over { "Roll over" } else { "Roll under" }, format!("{t:.2}")),
         ("Win chance", format!("{chance:.4}%")),
     ];

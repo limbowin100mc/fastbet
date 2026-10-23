@@ -208,7 +208,7 @@ impl Gambulls {
         self.sessions.lock().clear();
         self.status(ConnStatus::Connecting, "Opening gambulls.com");
         let cookies = token.map(|t| vec![BridgeCookie { name: SESSION_COOKIE.into(), value: t.to_string(), domain: "gambulls.com".into() }]).unwrap_or_default();
-        let bridge = Bridge::open_with(&format!("{SITE}/en"), Some(PROFILE), &BridgeSetup { user_agent: None, cookies }).await.map_err(|e| CallError::Casino(CasinoError::Server(e)))?;
+        let bridge = Bridge::open_with(&format!("{SITE}/en"), Some(PROFILE), &BridgeSetup { user_agent: None, cookies, script: None }).await.map_err(|e| CallError::Casino(CasinoError::Server(e)))?;
         if let Some(old) = self.bridge.lock().replace(bridge.clone()) {
             old.close();
         }

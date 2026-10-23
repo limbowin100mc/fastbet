@@ -2,6 +2,7 @@
 //! only ever talk to the trait, so adding a casino means adding one module
 //! here and one variant to [`CasinoId`].
 
+pub mod bcgame;
 pub mod chipsgg;
 pub mod creds;
 pub mod gambulls;
@@ -39,10 +40,11 @@ pub enum CasinoId {
     Thrill,
     Housebets,
     Degen,
+    BcGame,
 }
 
 impl CasinoId {
-    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake, CasinoId::StakeUs, CasinoId::Shuffle, CasinoId::Goated, CasinoId::Gambulls, CasinoId::Metaspins, CasinoId::Thrill, CasinoId::Housebets, CasinoId::Degen];
+    pub const ALL: &'static [CasinoId] = &[CasinoId::ChipsGg, CasinoId::Stake, CasinoId::StakeUs, CasinoId::Shuffle, CasinoId::Goated, CasinoId::Gambulls, CasinoId::Metaspins, CasinoId::Thrill, CasinoId::Housebets, CasinoId::Degen, CasinoId::BcGame];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -56,6 +58,7 @@ impl CasinoId {
             CasinoId::Thrill => "thrill",
             CasinoId::Housebets => "housebets",
             CasinoId::Degen => "degen",
+            CasinoId::BcGame => "bcgame",
         }
     }
 
@@ -71,6 +74,7 @@ impl CasinoId {
             CasinoId::Thrill => "Thrill.com",
             CasinoId::Housebets => "Housebets.com",
             CasinoId::Degen => "Degen.com",
+            CasinoId::BcGame => "BC.Game",
         }
     }
 
@@ -82,7 +86,7 @@ impl CasinoId {
     /// Domains the casino can be reached on; empty when there is only one.
     pub fn mirrors(self) -> &'static [&'static str] {
         match self {
-            CasinoId::ChipsGg | CasinoId::StakeUs | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => &[],
+            CasinoId::ChipsGg | CasinoId::StakeUs | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => &[],
             CasinoId::Stake => stake::MIRRORS,
             CasinoId::Shuffle => shuffle::MIRRORS,
         }
@@ -99,24 +103,24 @@ impl CasinoId {
 
     /// An auto bet on `game` settles its round in one request (the tiles go up front), so an auto
     /// run can have several in flight, like Limbo's: Mines on Stake (`mines/bet` with the tiles)
-    /// and Shuffle (`minesAuto`).
+    /// and Shuffle (`minesAuto`). BC.Game's driver plays the round out itself (bet, reveal, cash out).
     pub fn auto_settles(self, game: Game) -> bool {
-        matches!(self, CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen) && game == Game::Mines
+        matches!(self, CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame) && game == Game::Mines
     }
 
     /// Takes bets of 0: they play a real round that pays nothing (Stake, Shuffle, Goated, chips.gg).
     pub fn zero_bets(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame)
     }
 
     /// Whether the account can also be linked through the embedded login window.
     pub fn window_login(self) -> bool {
-        matches!(self, CasinoId::ChipsGg | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen)
+        matches!(self, CasinoId::ChipsGg | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame)
     }
 
     /// Linked through the login window: the casino has no API keys to paste (Shuffle, Goated, Gambulls, Metaspins).
     pub fn window_only(self) -> bool {
-        matches!(self, CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen)
+        matches!(self, CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame)
     }
 
     /// The site's tokens can also be pasted by hand: the access token and the refresh token (Goated).
@@ -148,13 +152,14 @@ impl CasinoId {
     }
 
     /// The login is several cookies the window reads together, kept as one `name=value; …` token
-    /// (Housebets, Degen): (the URLs whose cookies to read, the names to keep; the first must be there).
+    /// (Housebets, Degen, BC.Game): (the URLs whose cookies to read, the names to keep; the first must be there).
     /// It counts once the page reports it is logged in.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn login_jar(self) -> Option<(&'static [&'static str], &'static [&'static str])> {
         match self {
             CasinoId::Housebets => Some((housebets::LOGIN_URLS, housebets::LOGIN_COOKIES)),
             CasinoId::Degen => Some((degen::LOGIN_URLS, degen::LOGIN_COOKIES)),
+            CasinoId::BcGame => Some((bcgame::LOGIN_URLS, bcgame::LOGIN_COOKIES)),
             _ => None,
         }
     }
@@ -250,7 +255,7 @@ impl CasinoId {
                 "play'ngo",
                 "retrogaming",
             ],
-            CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => &[],
+            CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => &[],
         }
     }
 
@@ -263,7 +268,7 @@ impl CasinoId {
         match self {
             CasinoId::Gambulls | CasinoId::Metaspins => vec![],
             CasinoId::Thrill => vec![Game::Keno, Game::Mines],
-            CasinoId::Housebets | CasinoId::Degen => vec![Game::Dice, Game::Keno, Game::Mines],
+            CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => vec![Game::Dice, Game::Keno, Game::Mines],
             CasinoId::ChipsGg => vec![Game::Keno, Game::Mines, Game::Hilo],
             CasinoId::Stake | CasinoId::StakeUs => Game::stake().collect(),
             CasinoId::Goated => vec![Game::Dice, Game::Mines],
@@ -271,10 +276,11 @@ impl CasinoId {
         }
     }
 
-    /// An original's name here (Shuffle calls its tower "Waifu Tower").
+    /// An original's name here (Shuffle calls its tower "Waifu Tower", BC.Game its dice "Classic Dice").
     pub fn original_name(self, game: Game) -> &'static str {
         match (self, game) {
             (CasinoId::Shuffle, Game::DragonTower) => "Waifu Tower",
+            (CasinoId::BcGame, Game::Dice) => "Classic Dice",
             _ => game.name(),
         }
     }
@@ -285,10 +291,11 @@ impl CasinoId {
         matches!(self, CasinoId::ChipsGg)
     }
 
-    /// Dice win chances accepted here, in percent (Goated pays at most 990×).
+    /// Dice win chances accepted here, in percent (Goated pays at most 990×, BC.Game at least 1.0102×).
     pub fn dice_chance(self) -> (f64, f64) {
         match self {
             CasinoId::Goated => (0.1, 98.0),
+            CasinoId::BcGame => (0.01, 97.01),
             _ => (0.01, 98.0),
         }
     }
@@ -331,7 +338,7 @@ impl CasinoId {
         match self {
             CasinoId::ChipsGg => "API key",
             CasinoId::Stake | CasinoId::StakeUs => "API token",
-            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => "login",
+            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => "login",
         }
     }
 
@@ -349,6 +356,7 @@ impl CasinoId {
             CasinoId::Thrill => "https://thrill.com/".into(),
             CasinoId::Housebets => "https://www.housebets.com/".into(),
             CasinoId::Degen => "https://degen.com/".into(),
+            CasinoId::BcGame => "https://bc.game/".into(),
         }
     }
 
@@ -358,7 +366,7 @@ impl CasinoId {
             CasinoId::ChipsGg => "https://chips.gg/settings/api-keys".into(),
             CasinoId::Stake => format!("https://{}/settings/security", mirror.unwrap_or(stake::DEFAULT_MIRROR)),
             CasinoId::StakeUs => format!("https://{}/settings/security", stake::US_DOMAIN),
-            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => self.login_url(mirror),
+            CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => self.login_url(mirror),
         }
     }
 
@@ -597,6 +605,26 @@ impl CasinoId {
   }, 2000);
 })();"#
             }
+            // BC.Game's login is the site's cookies, which the window reads itself (`login_jar`);
+            // the page reports whether the site sees a user (`/api/account/get/` says `login`).
+            CasinoId::BcGame => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  var busy = false;
+  setInterval(function () {
+    if (busy || !/(^|\.)bc\.game$/.test(location.hostname)) return;
+    busy = true;
+    fetch('/api/account/get/', { credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        busy = false;
+        var ok = !!(j && j.code === 0 && j.data && j.data.login === true);
+        try { window.ipc.postMessage(JSON.stringify({ token: '', loggedIn: ok, ua: navigator.userAgent })); } catch (e) {}
+      }, function () { busy = false; });
+  }, 2000);
+})();"#
+            }
             // Stake links with an API token only
             CasinoId::Stake | CasinoId::StakeUs => "",
         }
@@ -614,27 +642,34 @@ impl CasinoId {
             CasinoId::Metaspins => "Metaspins has no API keys: log in to Metaspins in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Housebets => "Housebets has no API keys: log in to Housebets in the window that opens with the button below (Google and X work there too). FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Degen => "Degen has no API keys: log in to Degen in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
+            CasinoId::BcGame => "BC.Game has no API keys: log in to BC.Game in the window that opens with the button below (Google works there too). FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Thrill => "Thrill has no API keys: log in to Thrill in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
         }
     }
 
     pub fn min_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => 1.01,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => 1.01,
         }
     }
 
     pub fn max_target(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => 1_000_000.0,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen | CasinoId::BcGame => 1_000_000.0,
         }
     }
 
-    /// Payout multiplier at which the house edge is already deducted (99% RTP).
-    pub fn win_chance(self, target: f64) -> f64 {
+    /// What the originals pay back here, in percent (BC.Game keeps 2%).
+    pub fn rtp(self) -> f64 {
         match self {
-            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => 99.0 / target,
+            CasinoId::BcGame => bcgame::RTP,
+            CasinoId::ChipsGg | CasinoId::Stake | CasinoId::StakeUs | CasinoId::Shuffle | CasinoId::Goated | CasinoId::Gambulls | CasinoId::Metaspins | CasinoId::Thrill | CasinoId::Housebets | CasinoId::Degen => 99.0,
         }
+    }
+
+    /// Limbo's chance to reach `target`, in percent: the house edge is in the payout.
+    pub fn win_chance(self, target: f64) -> f64 {
+        self.rtp() / target
     }
 }
 
@@ -1024,6 +1059,7 @@ pub fn connect(id: CasinoId, setup: Setup, events: mpsc::UnboundedSender<CasinoE
         CasinoId::Thrill => thrill::Thrill::spawn(setup, events),
         CasinoId::Housebets => housebets::Housebets::spawn(setup, events),
         CasinoId::Degen => degen::Degen::spawn(setup, events),
+        CasinoId::BcGame => bcgame::BcGame::spawn(setup, events),
     }
 }
 

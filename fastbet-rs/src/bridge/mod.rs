@@ -6,7 +6,9 @@
 //! Child: `fastbet --bridge <page-url> [profile]`. Reads `REQ <id> <json>`
 //! lines on stdin, runs `fetch` in the page, prints `RES <id> <json>` on
 //! stdout. `SHOW` / `HIDE` toggle the window, for a check that wants a click.
-//! A [`BridgeSetup`] (User Agent, cookies) reaches the child in `FASTBET_BRIDGE_SETUP`.
+//! A [`BridgeSetup`] (User Agent, cookies, a page script) reaches the child in `FASTBET_BRIDGE_SETUP`.
+//! A request with the method `SOCK` goes to that script's `window.__fbsock` instead of `fetch`
+//! (BC.Game's games talk over the site's own socket).
 //! That is the PC's bridge (`desktop.rs`); the phone has none yet (`android.rs`).
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,9 @@ pub struct BridgeResponse {
 pub struct BridgeSetup {
     pub user_agent: Option<String>,
     pub cookies: Vec<BridgeCookie>,
+    /// More JavaScript for every page, run after the bridge's own and before the site's.
+    #[serde(default)]
+    pub script: Option<String>,
 }
 
 /// A secure, HttpOnly cookie for `domain` (".example.com" covers its subdomains too).
@@ -50,7 +55,7 @@ pub struct BridgeCookie {
 impl BridgeSetup {
     #[cfg_attr(target_os = "android", allow(dead_code))]
     fn is_empty(&self) -> bool {
-        self.user_agent.is_none() && self.cookies.is_empty()
+        self.user_agent.is_none() && self.cookies.is_empty() && self.script.is_none()
     }
 }
 
@@ -59,6 +64,10 @@ const BRIDGE_SCRIPT: &str = r#"(function () {
   if (window.top !== window || window.__fbreq) return;
   function out(line) { try { window.ipc.postMessage(line); } catch (e) {} }
   window.__fbreq = function (id, req) {
+    if (req.method === 'SOCK') {
+      if (window.__fbsock) return window.__fbsock(id, req);
+      return out('RES ' + id + ' ' + JSON.stringify({ status: 0, body: '', error: 'no socket script', ms: 0 }));
+    }
     var t0 = Date.now();
     var init = { method: req.method || 'GET', headers: {} };
     (req.headers || []).forEach(function (h) { init.headers[h[0]] = h[1]; });

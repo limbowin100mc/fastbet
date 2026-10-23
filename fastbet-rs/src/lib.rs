@@ -91,6 +91,13 @@ pub fn desktop_main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `fastbet --bcgame-test [bets]`: connects to BC.Game the way the app does and plays bets of 0 (see `casino::bcgame::self_test`).
+    if args.len() >= 2 && args[1] == "--bcgame-test" {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(casino::bcgame::self_test(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5)));
+        return Ok(());
+    }
+
     // `fastbet --metaspins-test`: connects to Metaspins the way the app does, never bets (see `casino::metaspins::self_test`).
     if args.len() >= 2 && args[1] == "--metaspins-test" {
         let rt = tokio::runtime::Runtime::new().expect("runtime");

@@ -391,6 +391,11 @@ pub fn mines_multiplier(mines: u32, gems: u32) -> f64 {
 /// Mines state in Stake's shape, for casinos that report the picked tiles and (once the round
 /// is over) where the mines were: what each tile paid, nothing from the first mine on.
 pub fn mines_state(count: u32, picks: &[i64], mines: &[i64]) -> Value {
+    mines_state_with(count, picks, mines, mines_multiplier)
+}
+
+/// [`mines_state`] for a casino that pays its own way (BC.Game: 98%): `pays(mines, gems)`.
+pub fn mines_state_with(count: u32, picks: &[i64], mines: &[i64], pays: fn(u32, u32) -> f64) -> Value {
     let (mut gems, mut hit) = (0, false);
     let rounds: Vec<Value> = picks
         .iter()
@@ -399,7 +404,7 @@ pub fn mines_state(count: u32, picks: &[i64], mines: &[i64]) -> Value {
             if !hit {
                 gems += 1;
             }
-            serde_json::json!({ "field": f, "payoutMultiplier": if hit { 0.0 } else { mines_multiplier(count, gems) } })
+            serde_json::json!({ "field": f, "payoutMultiplier": if hit { 0.0 } else { pays(count, gems) } })
         })
         .collect();
     serde_json::json!({ "minesCount": count, "mines": mines, "rounds": rounds })
@@ -467,12 +472,12 @@ pub fn dice_chance(target: f64, over: bool) -> f64 {
     }
 }
 
-/// Dice: payout for a win chance (1% edge).
-pub fn dice_multiplier(chance: f64) -> f64 {
+/// Dice: payout for a win chance where the casino pays back `rtp` percent.
+pub fn dice_multiplier_at(rtp: f64, chance: f64) -> f64 {
     if chance <= 0.0 {
         0.0
     } else {
-        99.0 / chance
+        rtp / chance
     }
 }
 
@@ -769,7 +774,7 @@ mod tests {
         assert!((pump_multiplier("easy", 1) - 1.0208333333333335).abs() < 1e-9);
         assert!((pump_multiplier("hard", 1) - 1.225).abs() < 1e-9);
         assert!((dragon_multiplier("easy", 1) - 1.31).abs() < 0.005);
-        assert!((dice_multiplier(dice_chance(50.5, true)) - 2.0).abs() < 1e-9);
+        assert!((dice_multiplier_at(99.0, dice_chance(50.5, true)) - 2.0).abs() < 1e-9);
         assert_eq!(diamonds_hand(&["yellow", "purple", "green", "purple", "orange"].map(String::from)), ("One pair", 0.1));
         assert_eq!(diamonds_hand(&["red"; 5].map(String::from)).1, 50.0);
         assert_eq!(diamonds_hand(&["a", "a", "a", "b", "b"].map(String::from)).0, "Full house");

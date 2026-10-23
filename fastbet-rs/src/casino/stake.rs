@@ -376,7 +376,7 @@ impl Stake {
         let bridge = match &manual {
             Some(c) => {
                 let cookies = c.cookies().into_iter().map(|(name, value)| BridgeCookie { name, value, domain: format!(".{mirror}") }).collect();
-                let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies };
+                let setup = BridgeSetup { user_agent: Some(c.user_agent.clone()), cookies, script: None };
                 Bridge::open_with(&page, Some(if self.id == CasinoId::StakeUs { "stakeus-cf" } else { PROFILE_MANUAL }), &setup).await?
             }
             // Stake.us keeps its own cookies, apart from Stake.com's

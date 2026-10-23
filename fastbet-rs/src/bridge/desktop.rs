@@ -48,6 +48,9 @@ pub fn run_child(url: &str, profile: Option<&str>) -> Result<(), String> {
                 let _ = proxy.send_event(UserEvent::Out(req.body().clone()));
             }
         });
+    if let Some(js) = &setup.script {
+        builder = builder.with_initialization_script(js);
+    }
     if let Some(ua) = &setup.user_agent {
         builder = builder.with_user_agent(ua);
     }
