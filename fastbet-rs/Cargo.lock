@@ -1841,7 +1841,7 @@ checksum = "c6e8948ce679d00a02a94739ea185595dca7118ed04feb991127e443bd3d761f"
 
 [[package]]
 name = "fastbet"
-version = "3.20.0"
+version = "3.20.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

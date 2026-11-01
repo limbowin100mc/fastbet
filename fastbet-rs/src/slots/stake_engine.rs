@@ -309,12 +309,13 @@ fn rgs_error(status: u16, body: &str) -> SlotError {
     }
 }
 
-/// A free-spin round, from the math SDK's book events ("freegame" reveals, freeSpin* events).
+/// A round that went into free spins or a bonus, from the math SDK's book events: freeSpin*
+/// events and "freegame" reveals in most games, bonusEnter / bonusExit in others (Lazy Vampire).
 fn has_free_spins(state: &[Value]) -> bool {
     state.iter().any(|e| {
         let kind = e["type"].as_str().unwrap_or("").to_ascii_lowercase();
         let game = e["gameType"].as_str().unwrap_or("").to_ascii_lowercase();
-        kind.starts_with("freespin") || game.starts_with("free")
+        ["freespin", "freegame", "bonusenter", "bonustrigger"].iter().any(|p| kind.starts_with(p)) || game.starts_with("free") || game.starts_with("bonus")
     })
 }
 
@@ -420,6 +421,8 @@ mod tests {
         assert!(!has_free_spins(&base));
         let fs = vec![json!({"type": "reveal", "gameType": "basegame"}), json!({"type": "freeSpinTrigger"}), json!({"type": "reveal", "gameType": "freegame"})];
         assert!(has_free_spins(&fs));
+        let bonus = vec![json!({"index": 0, "kind": "Super", "type": "s"}), json!({"type": "bonusEnter"}), json!({"type": "bonusExit"}), json!({"type": "finalWin"})];
+        assert!(has_free_spins(&bonus));
     }
 
     #[test]

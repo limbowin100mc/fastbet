@@ -128,7 +128,8 @@ const ROTATE: &str = "mutation FastbetRotateSeed($seed: String!) { rotateSeedPai
 // Slots: each provider the drivers know is a kurator group (its page on Stake), Stake Engine
 // games (many studios) one more; all of them are in "slots". Every game opens the same way, as
 // a game URL (Stake Engine's carries the RGS session, see `slots::stake_engine`).
-const ENGINE_GROUP: &str = "stake-engine";
+/// Stake Engine's kurator group ("stake-engine" until about 2026-10-31, then renamed).
+const ENGINE_GROUP: &str = "engine";
 const SLOTS_GROUP: &str = "slots";
 /// Stake's provider group of each producer key the drivers know.
 const PROVIDER_GROUPS: &[(&str, &str)] = &[
@@ -1532,7 +1533,7 @@ mod tests {
         let s = slot_game(&nl, None).unwrap();
         assert_eq!((s.producer.as_str(), s.studio.as_deref()), ("nolimit-city", Some("Nolimit City")));
         assert!(crate::slots::Provider::for_producer(&s.producer).is_none());
-        let se = json!({"name": "T", "slug": "twist-t", "providerGroup": {"name": "Twist Gaming", "slug": "twist-gaming"}, "groupGames": [{"group": {"slug": "slots"}}, {"group": {"slug": "stake-engine"}}]});
+        let se = json!({"name": "T", "slug": "twist-t", "providerGroup": {"name": "Twist Gaming", "slug": "twist-gaming"}, "groupGames": [{"group": {"slug": "slots"}}, {"group": {"slug": "engine"}}]});
         assert_eq!(slot_game(&se, None).unwrap().producer, crate::slots::STAKE_ENGINE);
         // a provider's own list names its producer
         assert_eq!(slot_game(&nl, Some("hacksawgaming")).unwrap().producer, "hacksawgaming");
