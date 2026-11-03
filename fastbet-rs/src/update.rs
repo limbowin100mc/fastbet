@@ -1,6 +1,6 @@
-//! Updates from the GitHub releases of limbowin100mc/fastbet: compare the
-//! latest release with this build's version, download the installer for this
-//! system (checked against GitHub's SHA-256 digest) and start it.
+//! Updates from the FastBet website (`/api/app/latest`, the newest release in the shape of a
+//! GitHub release): compare it with this build's version, download the installer for this
+//! system (checked against the SHA-256 digest published with it) and start it.
 //!
 //! Windows runs the NSIS setup; a Linux AppImage replaces itself; a Linux
 //! .deb install gets the package opened in the browser (installing it needs root).
@@ -15,8 +15,14 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const LATEST: &str = "https://api.github.com/repos/limbowin100mc/fastbet/releases/latest";
-pub const RELEASES_PAGE: &str = "https://github.com/limbowin100mc/fastbet/releases/latest";
+fn latest_url() -> String {
+    crate::member::page("/api/app/latest")
+}
+
+/// Where the download is on the website, for builds that can't install updates themselves.
+pub fn releases_page() -> String {
+    crate::member::page("/#download")
+}
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 /// This build's version. `FASTBET_PRETEND_VERSION` overrides it, to see the update flow (UI work).
@@ -124,7 +130,7 @@ impl Updater {
         matches!(*self.state.lock(), State::Checking | State::Downloading { .. } | State::Installing { .. })
     }
 
-    /// Asks GitHub for the latest release, on a worker thread.
+    /// Asks the website for the latest release, on a worker thread.
     pub fn check(&self) {
         if self.busy() {
             return;
@@ -212,14 +218,13 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 
 fn latest() -> Result<Release, String> {
     let resp = client()?
-        .get(LATEST)
-        .header("Accept", "application/vnd.github+json")
+        .get(latest_url())
         .send()
-        .map_err(|e| format!("Couldn't reach GitHub: {e}"))?;
+        .map_err(|e| format!("Couldn't reach FastBet: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("GitHub answered {}", resp.status()));
+        return Err(format!("FastBet answered {}", resp.status()));
     }
-    resp.json::<Release>().map_err(|e| format!("Unexpected reply from GitHub: {e}"))
+    resp.json::<Release>().map_err(|e| format!("Unexpected reply from FastBet: {e}"))
 }
 
 /// "3.10.0" > "3.9.2"; a leading "v" and any "-beta"/"+build" suffix are ignored.
@@ -245,7 +250,7 @@ fn download_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Streams the asset to `dest`, checking its size and SHA-256 against what GitHub published.
+/// Streams the asset to `dest`, checking its size and SHA-256 against what was published with it.
 fn download(asset: &Asset, dest: &Path, cancel: &AtomicBool, progress: impl Fn(u64)) -> Result<(), String> {
     let mut resp = client()?.get(&asset.browser_download_url).send().map_err(|e| format!("Download failed: {e}"))?;
     if !resp.status().is_success() {
@@ -277,7 +282,7 @@ fn download(asset: &Asset, dest: &Path, cancel: &AtomicBool, progress: impl Fn(u
         if let Some(want) = asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")) {
             let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
             if !got.eq_ignore_ascii_case(want) {
-                return Err("The download doesn't match GitHub's checksum, so it wasn't run".into());
+                return Err("The download doesn't match its published checksum, so it wasn't run".into());
             }
         }
         Ok(())
@@ -341,13 +346,13 @@ mod tests {
     }
 
     /// `cargo test -- --ignored`: fetches the latest release and downloads its Windows setup twice,
-    /// once with GitHub's digest and once with a wrong one.
+    /// once with the published digest and once with a wrong one (FASTBET_SITE picks the website).
     #[test]
-    #[ignore = "network: downloads a release file from GitHub"]
+    #[ignore = "network: downloads a release file from the website"]
     fn downloads_and_verifies_a_release_file() {
         let release = latest().expect("latest release");
         let mut asset = Platform::Windows.pick(&release.assets).expect("setup.exe in the release");
-        assert!(asset.digest.as_deref().is_some_and(|d| d.starts_with("sha256:")), "GitHub sent no digest");
+        assert!(asset.digest.as_deref().is_some_and(|d| d.starts_with("sha256:")), "the website sent no digest");
         let dir = std::env::temp_dir().join("fastbet-update-test");
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join(&asset.name);

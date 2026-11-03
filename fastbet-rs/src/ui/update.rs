@@ -8,7 +8,7 @@ use egui::{vec2, Align, CornerRadius, Frame, Layout, Margin, Rect, RichText, Str
 use super::theme::{self, alpha, BG1, G1, GREEN, LINE, MUTED, RED, TEXT, TEXT2};
 use super::widgets::{self, button, icon, pill_button, Btn};
 use super::App;
-use crate::update::{current, State, RELEASES_PAGE};
+use crate::update::{current, releases_page, State};
 
 const WIDTH: f32 = 420.0;
 
@@ -157,7 +157,7 @@ fn body(ui: &mut Ui, state: &State, betting: bool, act: &mut Option<Act>) {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if pill_button(ui, "Release page ↗", MUTED, false).clicked() {
-                        *act = Some(Act::Open(RELEASES_PAGE.into()));
+                        *act = Some(Act::Open(releases_page()));
                     }
                 });
             });

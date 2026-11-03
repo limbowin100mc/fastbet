@@ -7,6 +7,7 @@ pub mod code;
 pub mod coins;
 pub mod conditions;
 pub mod controls;
+pub mod gate;
 pub mod hitcard;
 pub mod hits;
 pub mod images;
@@ -161,6 +162,14 @@ pub struct App {
     /// The gear menu on the welcome screen.
     pub welcome_menu_open: bool,
     pub updater: crate::update::Updater,
+    /// The FastBet account: the app opens only while it has a running plan (see crate::member).
+    pub member: crate::member::Member,
+    /// The account screen's login form.
+    pub gate_login: String,
+    pub gate_password: String,
+    pub gate_show_pw: bool,
+    /// The app was open last frame: a plan running out stops the runs once.
+    was_unlocked: bool,
     pub update_open: bool,
     /// The Settings window, and the category it shows.
     pub prefs_open: bool,
@@ -257,6 +266,7 @@ impl App {
         }
 
         let updater = crate::update::Updater::new(repaint.clone());
+        let member = crate::member::Member::new(repaint.clone());
         let mut app = Self {
             settings,
             engine,
@@ -307,6 +317,11 @@ impl App {
             account_menu_open: std::env::var("FASTBET_ACCOUNT_MENU").is_ok(),
             welcome_menu_open: std::env::var("FASTBET_WELCOME_MENU").is_ok(),
             updater,
+            member,
+            gate_login: String::new(),
+            gate_password: String::new(),
+            gate_show_pw: false,
+            was_unlocked: false,
             update_open: false,
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
@@ -2073,6 +2088,8 @@ impl App {
         let mut switch = false;
         let mut prefs = false;
         let mut updates = false;
+        let mut logout = false;
+        let member = &self.member;
         let logos = &mut self.logos;
         let area = egui::Area::new(egui::Id::new("account-menu"))
             .order(egui::Order::Foreground)
@@ -2099,6 +2116,8 @@ impl App {
                         widgets::fit_text(p, pos2(x, hr.center().y - 8.0), egui::Align2::LEFT_CENTER, &name, theme::font_semi(13.0), theme::TEXT, hr.right() - x - 8.0);
                         p.text(pos2(x, hr.center().y + 9.0), egui::Align2::LEFT_CENTER, &site, theme::font(11.0), theme::MUTED);
                         widgets::hsep(ui);
+                        gate::menu_header(member, ui);
+                        widgets::hsep(ui);
                         if widgets::menu_item(ui, "swap", "Switch account").clicked() {
                             switch = true;
                         }
@@ -2107,6 +2126,9 @@ impl App {
                         }
                         if widgets::menu_item(ui, "download", "Check for updates").clicked() {
                             updates = true;
+                        }
+                        if widgets::menu_item(ui, "user", "Log out of FastBet").clicked() {
+                            logout = true;
                         }
                     });
             });
@@ -2124,6 +2146,10 @@ impl App {
         }
         if updates {
             self.check_updates();
+        }
+        if logout {
+            self.account_menu_open = false;
+            self.member.logout();
         }
     }
 
@@ -2156,6 +2182,27 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.member.tick();
+        let unlocked = self.member.unlocked();
+        if self.was_unlocked && !unlocked {
+            // the plan ran out (or the account logged out): runs stop where they are
+            self.stop_auto();
+            self.engine.send(Command::StopSlot);
+            self.account_menu_open = false;
+            self.prefs_open = false;
+        }
+        self.was_unlocked = unlocked;
+        // the plan's end and the next check come without any input: a quiet window wakes up for them
+        ctx.request_repaint_after(Duration::from_secs(self.member.seconds_left().clamp(1, 30)));
+        if !unlocked {
+            self.update_title(ctx);
+            let closing = ctx.input(|i| i.viewport().close_requested());
+            self.maybe_save(closing);
+            if closing {
+                self.engine.send(Command::Shutdown);
+            }
+            return;
+        }
         self.sync_own_seed();
         self.sync_vault();
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
@@ -2223,6 +2270,12 @@ impl eframe::App for App {
             .frame(Frame::new().fill(BG))
             .show_separator_line(false)
             .show(ui, |ui| titlebar::show(self, ui));
+        if !self.member.unlocked() {
+            egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| gate::show(self, ui));
+            update::show(self, ui.ctx());
+            titlebar::resize_grips(ui);
+            return;
+        }
         match self.screen {
             Screen::Accounts => {
                 egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(0))).show(ui, |ui| accounts::accounts(self, ui));

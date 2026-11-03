@@ -15,6 +15,7 @@ mod login;
 #[cfg(target_os = "android")]
 #[path = "login_android.rs"]
 mod login;
+mod member;
 mod money;
 mod originals;
 pub mod paths;
