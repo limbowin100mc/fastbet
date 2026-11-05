@@ -3,8 +3,8 @@
 //! kept in `member.json` next to the settings, checked when the app starts and every few minutes,
 //! and the app locks again the moment the plan runs out.
 //!
-//! What the account bets for real is reported to `/api/app/wager` every minute (in USD, per casino),
-//! for the admin page.
+//! What the account bets for real is reported to `/api/app/wager` every few seconds (in USD, per
+//! casino), for the profile and the admin page.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -227,8 +227,9 @@ pub struct Member {
     wager: Arc<Mutex<Wager>>,
 }
 
-/// How often the wager goes to the website.
-const WAGER_EVERY: Duration = Duration::from_secs(60);
+/// How often the wager goes to the website (only when something was bet), so the profile and the
+/// admin page follow it nearly live.
+const WAGER_EVERY: Duration = Duration::from_secs(15);
 
 /// Wager not on the website yet.
 #[derive(Default)]
