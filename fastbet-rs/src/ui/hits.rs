@@ -48,6 +48,9 @@ pub struct Hit {
     pub demo: bool,
     /// A hit (in the Hits list); otherwise a win whose card was asked for.
     pub hit: bool,
+    /// The bet's id on the casino, and its page there (where the casino has bet pages).
+    pub bet_id: Option<String>,
+    pub link: Option<String>,
 }
 
 impl Hit {
@@ -104,6 +107,7 @@ pub(crate) fn bet_hit(app: &App, n: u64, rec: &BetRecord) -> Hit {
         None => ("Limbo".to_string(), "limbo"),
     };
     let art = app.orig.catalog.iter().find(|c| c.id == slug).map(|c| c.image.clone()).unwrap_or_default();
+    let link = rec.bet_id.as_deref().and_then(|id| casino.bet_url(app.settings.mirror().as_deref(), id));
     Hit {
         key: HitKey::Bet(n),
         at: rec.at,
@@ -115,6 +119,8 @@ pub(crate) fn bet_hit(app: &App, n: u64, rec: &BetRecord) -> Hit {
         art,
         demo: false,
         hit: is_hit_bet(rec),
+        bet_id: rec.bet_id.clone(),
+        link,
     }
 }
 
@@ -139,6 +145,8 @@ pub(crate) fn spin_hit(app: &App, n: u64, rec: &SpinRecord) -> Option<Hit> {
         art: game.image.clone(),
         demo: app.slot.mode == Some(PlayMode::Demo),
         hit: is_hit_spin(rec),
+        bet_id: None,
+        link: None,
     })
 }
 
@@ -199,6 +207,8 @@ const COLS: &[Col] = &[
     Col { name: "Bet", weight: 1.1, right: true },
     Col { name: "Win", weight: 1.2, right: true },
     Col { name: "", weight: 1.0, right: true },
+    // the bet on the casino's site
+    Col { name: "", weight: 0.35, right: true },
 ];
 
 /// The hits, newest first; a click opens the card.
@@ -255,6 +265,21 @@ pub fn table(app: &mut App, ui: &mut Ui, width: f32) {
                 let font = if *strong { theme::font_semi(12.5) } else { theme::font(12.5) };
                 widgets::fit_text(p, pos, al, text, font, *color, w - 16.0);
                 x += w;
+            }
+            // the bet on the casino's site, where it has bet pages
+            if let (Some(url), Some(id)) = (h.link.clone(), h.bet_id.clone()) {
+                let ir = Rect::from_center_size(pos2(rr.right() - 22.0, rr.center().y), vec2(24.0, 24.0));
+                let site = app.casino_site();
+                let link = ui.interact(ir, ui.id().with(("hit-link", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Bet {id}\nOpen it on {site}"));
+                let p = ui.painter();
+                if link.hovered() {
+                    p.rect_filled(ir, CornerRadius::same(6), alpha(GOLD, 30));
+                }
+                widgets::icon(p, ir.shrink(6.0), "external", if link.hovered() { GOLD } else { MUTED });
+                if link.clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    continue;
+                }
             }
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 open_i = Some(i);
@@ -339,6 +364,7 @@ fn big(url: &str) -> String {
 
 /// The card window, while one is open.
 pub fn show(app: &mut App, ctx: &egui::Context) {
+    let site = app.casino_site();
     let Some(view) = app.card.as_mut() else { return };
     if let Some(res) = view.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
         view.rx = None;
@@ -399,6 +425,12 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         if let Some(path) = view.saved.clone() {
             if button(&mut left, "Show in folder", Btn::Ghost, true, None).clicked() {
                 reveal(&path);
+            }
+        }
+        if let Some(url) = view.hit.link.clone() {
+            let tip = view.hit.bet_id.as_deref().map(|id| format!("Bet {id}")).unwrap_or_default();
+            if button(&mut left, &format!("View on {site}  ›"), Btn::Ghost, true, None).on_hover_text(tip).clicked() {
+                left.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
         let mut right = ui.new_child(UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
@@ -469,6 +501,8 @@ mod tests {
             art: String::new(),
             demo: false,
             hit: true,
+            bet_id: None,
+            link: None,
         };
         let name = file_name(&hit);
         assert!(name.starts_with("FastBet Peter & Sons- Barbarossa - Beyond- 3211"), "{name}");

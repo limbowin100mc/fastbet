@@ -943,7 +943,7 @@ impl Casino for BcGame {
         let outcome = Msg::parse(&s.game).map(|g| g.sint(1) as f64 / 100.0).ok_or_else(|| CasinoError::BadReply("Limbo result without a multiplier".into()))?;
         let payout = self.paid(&s, &coin);
         self.credit(&coin, payout - req.amount);
-        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(s.result == 1), nonce: s.nonce })
+        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(s.result == 1), nonce: s.nonce, id: None })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

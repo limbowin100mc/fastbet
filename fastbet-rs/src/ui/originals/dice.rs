@@ -64,13 +64,20 @@ pub fn params(app: &mut App, ui: &mut Ui, locked: bool) {
     ui.horizontal(|ui| {
         let gap = 5.0;
         ui.spacing_mut().item_spacing.x = gap;
-        let n = QUICK.len() as f32;
-        let cw = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
         let rtp = app.casino().rtp();
+        // a 99.99% chance where the casino takes it: 0.9901×, for wagering
+        let wager = rtp / app.casino().dice_chance().1;
+        let quick: Vec<f64> = (wager < 1.0).then_some(wager).into_iter().chain(QUICK.iter().copied()).collect();
+        let n = quick.len() as f32;
+        let cw = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
         let cur = valid(app).map(|t| dice_multiplier_at(rtp, dice_chance(t, app.settings.orig.dice_over)));
-        for m in QUICK {
-            let on = cur.is_some_and(|c| (c - m).abs() < 0.005);
-            if chip_button_sized(ui, &format!("{}×", super::trim(*m)), on, !locked, vec2(cw, 28.0)).clicked() {
+        for m in &quick {
+            let on = cur.is_some_and(|c| (c - m).abs() < if *m < 1.0 { 0.00005 } else { 0.005 });
+            let mut chip = chip_button_sized(ui, &format!("{}×", if *m < 1.0 { format!("{m:.2}") } else { super::trim(*m) }), on, !locked, vec2(cw, 28.0));
+            if *m < 1.0 {
+                chip = chip.on_hover_text(format!("{}×  ·  99.99% win chance", super::trim(*m)));
+            }
+            if chip.clicked() {
                 let chance = rtp / m;
                 app.settings.orig.dice_target = format!("{:.2}", dice_target(chance, app.settings.orig.dice_over));
                 app.mark_dirty();

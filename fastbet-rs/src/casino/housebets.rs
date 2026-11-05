@@ -627,6 +627,7 @@ impl Casino for Housebets {
             winnings: Some(payout),
             win: Some(outcome >= req.target),
             nonce: d.pointer("/game/game/nonce").and_then(Value::as_u64),
+            id: None,
         })
     }
 

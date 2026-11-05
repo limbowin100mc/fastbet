@@ -184,6 +184,8 @@ pub struct BetRecord {
     pub game: Option<Game>,
     /// The original's settled round, for its board and history.
     pub round: Option<Arc<Round>>,
+    /// The bet's id on the casino, for its bet page (see [`CasinoId::bet_url`]).
+    pub bet_id: Option<String>,
 }
 
 impl BetRecord {
@@ -204,6 +206,7 @@ impl BetRecord {
             ms,
             game: Some(r.game),
             round: Some(Arc::new(r.clone())),
+            bet_id: Some(r.id.clone()).filter(|id| !id.is_empty()),
         }
     }
 }
@@ -825,6 +828,7 @@ impl Engine {
             ms,
             game: None,
             round: None,
+            bet_id: reply.id,
         };
         self.settled(&record);
         Ok(Some(record))

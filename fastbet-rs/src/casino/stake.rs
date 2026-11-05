@@ -895,6 +895,7 @@ impl Casino for Stake {
             winnings: payout,
             win,
             nonce: bet.get("nonce").and_then(Value::as_u64),
+            id: bet.get("id").and_then(Value::as_str).map(str::to_string),
         })
     }
 

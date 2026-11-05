@@ -504,6 +504,7 @@ impl Casino for Degen {
             winnings: Some(payout),
             win: Some(d.get("status").and_then(Value::as_str).map(|s| s.eq_ignore_ascii_case("won")).unwrap_or(outcome >= req.target)),
             nonce: d.get("nonce").and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse().ok()))),
+            id: None,
         })
     }
 

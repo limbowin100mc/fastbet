@@ -539,6 +539,7 @@ impl Casino for ChipsGg {
             winnings: r.get("winnings").and_then(units_from_json),
             win: r.get("win").and_then(|w| w.as_bool()),
             nonce: r.get("nonce").and_then(|n| n.as_u64()),
+            id: None,
         })
     }
 

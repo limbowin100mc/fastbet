@@ -498,7 +498,7 @@ impl Casino for Thrill {
         self.credit(&cur, payout - req.amount);
         // a bet of 0 pays 0 either way: the roll against the target decides it
         let win = if req.amount == 0 { outcome >= req.target } else { won > 0.0 || outcome >= req.target };
-        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(win), nonce: d.get("nonce").and_then(Value::as_u64) })
+        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(win), nonce: d.get("nonce").and_then(Value::as_u64), id: None })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

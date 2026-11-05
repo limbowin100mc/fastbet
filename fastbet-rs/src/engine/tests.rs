@@ -86,6 +86,7 @@ impl Casino for Mock {
             winnings: Some(if win { mul_f(req.amount, req.target) } else { 0 }),
             win: Some(win),
             nonce: Some(n as u64),
+            id: None,
         })
     }
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

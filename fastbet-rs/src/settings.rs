@@ -191,6 +191,17 @@ pub struct Settings {
     /// Where the Session pane sits: docked on the right, or floating, and whether it's minimized.
     pub session: SessionPane,
 
+    /// The open tabs, left to right: each one's account and bet panel ([`TabPrefs`]). The fields
+    /// above are tab `tab`'s; its entry here is a copy, refreshed when saving.
+    #[serde(deserialize_with = "lenient_tabs")]
+    pub tabs: Vec<TabPrefs>,
+    pub tab: usize,
+    /// The tab on screen (the one that opens again next time).
+    pub shown: usize,
+
+    /// The version whose "What's new" was last shown; a newer FastBet shows its own once.
+    pub seen_version: String,
+
     /// The file exists but couldn't be read: saving is off so it is never overwritten.
     #[serde(skip)]
     pub unreadable: bool,
@@ -380,6 +391,88 @@ pub struct SlotPrefs {
     pub feature: Option<String>,
 }
 
+/// [`TabPrefs`] from the [`Settings`] fields each tab has its own of, and the swap between them.
+macro_rules! tab_prefs {
+    ($($f:ident: $t:ty),* $(,)?) => {
+        /// What every tab has its own of: the account it plays on and its bet panel.
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct TabPrefs {
+            $(pub $f: $t,)*
+        }
+
+        impl Default for TabPrefs {
+            fn default() -> Self {
+                let d = Settings::default();
+                Self { $($f: d.$f,)* }
+            }
+        }
+
+        impl Settings {
+            /// Trades the tab fields for `t`'s.
+            fn swap_prefs(&mut self, t: &mut TabPrefs) {
+                $(std::mem::swap(&mut self.$f, &mut t.$f);)*
+            }
+
+            /// A copy of the tab fields.
+            pub fn tab_prefs(&self) -> TabPrefs {
+                TabPrefs { $($f: self.$f.clone(),)* }
+            }
+        }
+    };
+}
+
+tab_prefs! {
+    account: String,
+    casino: CasinoId,
+    mode: Mode,
+    strategy: Strategy,
+    rules: Vec<crate::rules::Rule>,
+    script: String,
+    currency: String,
+    unit: Unit,
+    fiat: String,
+    amount: String,
+    target: String,
+    count: String,
+    delay: String,
+    on_win: Adjust,
+    on_win_pct: String,
+    on_loss: Adjust,
+    on_loss_pct: String,
+    stop_profit: String,
+    stop_loss: String,
+    max_bet: String,
+    stop_on_hit: bool,
+    hit_multi: String,
+    seed_enabled: bool,
+    seed_every: String,
+    async_bets: u32,
+    force_restart: bool,
+    restart_on_error: bool,
+    vault_on: bool,
+    vault_every: String,
+    vault_pct: String,
+    slot_demo: bool,
+    slot_stop_mult_on: bool,
+    slot_stop_mult: String,
+    slot_stop_fs: bool,
+    slot_count: String,
+    slot_stop_profit: String,
+    slot_stop_loss: String,
+    orig: OriginalPrefs,
+}
+
+/// Most tabs open at once (each one keeps its own connection running).
+pub const MAX_TABS: usize = 8;
+
+/// The saved tabs. One this build can't read (a casino from a newer FastBet) comes back empty,
+/// and so doesn't open, instead of costing the whole file.
+fn lenient_tabs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<TabPrefs>, D::Error> {
+    let raw: Vec<serde_json::Value> = Deserialize::deserialize(d)?;
+    Ok(raw.into_iter().map(|v| serde_json::from_value(v).unwrap_or_default()).collect())
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -443,6 +536,10 @@ impl Default for Settings {
             slot_prefs: Default::default(),
             orig: OriginalPrefs::default(),
             session: SessionPane::default(),
+            tabs: vec![],
+            tab: 0,
+            shown: 0,
+            seen_version: String::new(),
             unreadable: false,
             removed: vec![],
         }
@@ -461,12 +558,103 @@ impl Settings {
     pub fn load() -> Self {
         let mut s = Self::load_file();
         s.migrate();
+        s.open_tabs();
         // a count the async picker no longer offers comes back as the highest one it does
         s.async_bets = s.async_bets.clamp(1, crate::engine::MAX_CONCURRENCY);
+        for t in &mut s.tabs {
+            t.async_bets = t.async_bets.clamp(1, crate::engine::MAX_CONCURRENCY);
+        }
         if let Some(c) = s.active().map(|a| a.casino) {
             s.casino = c;
         }
         s
+    }
+
+    /// The tabs as they were saved, the one that was on screen in the tab fields. A tab whose
+    /// account is gone, or is open in another tab, doesn't come back; a file without tabs has one.
+    fn open_tabs(&mut self) {
+        if self.tabs.is_empty() {
+            self.tabs.push(self.tab_prefs());
+            self.tab = 0;
+            self.shown = 0;
+            return;
+        }
+        let last = self.tabs.len() - 1;
+        // the fields are the truth for the tab they belong to
+        let tab = self.tab.min(last);
+        self.tabs[tab] = self.tab_prefs();
+        let shown = self.shown.min(last);
+        let mut seen = vec![self.tabs[shown].account.clone()];
+        let mut kept = Vec::new();
+        let mut at = 0;
+        for (i, mut t) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if i != shown {
+                let Some(a) = self.accounts.iter().find(|a| a.id == t.account) else { continue };
+                if seen.contains(&t.account) {
+                    continue;
+                }
+                seen.push(t.account.clone());
+                t.casino = a.casino;
+            } else {
+                at = kept.len();
+            }
+            kept.push(t);
+        }
+        let mut on_screen = kept[at].clone();
+        self.swap_prefs(&mut on_screen);
+        self.tabs = kept;
+        self.tab = at;
+        self.shown = at;
+    }
+
+    /// Puts tab `k`'s panel in the tab fields; the panel there goes back to its own entry.
+    pub fn select_tab(&mut self, k: usize) {
+        if k == self.tab || k >= self.tabs.len() {
+            return;
+        }
+        let mut tabs = std::mem::take(&mut self.tabs);
+        self.swap_prefs(&mut tabs[k]);
+        tabs.swap(self.tab, k);
+        self.tabs = tabs;
+        self.tab = k;
+    }
+
+    /// Copies the tab fields into their tab's entry, so the file has every tab as it is.
+    fn store_tab(&mut self) {
+        let current = self.tab_prefs();
+        if let Some(t) = self.tabs.get_mut(self.tab) {
+            *t = current;
+        }
+    }
+
+    /// A new tab at the end with `prefs`; its index.
+    pub fn add_tab(&mut self, prefs: TabPrefs) -> usize {
+        self.tabs.push(prefs);
+        self.tabs.len() - 1
+    }
+
+    /// Closes tab `k` (not the one in the tab fields: select another first).
+    pub fn remove_tab(&mut self, k: usize) {
+        if k == self.tab || k >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(k);
+        if self.tab > k {
+            self.tab -= 1;
+        }
+        if self.shown > k {
+            self.shown -= 1;
+        }
+        self.shown = self.shown.min(self.tabs.len() - 1);
+    }
+
+    /// The account tab `k` plays on (empty for a tab that has none yet).
+    pub fn tab_account(&self, k: usize) -> &str {
+        if k == self.tab {
+            &self.account
+        } else {
+            self.tabs.get(k).map(|t| t.account.as_str()).unwrap_or("")
+        }
     }
 
     /// Accounts from the one-login-per-casino fields, the first time a multi-account FastBet runs.
@@ -597,6 +785,7 @@ impl Settings {
             }
         }
         self.sync_legacy();
+        self.store_tab();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -766,6 +955,81 @@ mod tests {
         let n = s.accounts.len();
         s.migrate();
         assert_eq!(s.accounts.len(), n);
+    }
+
+    fn with_accounts(ids: &[&str]) -> Settings {
+        let mut s = Settings::default();
+        for id in ids {
+            s.accounts.push(Account { id: id.to_string(), casino: CasinoId::Stake, ..Account::default() });
+        }
+        s
+    }
+
+    #[test]
+    fn every_tab_keeps_its_own_panel() {
+        let mut s = with_accounts(&["a", "b"]);
+        s.open_tabs();
+        s.account = "a".into();
+        s.amount = "1".into();
+        let mut second = s.tab_prefs();
+        second.account = "b".into();
+        second.amount = "2".into();
+        let k = s.add_tab(second);
+        s.select_tab(k);
+        assert_eq!((s.account.as_str(), s.amount.as_str()), ("b", "2"));
+        s.target = "10".into();
+        s.select_tab(0);
+        assert_eq!((s.account.as_str(), s.amount.as_str(), s.target.as_str()), ("a", "1", "2"));
+        assert_eq!(s.tab_account(1), "b");
+        s.select_tab(1);
+        assert_eq!((s.amount.as_str(), s.target.as_str()), ("2", "10"));
+        // shared settings stay put
+        s.hit_sound = false;
+        s.select_tab(0);
+        assert!(!s.hit_sound);
+    }
+
+    #[test]
+    fn tabs_open_again_as_they_were() {
+        let mut s = with_accounts(&["a", "b", "c"]);
+        s.open_tabs();
+        s.account = "a".into();
+        for (id, amount) in [("b", "2"), ("gone", "3"), ("b", "4"), ("c", "5")] {
+            let mut t = s.tab_prefs();
+            t.account = id.into();
+            t.amount = amount.into();
+            s.add_tab(t);
+        }
+        // on screen: "c", while a save happens with "b" in the fields
+        s.shown = 4;
+        s.select_tab(1);
+        s.amount = "2b".into();
+        s.store_tab();
+        let mut back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        back.open_tabs();
+        // the gone account and the second "b" tab don't come back
+        let open: Vec<&str> = back.tabs.iter().map(|t| t.account.as_str()).collect();
+        assert_eq!(open, ["a", "b", "c"]);
+        assert_eq!((back.tab, back.shown), (2, 2));
+        assert_eq!((back.account.as_str(), back.amount.as_str()), ("c", "5"));
+        back.select_tab(1);
+        assert_eq!(back.amount, "2b");
+        // a tab this build can't read stays closed, the rest open
+        let mut v = serde_json::to_value(&s).unwrap();
+        v["tabs"][4]["casino"] = "NewCasino".into();
+        let mut back: Settings = serde_json::from_value(v).unwrap();
+        back.shown = 0;
+        back.open_tabs();
+        let open: Vec<&str> = back.tabs.iter().map(|t| t.account.as_str()).collect();
+        assert_eq!(open, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_file_without_tabs_has_one() {
+        let mut s: Settings = serde_json::from_str(r#"{"account":"a","amount":"7"}"#).unwrap();
+        s.open_tabs();
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!((s.tab, s.shown, s.tabs[0].amount.as_str()), (0, 0, "7"));
     }
 
     #[test]

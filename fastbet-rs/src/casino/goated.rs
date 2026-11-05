@@ -536,7 +536,7 @@ impl Casino for Goated {
         self.settled.fetch_add(1, Ordering::SeqCst);
         // a bet of 0 pays 0 either way: the result against the target decides it
         let win = if req.amount == 0 { Some(outcome >= req.target) } else { payout.map(|p| p > 0) };
-        Ok(BetReply { outcome, amount, winnings: payout, win, nonce: bet.get("nonce").and_then(Value::as_u64) })
+        Ok(BetReply { outcome, amount, winnings: payout, win, nonce: bet.get("nonce").and_then(Value::as_u64), id: None })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

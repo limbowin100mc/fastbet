@@ -565,7 +565,7 @@ impl Casino for Gambulls {
         let payout = bet.pointer("/result/payout").and_then(amount_units).unwrap_or(0);
         self.credit(payout - req.amount);
         self.settled.fetch_add(1, Ordering::SeqCst);
-        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(payout > 0), nonce: None })
+        Ok(BetReply { outcome, amount: Some(req.amount), winnings: Some(payout), win: Some(payout > 0), nonce: None, id: None })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

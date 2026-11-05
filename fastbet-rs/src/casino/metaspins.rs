@@ -683,7 +683,7 @@ impl Casino for Metaspins {
             self.book(&game.currency, after);
         }
         self.settled.fetch_add(1, Ordering::SeqCst);
-        Ok(BetReply { outcome: bet.outcome, amount: Some(bet.amount.unwrap_or(req.amount)), winnings: Some(bet.payout), win: Some(bet.payout > 0), nonce: None })
+        Ok(BetReply { outcome: bet.outcome, amount: Some(bet.amount.unwrap_or(req.amount)), winnings: Some(bet.payout), win: Some(bet.payout > 0), nonce: None, id: None })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

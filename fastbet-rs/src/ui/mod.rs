@@ -27,11 +27,13 @@ pub mod slots_lobby;
 pub mod sound;
 pub mod stats;
 pub mod stats_pane;
+pub mod tabs;
 pub mod theme;
 pub mod titlebar;
 pub mod update;
 pub mod vip;
 pub mod wallet;
+pub mod whats_new;
 pub mod widgets;
 
 use std::collections::VecDeque;
@@ -171,6 +173,10 @@ pub struct App {
     /// The app was open last frame: a plan running out stops the runs once.
     was_unlocked: bool,
     pub update_open: bool,
+    /// The update check made at start: the dialog opens by itself if it finds one.
+    update_on_start: bool,
+    /// "What's new" after an update.
+    pub whats_new: whats_new::WhatsNew,
     /// The Settings window, and the category it shows.
     pub prefs_open: bool,
     pub prefs_tab: prefs::Tab,
@@ -221,6 +227,12 @@ pub struct App {
     pub rewards: rewards::State,
     pub challenges: challenges::State,
 
+    /// Every tab, left to right; `None` at the one on screen (`settings.tab`), which is in the
+    /// fields above (see [`tabs`]).
+    tabs: Vec<Option<Box<tabs::Tab>>>,
+    /// The tab whose × was pressed once while a run was going (a second press closes it).
+    close_armed: Option<usize>,
+
     dirty: bool,
     last_save: Instant,
     title: String,
@@ -233,9 +245,11 @@ impl App {
 
         let ctx = cc.egui_ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let engine = engine::start(repaint.clone());
 
         let settings = Settings::load();
+        // tabs from last time open on their accounts; a single one on the account list, as always
+        let restored = settings.tabs.len() > 1;
+        let first = if restored && settings.active().is_some() { Screen::Account } else { Screen::Accounts };
         let screen = match std::env::var("FASTBET_SCREEN").as_deref() {
             Ok("lobby") => Screen::Lobby,
             Ok("limbo") => Screen::Limbo,
@@ -244,29 +258,20 @@ impl App {
             Ok("rewards") => Screen::Rewards,
             // FASTBET_SCREEN=orig:<slug> opens an original's page (UI work)
             Ok(v) if v.starts_with("orig:") => crate::originals::Game::from_slug(&v[5..]).map(Screen::Original).unwrap_or(Screen::Lobby),
-            _ => Screen::Accounts,
+            _ => first,
         };
         let preview: Option<usize> = std::env::var("FASTBET_PREVIEW").ok().map(|v| v.parse().unwrap_or(400));
-        if preview.is_none() {
-            engine.send(Command::SetCasino { id: settings.casino, setup: settings.setup() });
-        }
-        engine.send(Command::SeedPolicy { every: settings.seed_every() });
-        engine.send(Command::SetConcurrency(settings.async_bets.clamp(1, engine::MAX_CONCURRENCY)));
-        engine.send(Command::ForceRestart { always: settings.force_restart, on_error: settings.restart_on_error });
-
-        // FASTBET_SLOT=<catalog id>:<provider id>:<name>[:<producer>] opens a demo game at startup (UI work).
-        let mut screen = screen;
-        if let Ok(spec) = std::env::var("FASTBET_SLOT") {
-            let mut it = spec.splitn(4, ':');
-            let (id, pid, name) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string(), it.next().unwrap_or("Slot").to_string());
-            let producer = it.next().unwrap_or("hacksawgaming").to_string();
-            let game = SlotGame { id, name, producer, image: String::new(), demo: true, rtp: 96.3, provider_game_id: Some(pid), studio: None };
-            engine.send(Command::OpenSlot { game, mode: PlayMode::Demo, currency: "usdt".into(), fiat: "usd".into() });
-            screen = Screen::Slot;
-        }
 
         let updater = crate::update::Updater::new(repaint.clone());
         let member = crate::member::Member::new(repaint.clone());
+        let tabs::Tab {
+            engine, screen, stage, onboard_error, key_input, mirror_input, mirror_search, mirror_open, cf_open,
+            cf_agent_input, cf_cookie_input, cookies_cleared, open_casino, account_search, remove_row, remove_armed,
+            login_manual, manual_access, manual_refresh, cf_ip, status, status_detail, market, provable, seed, queued,
+            auto, stats, history, hit_badge_n, hits, hits_seen, hits_tab, card, flash, notice, pop_at, token_visible,
+            wallet_open, wallet_search, wallet_search_focused, wallet_fiats, seed_sent, seed_applied, catalog, slot,
+            spins, spins_total, slot_stats, slot_pop, orig, code, vault_sent, vault, vip, vip_open, rewards, challenges,
+        } = tabs::Tab::new(engine::start(repaint.clone()), screen);
         let mut app = Self {
             settings,
             engine,
@@ -276,44 +281,44 @@ impl App {
             #[cfg(target_os = "android")]
             keyboard: keyboard::Keyboard::default(),
             screen,
-            stage: Stage::Idle,
-            onboard_error: None,
-            key_input: String::new(),
-            mirror_input: String::new(),
-            mirror_search: String::new(),
-            mirror_open: false,
-            cf_open: false,
-            cookies_cleared: false,
-            open_casino: None,
-            account_search: String::new(),
-            remove_row: None,
-            remove_armed: false,
-            login_manual: false,
-            manual_access: String::new(),
-            manual_refresh: String::new(),
-            cf_agent_input: String::new(),
-            cf_cookie_input: String::new(),
-            cf_ip: None,
-            status: ConnStatus::Connecting,
-            status_detail: String::new(),
-            market: Market::default(),
-            provable: ProvableState::default(),
-            seed: SeedInfo::default(),
-            queued: 0,
-            auto: AutoState::default(),
-            stats: Stats::fresh("", 8),
-            history: History::default(),
-            hit_badge_n: None,
-            hits: Vec::new(),
-            hits_seen: 0,
-            hits_tab: false,
-            card: None,
-            flash: None,
-            notice: None,
+            stage,
+            onboard_error,
+            key_input,
+            mirror_input,
+            mirror_search,
+            mirror_open,
+            cf_open,
+            cookies_cleared,
+            open_casino,
+            account_search,
+            remove_row,
+            remove_armed,
+            login_manual,
+            manual_access,
+            manual_refresh,
+            cf_agent_input,
+            cf_cookie_input,
+            cf_ip,
+            status,
+            status_detail,
+            market,
+            provable,
+            seed,
+            queued,
+            auto,
+            stats,
+            history,
+            hit_badge_n,
+            hits,
+            hits_seen,
+            hits_tab,
+            card,
+            flash,
+            notice,
             sound: sound::Sound::new(),
-            pop_at: None,
-            token_visible: false,
-            wallet_open: std::env::var("FASTBET_WALLET").is_ok(),
+            pop_at,
+            token_visible,
+            wallet_open,
             account_menu_open: std::env::var("FASTBET_ACCOUNT_MENU").is_ok(),
             welcome_menu_open: std::env::var("FASTBET_WELCOME_MENU").is_ok(),
             updater,
@@ -323,6 +328,8 @@ impl App {
             gate_show_pw: false,
             was_unlocked: false,
             update_open: false,
+            update_on_start: false,
+            whats_new: Default::default(),
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
             // FASTBET_PREFS=storage / sound / alerts opens it on that page
@@ -336,35 +343,58 @@ impl App {
             sound_view: prefs::SoundView::default(),
             alerts_view: Default::default(),
             seed_name_editing: false,
-            seed_sent: None,
-            seed_applied: None,
+            seed_sent,
+            seed_applied,
             seed_preview: None,
             update_close_at: None,
-            wallet_search: String::new(),
-            wallet_search_focused: false,
-            wallet_fiats: std::env::var("FASTBET_WALLET").is_ok_and(|v| v == "fiat"),
+            wallet_search,
+            wallet_search_focused,
+            wallet_fiats,
             logos: logos::Logos::default(),
             images: images::ImageCache::new(),
-            catalog: slots_lobby::Catalog::default(),
-            slot: SlotState::default(),
-            spins: VecDeque::new(),
-            spins_total: 0,
-            slot_stats: Stats::fresh("USD", 2),
-            slot_pop: None,
-            orig: originals::State::default(),
-            code: Default::default(),
-            vault_sent: None,
-            vault: VaultView::default(),
-            vip: None,
-            // FASTBET_VIP=1: the VIP dropdown opens at start (UI work)
-            vip_open: std::env::var("FASTBET_VIP").is_ok(),
-            rewards: rewards::State::default(),
-            // FASTBET_CHALLENGES=1: the challenges window opens at start (UI work)
-            challenges: challenges::State { window_open: std::env::var("FASTBET_CHALLENGES").is_ok(), ..Default::default() },
+            catalog,
+            slot,
+            spins,
+            spins_total,
+            slot_stats,
+            slot_pop,
+            orig,
+            code,
+            vault_sent,
+            vault,
+            vip,
+            vip_open,
+            rewards,
+            challenges,
+            tabs: Vec::new(),
+            close_armed: None,
             dirty: false,
             last_save: Instant::now(),
             title: String::new(),
         };
+        // UI work: FASTBET_WALLET=1 opens the wallet dropdown (=fiat on its fiat picker),
+        // FASTBET_VIP=1 the VIP dropdown, FASTBET_CHALLENGES=1 the challenges window
+        app.wallet_open = std::env::var("FASTBET_WALLET").is_ok();
+        app.wallet_fiats = std::env::var("FASTBET_WALLET").is_ok_and(|v| v == "fiat");
+        app.vip_open = std::env::var("FASTBET_VIP").is_ok();
+        app.challenges.window_open = std::env::var("FASTBET_CHALLENGES").is_ok();
+        // the other tabs from last time, each with its own connection
+        let on_screen = app.settings.tab;
+        app.tabs = (0..app.settings.tabs.len())
+            .map(|k| (k != on_screen).then(|| Box::new(tabs::Tab::new(engine::start(app.repaint.clone()), Screen::Account))))
+            .collect();
+        app.boot();
+        app.each_background(|a| a.boot());
+
+        // FASTBET_SLOT=<catalog id>:<provider id>:<name>[:<producer>] opens a demo game at startup (UI work).
+        if let Ok(spec) = std::env::var("FASTBET_SLOT") {
+            let mut it = spec.splitn(4, ':');
+            let (id, pid, name) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string(), it.next().unwrap_or("Slot").to_string());
+            let producer = it.next().unwrap_or("hacksawgaming").to_string();
+            let game = SlotGame { id, name, producer, image: String::new(), demo: true, rtp: 96.3, provider_game_id: Some(pid), studio: None };
+            app.send(Command::OpenSlot { game, mode: PlayMode::Demo, currency: "usdt".into(), fiat: "usd".into() });
+            app.screen = Screen::Slot;
+        }
         // the account list opens on the casino last used
         let last = app.settings.casino;
         app.open_casino = app.settings.accounts.iter().any(|a| a.casino == last).then_some(last);
@@ -410,10 +440,15 @@ impl App {
                 app.catalog.providers = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
         }
-        // FASTBET_UPDATE=1: run "Check for updates" at start (UI work)
+        // FASTBET_UPDATE=1: run "Check for updates" at start (UI work); otherwise the check runs
+        // quietly and says something only when there is an update
         if std::env::var("FASTBET_UPDATE").is_ok() {
             app.check_updates();
+        } else if preview.is_none() {
+            app.updater.check();
+            app.update_on_start = true;
         }
+        app.start_whats_new();
         // FASTBET_LOGIN=1: open the active account's login window at start (testing a casino's login)
         if std::env::var("FASTBET_LOGIN").is_ok() {
             app.start_login();
@@ -461,6 +496,7 @@ impl App {
                 ms: rng.random_range(120.0..220.0),
                 game: None,
                 round: None,
+                bet_id: None,
             };
             self.stats.settle(&rec, 6, self.history.next_n());
             let hit_rec = hits::is_hit_bet(&rec).then(|| rec.clone());
@@ -908,6 +944,18 @@ impl App {
         self.screen = Screen::Original(game);
     }
 
+    /// Asks for the originals' payout tables once connected; true the time it asks.
+    fn request_original_info(&mut self) -> bool {
+        if !self.ready() || self.orig.info_requested {
+            return false;
+        }
+        self.orig.info_requested = true;
+        if !self.casino().originals().is_empty() {
+            self.engine.send(Command::OriginalInfo);
+        }
+        true
+    }
+
     /// Currency and stake for an original's bet. A zero stake is allowed: Stake plays it for free.
     fn orig_setup(&self) -> Result<(String, Units), String> {
         if !self.ready() {
@@ -1126,7 +1174,7 @@ impl App {
     /// Makes `account` the one in use and connects to its casino with its login.
     pub fn switch_account(&mut self, account: &str) {
         let Some(id) = self.settings.accounts.iter().find(|a| a.id == account).map(|a| a.casino) else { return };
-        if account == self.settings.account {
+        if account == self.settings.account || self.tab_of(account).is_some() {
             return;
         }
         self.settings.account = account.to_string();
@@ -1157,6 +1205,50 @@ impl App {
         self.updater.check();
     }
 
+    /// "What's new" once after an update: the notes since the version that last showed them (a fresh
+    /// install has nothing new to it). FASTBET_WHATS_NEW=<version> shows the notes after it (UI work).
+    fn start_whats_new(&mut self) {
+        let current = crate::update::current();
+        if let Ok(from) = std::env::var("FASTBET_WHATS_NEW") {
+            self.whats_new = whats_new::WhatsNew::fetch(from.trim(), &current, false, self.repaint.clone());
+            return;
+        }
+        let seen = self.settings.seen_version.clone();
+        if seen.is_empty() && self.settings.accounts.is_empty() {
+            self.settings.seen_version = current;
+            self.mark_dirty();
+        } else if seen.is_empty() || crate::update::is_newer(&current, &seen) {
+            self.whats_new = whats_new::WhatsNew::fetch(&seen, &current, true, self.repaint.clone());
+        }
+    }
+
+    /// A real-money bet worth `usd`: it goes on the FastBet account's wager (the admin page sums it).
+    fn count_wager(&self, usd: Option<f64>) {
+        if let Some(usd) = usd {
+            self.member.add_wager(self.casino().key(), usd);
+        }
+    }
+
+    /// The update check made at start opens the dialog only when it finds an update.
+    fn startup_update(&mut self) {
+        if !self.update_on_start {
+            return;
+        }
+        match self.updater.state() {
+            crate::update::State::Idle | crate::update::State::Checking => {}
+            crate::update::State::Available { .. } => {
+                self.update_on_start = false;
+                self.update_open = true;
+            }
+            _ => {
+                self.update_on_start = false;
+                if !self.update_open {
+                    self.updater.dismiss();
+                }
+            }
+        }
+    }
+
     pub fn go_accounts(&mut self) {
         if self.auto.running {
             self.stop_auto();
@@ -1180,6 +1272,16 @@ impl App {
     }
 
     pub fn open_account(&mut self, account: &str) {
+        // it plays in another tab already: that tab comes on screen (this one closes if it had
+        // nothing in it yet)
+        if let Some(k) = self.tab_of(account) {
+            let (here, blank) = (self.settings.tab, self.settings.account.is_empty());
+            self.show_tab(k);
+            if blank {
+                self.close_tab(here);
+            }
+            return;
+        }
         self.switch_account(account);
         self.stage = Stage::Idle;
         self.onboard_error = None;
@@ -1207,6 +1309,10 @@ impl App {
 
     /// Forgets an account's login and its login window profile (the casino account itself stays).
     pub fn forget_account(&mut self, id: &str) {
+        // another tab plays on it (the account list offers no remove there)
+        if self.tab_of(id).is_some() {
+            return;
+        }
         let active = id == self.settings.account;
         self.settings.accounts.retain(|a| a.id != id);
         self.settings.removed.push(id.to_string());
@@ -1591,9 +1697,15 @@ impl App {
             ms: rec.ms,
             game: None,
             round: None,
+            bet_id: None,
         };
         if self.slot_stats.cur != rec.currency || self.slot_stats.decimals != rec.decimals {
             self.slot_stats = Stats::fresh(&rec.currency, rec.decimals);
+        }
+        if self.slot.mode != Some(PlayMode::Demo) && rec.cost > 0 {
+            let cost = rec.cost as f64 / 10f64.powi(rec.decimals as i32);
+            let rate = if rec.currency.eq_ignore_ascii_case("usd") { Some(1.0) } else { self.info(&rec.currency.to_ascii_lowercase()).map(|i| i.price).filter(|p| *p > 0.0) };
+            self.count_wager(rate.map(|r| cost * r));
         }
         self.spins_total += 1;
         let n = self.spins_total;
@@ -1742,6 +1854,9 @@ impl App {
                     }
                 }
                 Event::Bet(rec) => {
+                    if rec.amount > 0 {
+                        self.count_wager(self.usd_value(rec.amount, &rec.currency));
+                    }
                     let dec = self.info(&rec.currency).map(|i| i.decimals).unwrap_or(8);
                     self.stats.settle(&rec, dec, self.history.next_n());
                     if let Some(n) = rec.nonce {
@@ -2184,25 +2299,50 @@ impl eframe::App for App {
         self.drain_events();
         self.member.tick();
         let unlocked = self.member.unlocked();
-        if self.was_unlocked && !unlocked {
-            // the plan ran out (or the account logged out): runs stop where they are
+        // the plan ran out (or the account logged out): runs stop where they are, in every tab
+        let locking = self.was_unlocked && !unlocked;
+        if locking {
             self.stop_auto();
             self.engine.send(Command::StopSlot);
             self.account_menu_open = false;
             self.prefs_open = false;
         }
         self.was_unlocked = unlocked;
+        // the tabs off screen bet on: their events, seed and vault, and their login flow
+        self.each_background(|app| {
+            app.drain_events();
+            if locking {
+                app.stop_auto();
+                app.send(Command::StopSlot);
+            }
+            if unlocked {
+                app.sync_own_seed();
+                app.sync_vault();
+                app.request_original_info();
+                if matches!(app.screen, Screen::Accounts | Screen::Account) {
+                    app.onboarding_logic();
+                }
+            }
+        });
         // the plan's end and the next check come without any input: a quiet window wakes up for them
         ctx.request_repaint_after(Duration::from_secs(self.member.seconds_left().clamp(1, 30)));
+        self.startup_update();
+        if self.whats_new.poll() {
+            self.settings.seen_version = self.whats_new.version.clone();
+            self.mark_dirty();
+        }
         if !unlocked {
             self.update_title(ctx);
             let closing = ctx.input(|i| i.viewport().close_requested());
             self.maybe_save(closing);
             if closing {
-                self.engine.send(Command::Shutdown);
+                self.member.flush_wager();
+                self.shutdown_tabs();
             }
             return;
         }
+        self.tab_hotkeys(ctx);
+        self.tab_dev_steps(ctx);
         self.sync_own_seed();
         self.sync_vault();
         if !self.casino().has_slots() && matches!(self.screen, Screen::Slots | Screen::Slot) {
@@ -2223,11 +2363,7 @@ impl eframe::App for App {
             }
         }
         self.orig_dev_play();
-        if self.ready() && !self.orig.info_requested {
-            self.orig.info_requested = true;
-            if !self.casino().originals().is_empty() {
-                self.engine.send(Command::OriginalInfo);
-            }
+        if self.request_original_info() {
             // FASTBET_ORIG_BET=1: one manual bet on the open original (or Limbo) once connected
             // (UI work; FASTBET_ORIG_BET=auto starts an auto run instead)
             match (self.screen, std::env::var("FASTBET_ORIG_BET").as_deref()) {
@@ -2252,7 +2388,8 @@ impl eframe::App for App {
         let closing = ctx.input(|i| i.viewport().close_requested());
         self.maybe_save(closing);
         if closing {
-            self.engine.send(Command::Shutdown);
+            self.member.flush_wager();
+            self.shutdown_tabs();
         }
     }
 
@@ -2344,6 +2481,9 @@ impl eframe::App for App {
             challenges::window(self, ui.ctx());
         }
         update::show(self, ui.ctx());
+        if !self.update_open {
+            whats_new::show(self, ui.ctx());
+        }
         titlebar::resize_grips(ui);
     }
 }

@@ -1511,6 +1511,12 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.line_segment([at(0.5, 0.08), at(0.5, 0.92)], s);
             p.line_segment([at(0.08, 0.5), at(0.92, 0.5)], s);
         }
+        // a box with an arrow out of its corner: opens on a website
+        "external" => {
+            p.add(egui::Shape::line(vec![at(0.42, 0.14), at(0.14, 0.14), at(0.14, 0.86), at(0.86, 0.86), at(0.86, 0.58)], s));
+            p.line_segment([at(0.48, 0.52), at(0.9, 0.1)], s);
+            p.add(egui::Shape::line(vec![at(0.6, 0.1), at(0.9, 0.1), at(0.9, 0.4)], s));
+        }
         _ => {}
     }
 }

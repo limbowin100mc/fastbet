@@ -2,7 +2,11 @@
 //! Weekly or Monthly plan. The website's `/api/app/*` logs in and reports the plan; the session is
 //! kept in `member.json` next to the settings, checked when the app starts and every few minutes,
 //! and the app locks again the moment the plan runs out.
+//!
+//! What the account bets for real is reported to `/api/app/wager` every minute (in USD, per casino),
+//! for the admin page.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -108,6 +112,59 @@ struct Inner {
 pub struct Member {
     inner: Arc<Mutex<Inner>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    wager: Arc<Mutex<Wager>>,
+}
+
+/// How often the wager goes to the website.
+const WAGER_EVERY: Duration = Duration::from_secs(60);
+
+/// Wager not on the website yet.
+#[derive(Default)]
+struct Wager {
+    /// Bet since the last report, per casino key: USD and how many bets.
+    pending: BTreeMap<String, (f64, u64)>,
+    /// A report sent and not confirmed: it keeps its id, so sending it again counts it once.
+    out: Option<Report>,
+    sending: bool,
+    next: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct Report {
+    id: String,
+    entries: Vec<(String, f64, u64)>,
+}
+
+/// A random UUID (v4), a report's id.
+fn report_id() -> String {
+    let mut b: [u8; 16] = rand::random();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+/// Sends a report: Ok when the website has it (or will never take it, so it isn't sent again).
+fn send_report(token: &str, r: &Report, timeout: Duration) -> Result<(), String> {
+    let wagers: Vec<serde_json::Value> = r.entries.iter().map(|(c, usd, bets)| serde_json::json!({ "casino": c, "usd": usd, "bets": bets })).collect();
+    let resp = reqwest::blocking::Client::builder()
+        .user_agent(format!("FastBet/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?
+        .post(page("/api/app/wager"))
+        .json(&serde_json::json!({ "access_token": token, "report_id": r.id, "wagers": wagers }))
+        .send()
+        .map_err(|e| e.to_string())?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        // a report the website can't read never will be
+        400 => {
+            tracing::warn!("FastBet wager report refused: {}", resp.text().unwrap_or_default());
+            Ok(())
+        }
+        code => Err(format!("FastBet answered {code}")),
+    }
 }
 
 fn now() -> u64 {
@@ -214,7 +271,7 @@ impl Member {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         let saved = load();
         let gate = if saved.is_some() { Gate::Checking } else { Gate::LoggedOut { error: None } };
-        let m = Self { inner: Arc::new(Mutex::new(Inner { gate, saved, busy: false, next_check: Instant::now() })), repaint };
+        let m = Self { inner: Arc::new(Mutex::new(Inner { gate, saved, busy: false, next_check: Instant::now() })), repaint, wager: Default::default() };
         if m.inner.lock().saved.is_some() {
             m.check();
         }
@@ -255,6 +312,86 @@ impl Member {
         };
         if due {
             self.check();
+        }
+        let report = {
+            let mut w = self.wager.lock();
+            let now = Instant::now();
+            if w.sending || w.next.is_some_and(|t| now < t) {
+                false
+            } else {
+                w.next = Some(now + WAGER_EVERY);
+                true
+            }
+        };
+        if report {
+            self.report_wager();
+        }
+    }
+
+    /// A real-money bet worth `usd` on `casino` (its key): counted for the account's wager.
+    pub fn add_wager(&self, casino: &str, usd: f64) {
+        if !(usd.is_finite() && usd > 0.0) {
+            return;
+        }
+        let mut w = self.wager.lock();
+        let e = w.pending.entry(casino.to_string()).or_default();
+        e.0 += usd;
+        e.1 += 1;
+    }
+
+    /// The report to send now, and the token to send it with: the one not confirmed yet, else
+    /// what's pending. None when there's nothing, or nobody logged in.
+    fn take_report(&self) -> Option<(String, Report)> {
+        let token = self.inner.lock().saved.as_ref().map(|s| s.access_token.clone())?;
+        let mut w = self.wager.lock();
+        if w.sending {
+            return None;
+        }
+        if w.out.is_none() {
+            if w.pending.is_empty() {
+                return None;
+            }
+            let entries = std::mem::take(&mut w.pending).into_iter().map(|(c, (usd, bets))| (c, usd, bets)).collect();
+            w.out = Some(Report { id: report_id(), entries });
+        }
+        w.sending = true;
+        Some((token, w.out.clone()?))
+    }
+
+    fn report_done(wager: &Mutex<Wager>, res: Result<(), String>) {
+        let mut w = wager.lock();
+        w.sending = false;
+        match res {
+            Ok(()) => w.out = None,
+            Err(e) => tracing::warn!("FastBet wager report: {e} (sent again later)"),
+        }
+    }
+
+    /// Sends the wager since the last report, on a worker thread.
+    fn report_wager(&self) {
+        let Some((token, report)) = self.take_report() else { return };
+        let wager = self.wager.clone();
+        std::thread::spawn(move || Self::report_done(&wager, send_report(&token, &report, Duration::from_secs(20))));
+    }
+
+    /// The app is closing: the last report goes now (a few seconds at most).
+    pub fn flush_wager(&self) {
+        // the one a worker is sending: give it a moment
+        for _ in 0..20 {
+            if !self.wager.lock().sending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // the unconfirmed one, then what's pending; offline, the first try is enough
+        for _ in 0..2 {
+            let Some((token, report)) = self.take_report() else { return };
+            let res = send_report(&token, &report, Duration::from_secs(3));
+            let failed = res.is_err();
+            Self::report_done(&self.wager, res);
+            if failed {
+                return;
+            }
         }
     }
 
@@ -342,6 +479,9 @@ impl Member {
 
     /// Forgets the session here and ends it on the website.
     pub fn logout(&self) {
+        // what wasn't reported yet belongs to this account: it goes before the session ends
+        let report = self.take_report();
+        *self.wager.lock() = Wager::default();
         let saved = {
             let mut i = self.inner.lock();
             i.gate = Gate::LoggedOut { error: None };
@@ -350,6 +490,9 @@ impl Member {
         store(None);
         if let Some(s) = saved {
             std::thread::spawn(move || {
+                if let Some((token, r)) = report {
+                    let _ = send_report(&token, &r, Duration::from_secs(10));
+                }
                 let _ = client().and_then(|c| {
                     c.post(page("/api/app/logout")).json(&serde_json::json!({ "access_token": s.access_token })).send().map_err(|e| e.to_string())
                 });

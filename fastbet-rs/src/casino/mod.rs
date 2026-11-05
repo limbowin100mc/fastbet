@@ -96,6 +96,19 @@ impl CasinoId {
         self.mirrors().first().copied()
     }
 
+    /// The casino's own page for bet `id` (the id its bet reply carries), on `mirror` where it has
+    /// mirrors: Stake's and Shuffle's bet windows open from a link.
+    pub fn bet_url(self, mirror: Option<&str>, id: &str) -> Option<String> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return None;
+        }
+        match self {
+            CasinoId::Stake | CasinoId::StakeUs => Some(format!("https://{}/?betId={id}&modal=bet", mirror.or(self.default_mirror())?)),
+            CasinoId::Shuffle => Some(format!("https://shuffle.com/?modal=bet&md-id={id}")),
+            _ => None,
+        }
+    }
+
     /// Sits behind Cloudflare checks, so the user can hand over a clearance cookie from their browser.
     pub fn behind_cloudflare(self) -> bool {
         matches!(self, CasinoId::Stake | CasinoId::StakeUs)
@@ -291,11 +304,13 @@ impl CasinoId {
         matches!(self, CasinoId::ChipsGg)
     }
 
-    /// Dice win chances accepted here, in percent (Goated pays at most 990×, BC.Game at least 1.0102×).
+    /// Dice win chances accepted here, in percent (Goated pays at most 990×, BC.Game at least
+    /// 1.0102×; Stake and Shuffle go up to 99.99%, a 0.9901× payout, for wagering).
     pub fn dice_chance(self) -> (f64, f64) {
         match self {
             CasinoId::Goated => (0.1, 98.0),
             CasinoId::BcGame => (0.01, 97.01),
+            CasinoId::Stake | CasinoId::Shuffle => (0.01, 99.99),
             _ => (0.01, 98.0),
         }
     }
@@ -913,6 +928,8 @@ pub struct BetReply {
     pub winnings: Option<Units>,
     pub win: Option<bool>,
     pub nonce: Option<u64>,
+    /// The bet's id on the casino, as its bet page takes it (see [`CasinoId::bet_url`]).
+    pub id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1203,6 +1220,27 @@ fn backoff(retries: &mut u32) -> Duration {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bet_pages() {
+        let uuid = "0a158722-067f-404a-813c-b5b52134c121";
+        assert_eq!(CasinoId::Stake.bet_url(None, uuid).as_deref(), Some("https://stake.com/?betId=0a158722-067f-404a-813c-b5b52134c121&modal=bet"));
+        assert_eq!(CasinoId::Stake.bet_url(Some("stake.bet"), uuid).as_deref(), Some("https://stake.bet/?betId=0a158722-067f-404a-813c-b5b52134c121&modal=bet"));
+        assert_eq!(CasinoId::Shuffle.bet_url(None, "CgjzRwWV9xZhuDV2YNrEm").as_deref(), Some("https://shuffle.com/?modal=bet&md-id=CgjzRwWV9xZhuDV2YNrEm"));
+        // no page, or an id that would break the link
+        assert_eq!(CasinoId::ChipsGg.bet_url(None, "abc"), None);
+        assert_eq!(CasinoId::Stake.bet_url(None, "a&modal=x"), None);
+        assert_eq!(CasinoId::Stake.bet_url(None, ""), None);
+    }
+
+    #[test]
+    fn dice_wagering_chance_where_the_casino_takes_it() {
+        assert_eq!(CasinoId::Stake.dice_chance().1, 99.99);
+        assert_eq!(CasinoId::Shuffle.dice_chance().1, 99.99);
+        assert_eq!(CasinoId::ChipsGg.dice_chance().1, 98.0);
+        let m = crate::originals::dice_multiplier_at(CasinoId::Stake.rtp(), 99.99);
+        assert!((m - 0.990099).abs() < 1e-6);
+    }
 
     #[test]
     fn iso_times_and_claim_texts() {

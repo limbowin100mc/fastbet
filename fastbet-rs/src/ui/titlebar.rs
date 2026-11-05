@@ -1,12 +1,12 @@
-//! The window's own title bar (the system one is turned off so the account can sit in the
-//! middle): the wordmark on the left, who is logged in and at which casino in the middle,
-//! the window buttons on the right. Also the resize grips the system border gave before.
+//! The window's own title bar (the system one is turned off so the tabs can sit in it): the
+//! wordmark on the left, the tabs (casino and account each) after it, the window buttons on
+//! the right. Also the resize grips the system border gave before.
 
 use egui::{pos2, vec2, Align, Color32, CursorIcon, Id, Layout, PointerButton, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand};
 
-use super::theme::{self, DIM, LINE, MUTED, TEXT, TEXT2};
+use super::theme::{self, LINE, TEXT2};
 use super::widgets;
-use super::{App, Screen};
+use super::App;
 
 pub const HEIGHT: f32 = 34.0;
 const BUTTON_W: f32 = 46.0;
@@ -31,8 +31,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     );
     widgets::wordmark(&mut left, 14.0);
 
-    if !matches!(app.screen, Screen::Accounts | Screen::Account) {
-        who(app, ui, bar);
+    // the tabs, between the wordmark and the window buttons
+    if app.member.unlocked() {
+        let area = Rect::from_min_max(pos2(left.min_rect().right() + 18.0, bar.top()), pos2(bar.right() - 3.0 * BUTTON_W - 12.0, bar.bottom()));
+        super::tabs::strip(app, ui, area);
     }
 
     let mut x = bar.right() - BUTTON_W;
@@ -48,31 +50,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     if button(ui, Rect::from_min_size(pos2(x, bar.top()), vec2(BUTTON_W, bar.height())), Glyph::Minimize).clicked() {
         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
     }
-}
-
-/// "name · [logo] Casino", centred on the window.
-fn who(app: &mut App, ui: &Ui, bar: Rect) {
-    let id = app.casino();
-    let p = ui.painter();
-    let name = app.active_name().unwrap_or_default();
-    let name_g = p.layout_no_wrap(name.clone(), theme::font_semi(12.5), TEXT);
-    let casino_g = p.layout_no_wrap(id.name().to_string(), theme::font_semi(12.5), MUTED);
-    const LOGO: f32 = 14.0;
-    const GAP: f32 = 7.0;
-    // the dot between name and casino, with room on both sides
-    const SEP: f32 = 18.0;
-    let name_w = if name.is_empty() { 0.0 } else { name_g.size().x + SEP };
-    let w = name_w + LOGO + GAP + casino_g.size().x;
-    let cy = bar.center().y;
-    let mut x = bar.center().x - w / 2.0;
-    if !name.is_empty() {
-        p.galley(pos2(x, cy - name_g.size().y / 2.0), name_g, TEXT);
-        x += name_w;
-        p.circle_filled(pos2(x - SEP / 2.0, cy), 1.5, DIM);
-    }
-    app.logos.paint(ui.painter(), Rect::from_min_size(pos2(x, cy - LOGO / 2.0), vec2(LOGO, LOGO)), id, TEXT2);
-    x += LOGO + GAP;
-    ui.painter().galley(pos2(x, cy - casino_g.size().y / 2.0), casino_g, MUTED);
 }
 
 #[derive(Clone, Copy)]

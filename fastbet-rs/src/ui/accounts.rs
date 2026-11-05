@@ -196,7 +196,7 @@ fn group_body(app: &mut App, ui: &mut Ui, casino: CasinoId, room: f32, t: f32, p
 }
 
 /// One account of an open casino: initial, username, mirror (when it isn't the main site),
-/// and on hover a bin that asks for a second press.
+/// and on hover a bin that asks for a second press (or "Open in another tab").
 fn account_row(app: &App, ui: &mut Ui, a: &Account, pick: &mut Option<Pick>) {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, ACCOUNT_H), egui::Sense::click());
@@ -210,7 +210,9 @@ fn account_row(app: &App, ui: &mut Ui, a: &Account, pick: &mut Option<Pick>) {
     } else {
         Rect::from_center_size(pos2(rect.right() - 46.0, cy), vec2(26.0, 26.0))
     };
-    let bin_resp = (over || armed).then(|| {
+    // another tab plays on it: a click goes there, and it can't be removed from here
+    let elsewhere = app.tab_of(&a.id).is_some();
+    let bin_resp = (!elsewhere && (over || armed)).then(|| {
         let hint = if armed { "Forgets this login on this PC (the casino account itself stays)" } else { "Remove account" };
         ui.interact(bin, ui.id().with(("remove", &a.id)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint)
     });
@@ -230,7 +232,9 @@ fn account_row(app: &App, ui: &mut Ui, a: &Account, pick: &mut Option<Pick>) {
     };
     p.text(pos2(rect.left() + 78.0, cy), Align2::LEFT_CENTER, label, theme::font_semi(12.5), color);
     let mirror = a.mirror.as_deref().filter(|m| Some(*m) != a.casino.default_mirror());
-    if let (Some(m), false) = (mirror, armed) {
+    if elsewhere {
+        p.text(pos2(rect.right() - 40.0, cy), Align2::RIGHT_CENTER, "Open in another tab", theme::font(11.5), MUTED);
+    } else if let (Some(m), false) = (mirror, armed) {
         p.text(pos2(rect.right() - 66.0, cy), Align2::RIGHT_CENTER, m, theme::font(11.5), MUTED);
     }
     match &bin_resp {

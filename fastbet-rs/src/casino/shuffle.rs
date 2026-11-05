@@ -829,7 +829,7 @@ impl Casino for Shuffle {
         // a bet of 0 pays 0 either way: the result against the target decides it
         let target = limbo.get("userValue").and_then(f64_from_json).unwrap_or(req.target);
         let win = if req.amount == 0 { Some(outcome >= target) } else { payout.map(|p| p > 0) };
-        Ok(BetReply { outcome, amount, winnings: payout, win, nonce: bet.get("gameSeedNonce").and_then(Value::as_u64) })
+        Ok(BetReply { outcome, amount, winnings: payout, win, nonce: bet.get("gameSeedNonce").and_then(Value::as_u64), id: bet.get("id").and_then(Value::as_str).map(str::to_string) })
     }
 
     async fn rotate_seed(&self, client_seed: &str) -> Result<ProvableState, CasinoError> {

@@ -372,6 +372,7 @@ mod tests {
             ms: 0.0,
             game: None,
             round: None,
+            bet_id: None,
         }
     }
 
