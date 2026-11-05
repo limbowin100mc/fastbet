@@ -1,6 +1,6 @@
 [package]
 name = "fastbet"
-version = "3.22.0"
+version = "3.23.0"
 edition = "2021"
 description = "Instant Limbo bets straight over casino websocket APIs. No animations, no delays."
 publish = false
@@ -39,6 +39,8 @@ thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "gzip", "blocking", "cookies", "multipart"] }
 # the app icon as the Discord webhook's picture (a data URI)
 base64 = "0.22"
+# checks the plan tickets the website signs (Ed25519; already in the build through rustls)
+ring = "0.17"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # casino logos (bundled SVGs, rasterised at the size they're drawn) and the hit card (text in Saira)
 resvg = { version = "0.48", default-features = false, features = ["text"] }

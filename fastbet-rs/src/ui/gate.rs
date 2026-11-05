@@ -30,6 +30,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 Gate::LoggingIn => login_card(app, ui, w, None, true, &mut open),
                 Gate::NoPlan { username, ended } => no_plan(app, ui, w, username, ended.as_deref(), busy, &mut open),
                 Gate::Offline { error } => offline(app, ui, w, error, busy),
+                Gate::Replaced { username } => replaced(app, ui, w, username, busy),
                 // the app shows itself; this screen isn't drawn
                 Gate::Active { .. } => {}
             }
@@ -164,6 +165,25 @@ fn offline(app: &mut App, ui: &mut Ui, w: f32, error: &str, busy: bool) {
     }
     if retry {
         app.member.check();
+    }
+}
+
+/// Another device took this PC's place on the account.
+fn replaced(app: &mut App, ui: &mut Ui, w: f32, username: &str, busy: bool) {
+    let mut claim = false;
+    card(ui, w, |ui| {
+        title(ui, "In use on another device", &format!("{username} was opened on another PC or browser. FastBet plays on a few devices at a time: use it here and the one used longest ago stops."));
+        let text = if busy { "Taking over…" } else { "Use FastBet here" };
+        if button(ui, text, Btn::Primary, !busy, Some(ui.available_width())).clicked() {
+            claim = true;
+        }
+    });
+    ui.add_space(14.0);
+    if pill_button(ui, "Log out", MUTED, false).clicked() {
+        app.member.logout();
+    }
+    if claim {
+        app.member.claim();
     }
 }
 

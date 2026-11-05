@@ -106,13 +106,49 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/checkout@v7
+
+      # the notes are the release commit's bullets ("FastBet X.Y.Z: title" + "- " lines)
+      - name: Release notes
+        run: git log -1 --format=%b HEAD | grep -vi '^co-authored-by:' > notes.md; cat notes.md
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - uses: softprops/action-gh-release@v3
+        continue-on-error: true
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: notes.md
+
+      # GitHub's API sometimes answers 500 while publishing (v3.22.0 stayed a draft that way): make
+      # sure the release exists, has every file and isn't a draft, trying for a few minutes
+      - name: Make sure the release is out
+        run: |
+          for try in 1 2 3 4 5 6; do
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag || true
+            else
+              have=$(gh release view "$TAG" --json assets -q '.assets[].name')
+              for f in dist/*; do
+                grep -qxF "$(basename "$f")" <<< "$have" || gh release upload "$TAG" "$f" --clobber || true
+              done
+              gh release edit "$TAG" --draft=false --notes-file notes.md || true
+            fi
+            draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || echo missing)
+            count=$(gh release view "$TAG" --json assets -q '.assets | length' 2>/dev/null || echo 0)
+            echo "try $try: draft=$draft files=$count of $(ls dist | wc -l)"
+            if [ "$draft" = "false" ] && [ "$count" -ge "$(ls dist | wc -l)" ]; then exit 0; fi
+            sleep $((try * 20))
+          done
+          echo "::error::The release is still not published"
+          exit 1
