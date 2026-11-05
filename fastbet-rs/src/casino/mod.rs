@@ -981,10 +981,15 @@ impl CasinoError {
     /// account can't pay for the bet, and no retry helps until the user deposits.
     pub fn is_balance(&self) -> bool {
         let CasinoError::Server(m) = self else { return false };
-        let m = m.to_ascii_lowercase().replace('_', " ");
-        let money = ["balance", "funds", "money"].iter().any(|k| m.contains(k));
-        money && ["insufficient", "not enough", "too low", "low balance"].iter().any(|k| m.contains(k))
+        low_balance(m)
     }
+}
+
+/// A message saying the account can't pay for the bet (see [`CasinoError::is_balance`]).
+pub fn low_balance(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase().replace('_', " ");
+    let money = ["balance", "funds", "money"].iter().any(|k| m.contains(k));
+    money && ["insufficient", "not enough", "too low", "low balance"].iter().any(|k| m.contains(k))
 }
 
 /// Which slots to list.

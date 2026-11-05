@@ -1,22 +1,26 @@
-//! Slot challenges and King of the Hill (casinos that run them): a banner over the slots lobby
-//! that opens the list in a window, badges on the challenged games' tiles, and a card on the
-//! slot page with what it takes and a button that stops autoplay at the target.
+//! Slot challenges and King of the Hill (casinos that run them): a card on the lobby banners that
+//! opens them in a window of artwork cards, badges on the challenged games' tiles, and a card on
+//! the slot page with what it takes and a button that stops autoplay at the target.
 
 use std::time::{Duration, Instant};
 
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 
 use super::rewards::until;
-use super::theme::{self, alpha, mix, BG1, BG2, DIM, GOLD, LINE, LINE2, MUTED, RED, TEXT, TEXT2};
+use super::theme::{self, alpha, BG1, BG2, DIM, GOLD, LINE, LINE2, MUTED, RED, TEXT, TEXT2};
 use super::widgets::{self, button, Btn};
-use super::App;
+use super::{images, slots_lobby, App};
 use crate::casino::{Challenge, ConnStatus};
 use crate::engine::Command;
 use crate::money::{fmt_multi, fmt_usd};
 use crate::slots::{PlayMode, Provider, SlotGame};
 
-const WIDTH: f32 = 660.0;
-const ROW_H: f32 = 76.0;
+/// Room around a card's artwork, and between cards.
+const PAD: f32 = 8.0;
+const GAP: f32 = 14.0;
+/// A card's text under its artwork.
+const INFO_H: f32 = 98.0;
+const MAX_COLS: usize = 7;
 
 const CHALLENGE_HELP: &str = "The first real-money spin on the game that pays the target multiplier or more, at the minimum bet or more, wins the prize. Open to everyone; demo spins don't count.";
 const KOTH_HELP: &str = "King of the Hill: while the round runs, the best multiplier on the game (at the minimum bet or more) leads. Whoever leads when it ends wins the pool, which grows with every bet.";
@@ -59,95 +63,16 @@ fn game_of(app: &App, c: &Challenge) -> SlotGame {
     cat.featured.iter().chain(&cat.all).chain(&cat.results).find(|g| g.id == c.game.id).cloned().unwrap_or_else(|| c.game.clone())
 }
 
-/// The banner over the slots lobby, once there are challenges. Opens the window. Returns
-/// whether it is there.
-pub fn banner(app: &mut App, ui: &mut Ui) -> bool {
-    refresh(app);
-    if app.challenges.list.is_empty() {
-        return false;
-    }
-    let list = app.challenges.list.clone();
-    let koth = list.iter().find(|c| c.koth);
-    let count = list.iter().filter(|c| !c.koth).count();
-    let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 76.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
-    let p = ui.painter();
-    p.rect(rect, CornerRadius::same(12), mix(BG1, BG2, t), Stroke::new(1.0, mix(LINE, alpha(GOLD, 110), t)), StrokeKind::Inside);
-
-    let ic = pos2(rect.left() + 38.0, rect.center().y);
-    p.circle_filled(ic, 22.0, BG2);
-    p.circle_stroke(ic, 22.0, Stroke::new(1.0, LINE2));
-    let icon_r = Rect::from_center_size(ic, vec2(20.0, 20.0));
-    if koth.is_some() {
-        widgets::paint_crown(p, icon_r, GOLD);
-    } else {
-        widgets::paint_trophy(p, icon_r, GOLD);
-    }
-
-    let x = rect.left() + 74.0;
-    let title = p.text(pos2(x, rect.center().y - 10.0), Align2::LEFT_CENTER, "Challenges", theme::font_bold(15.0), TEXT);
-    let top = list.iter().map(|c| c.prize_usd).fold(0.0, f64::max);
-    let sub = match koth {
-        Some(k) => {
-            live_tag(p, pos2(title.right() + 10.0, title.center().y));
-            let ends = k.ends.map(|e| format!(" · ends in {}", until(e))).unwrap_or_default();
-            format!("King of the Hill on {}: best {}{ends}   ·   {count} challenges", k.game.name, fmt_multi(k.target))
-        }
-        None => format!("{count} running · prizes up to {}", dollars(top)),
-    };
-
-    // artwork of the challenged games, right to left before the chevron
-    let mut ax = rect.right() - 40.0;
-    let art = vec2(64.0, 48.0);
-    let mut shown = 0;
-    for c in &list {
-        if shown == 5 || ax - art.x < x + 380.0 {
-            break;
-        }
-        let r = Rect::from_min_size(pos2(ax - art.x, rect.center().y - art.y / 2.0), art);
-        match app.images.get(ui.ctx(), &c.game.image) {
-            Some(tex) => widgets::image_cover(p, r, &tex, 6),
-            None => {
-                p.rect_filled(r, CornerRadius::same(6), BG2);
-            }
-        }
-        p.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, if c.koth { alpha(GOLD, 200) } else { alpha(Color32::BLACK, 120) }), StrokeKind::Inside);
-        ax -= art.x + 8.0;
-        shown += 1;
-    }
-    widgets::fit_text(p, pos2(x, rect.center().y + 11.0), Align2::LEFT_CENTER, &sub, theme::font(12.0), MUTED, (ax - x - 12.0).max(120.0));
-    let c = pos2(rect.right() - 20.0, rect.center().y);
-    let edge = mix(MUTED, TEXT, t);
-    p.line_segment([c + vec2(-2.5, -5.0), c + vec2(2.5, 0.0)], Stroke::new(1.7, edge));
-    p.line_segment([c + vec2(2.5, 0.0), c + vec2(-2.5, 5.0)], Stroke::new(1.7, edge));
-    if koth.is_some() {
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
-    }
-    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-        app.challenges.window_open = true;
-    }
-    true
-}
-
-/// "LIVE" in a small gold tag, its left edge at `at`.
-fn live_tag(p: &egui::Painter, at: egui::Pos2) -> Rect {
-    let g = p.layout_no_wrap("LIVE".into(), theme::font_bold(9.5), GOLD);
-    let r = Rect::from_min_size(pos2(at.x, at.y - g.size().y / 2.0 - 2.0), g.size() + vec2(12.0, 4.0));
-    p.rect_filled(r, CornerRadius::same(4), alpha(GOLD, 36));
-    p.galley(r.min + vec2(6.0, 2.0), g, GOLD);
-    r
-}
-
 /// A tile's badge for its challenge, at the bottom left.
 pub fn tile_badge(app: &App, p: &egui::Painter, r: Rect, game_id: &str) {
     let mut list = app.challenges.for_game(game_id);
     let Some(c) = list.next() else { return };
     let text = if c.koth { "King of the Hill".to_string() } else { format!("Challenge {}", fmt_multi(c.target)) };
-    widgets::tile_badge(p, pos2(r.left() + 6.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, &text, alpha(Color32::BLACK, 190), GOLD);
+    widgets::tile_badge(p, pos2(r.left() + 7.0, r.bottom() - 7.0), Align2::LEFT_BOTTOM, &text, alpha(Color32::BLACK, 190), GOLD);
 }
 
-/// The list, in a window over the lobby.
+/// The challenges in a window over the lobby: King of the Hill first, then the rest, as cards
+/// with the game's artwork, what it takes, the prize and Play.
 pub fn window(app: &mut App, ctx: &egui::Context) {
     if !app.challenges.window_open {
         return;
@@ -155,7 +80,14 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     refresh(app);
     let mut close = false;
     let mut play: Option<SlotGame> = None;
-    let list = app.challenges.list.clone();
+    let mut list = app.challenges.list.clone();
+    list.sort_by_key(|c| !c.koth);
+    let art = slots_lobby::tile_size(app);
+    let card = vec2(art.x + 2.0 * PAD, PAD + art.y + INFO_H + widgets::FIELD_H + PAD);
+    let screen = ctx.content_rect();
+    let cols = (((screen.width() - 120.0 - 36.0 + GAP) / (card.x + GAP)).floor() as usize).clamp(1, MAX_COLS).min(list.len().max(3));
+    let inner_w = cols as f32 * (card.x + GAP) - GAP;
+    let width = inner_w + 36.0;
     let frame = Frame::new()
         .fill(BG1)
         .stroke(Stroke::new(1.0, LINE2))
@@ -163,12 +95,19 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
         .inner_margin(Margin::same(0))
         .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 30, spread: 0, color: Color32::from_black_alpha(160) });
     let modal = egui::Modal::new(egui::Id::new("challenges-dialog")).frame(frame).backdrop_color(alpha(theme::BG, 170)).show(ctx, |ui| {
-        ui.set_width(WIDTH);
+        ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 0.0;
         Frame::new().inner_margin(Margin::symmetric(18, 14)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(widgets::bold("Challenges", 14.5, TEXT));
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(widgets::bold("Challenges", 15.5, TEXT));
                 ui.label(widgets::semi(list.iter().filter(|c| !c.koth).count().to_string(), 12.0, DIM));
+                widgets::help_icon(ui, CHALLENGE_HELP);
+                if list.iter().any(|c| c.koth) {
+                    ui.add_space(6.0);
+                    ui.label(widgets::semi("King of the Hill", 12.0, GOLD));
+                    widgets::help_icon(ui, KOTH_HELP);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, "×", MUTED, true, "").clicked() {
                         close = true;
@@ -178,33 +117,26 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
         });
         ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, LINE));
         // sized from the list itself: a height remembered from an emptier frame would clip it
-        let koth = list.iter().any(|c| c.koth);
-        let rows = list.iter().filter(|c| !c.koth).count().max(1) as f32;
+        let rows = list.len().div_ceil(cols).max(1) as f32;
         let error = if app.challenges.error.is_some() { 32.0 } else { 0.0 };
-        let content = 14.0 + error + if koth { 26.0 + ROW_H + 16.0 } else { 0.0 } + 26.0 + rows * ROW_H + 18.0;
-        let height = content.min((ctx.content_rect().height() - 200.0).clamp(240.0, 560.0));
+        let content = 16.0 + error + if list.is_empty() { 40.0 } else { rows * (card.y + GAP) - GAP } + 18.0;
+        let height = content.min((screen.height() - 170.0).max(260.0));
         egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
-            Frame::new().inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 18 }).show(ui, |ui| {
-                let w = WIDTH - 36.0;
-                ui.set_width(w);
+            Frame::new().inner_margin(Margin { left: 18, right: 18, top: 16, bottom: 18 }).show(ui, |ui| {
+                ui.set_width(inner_w);
                 if let Some(e) = &app.challenges.error {
                     ui.label(widgets::semi(e, 12.0, RED));
                     ui.add_space(10.0);
                 }
-                if let Some(k) = list.iter().find(|c| c.koth) {
-                    heading(ui, "King of the Hill", KOTH_HELP);
-                    if row(app, ui, w, k) {
-                        play = Some(game_of(app, k));
-                    }
-                    ui.add_space(16.0);
-                }
-                heading(ui, "Challenges", CHALLENGE_HELP);
-                let running: Vec<&Challenge> = list.iter().filter(|c| !c.koth).collect();
-                if running.is_empty() {
+                if list.is_empty() {
                     ui.label(widgets::semi(if app.challenges.loaded { "No challenges running" } else { "Loading…" }, 12.0, DIM));
+                    return;
                 }
-                for c in running {
-                    if row(app, ui, w, c) {
+                let (area, _) = ui.allocate_exact_size(vec2(inner_w, rows * (card.y + GAP) - GAP), Sense::hover());
+                for (i, c) in list.iter().enumerate() {
+                    let at = pos2(area.left() + (i % cols) as f32 * (card.x + GAP), area.top() + (i / cols) as f32 * (card.y + GAP));
+                    let rect = Rect::from_min_size(at, card);
+                    if ui.is_rect_visible(rect) && challenge_card(app, ui, rect, art, c) {
                         play = Some(game_of(app, c));
                     }
                 }
@@ -222,17 +154,8 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-fn heading(ui: &mut Ui, title: &str, help: &str) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(widgets::semi(title, 13.0, TEXT2));
-        widgets::help_icon(ui, help);
-    });
-    ui.add_space(8.0);
-}
-
 /// "$1,000" for whole dollars, else "$0.40".
-fn dollars(v: f64) -> String {
+pub(super) fn dollars(v: f64) -> String {
     if v >= 1.0 && (v - v.round()).abs() < 0.005 {
         format!("${}", crate::money::fmt_int(v.round() as i128))
     } else {
@@ -240,60 +163,58 @@ fn dollars(v: f64) -> String {
     }
 }
 
-/// Paints `text` on one line no wider than `max_w`, cut short with "…".
-fn text_cut(p: &egui::Painter, pos: egui::Pos2, align: Align2, text: &str, font: egui::FontId, color: Color32, max_w: f32) {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
-    job.wrap = egui::text::TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    let g = p.layout_job(job);
-    p.galley(align.anchor_size(pos, g.size()).min, g, color);
-}
-
-/// One challenge: artwork, name and time left, its numbers, Play. Returns true when Play was pressed.
-fn row(app: &mut App, ui: &mut Ui, w: f32, c: &Challenge) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW_H), Sense::hover());
-    let play_w = 76.0;
-    let col_w = 92.0;
-    let cols_left = rect.right() - play_w - 14.0 - col_w * 3.0;
-    if resp.hovered() {
-        resp.on_hover_text(&c.game.name);
-    }
+/// One challenge: the game's artwork, what it takes, the prize and time left, Play. True when
+/// Play was pressed.
+fn challenge_card(app: &mut App, ui: &mut Ui, rect: Rect, art: egui::Vec2, c: &Challenge) -> bool {
+    let ppp = ui.ctx().pixels_per_point();
+    let edge = if c.koth { alpha(GOLD, 150) } else { LINE };
+    ui.painter().rect(rect, CornerRadius::same(12), BG2, Stroke::new(1.0, edge), StrokeKind::Inside);
+    let ar = images::snap(Rect::from_min_size(rect.min + vec2(PAD, PAD), art), ppp);
     let p = ui.painter();
-    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, LINE));
-    let art = Rect::from_min_size(pos2(rect.left(), rect.center().y - 30.0), vec2(80.0, 60.0));
-    match app.images.get(ui.ctx(), &c.game.image) {
-        Some(tex) => widgets::image_cover(p, art, &tex, 8),
-        None => {
-            p.rect_filled(art, CornerRadius::same(8), BG2);
-        }
+    if !app.images.paint_fit(p, ar, &c.game.image, 9) {
+        p.rect_filled(ar, CornerRadius::same(9), BG1);
+        let g = p.layout(c.game.name.clone(), theme::font_bold(14.0), TEXT, ar.width() - 16.0);
+        p.galley(ar.center() - g.size() / 2.0, g, TEXT);
     }
-    let x = art.right() + 14.0;
-    text_cut(p, pos2(x, rect.center().y - 16.0), Align2::LEFT_CENTER, &c.game.name, theme::font_bold(13.0), TEXT, cols_left - x - 14.0);
-    p.text(pos2(x, rect.center().y + 1.0), Align2::LEFT_CENTER, c.game.maker(), theme::font(11.0), MUTED);
-    let ends = c.ends.map(|e| format!("Ends in {}", until(e))).unwrap_or_default();
-    p.text(pos2(x, rect.center().y + 18.0), Align2::LEFT_CENTER, ends, theme::font(10.5), DIM);
-
-    // the numbers, in columns before Play
-    let supported = Provider::for_producer(&c.game.producer).is_some();
-    let cols: [(&str, String); 3] = if c.koth {
-        [("Best", if c.target > 0.0 { fmt_multi(c.target) } else { "–".into() }), ("Min bet", dollars(c.min_bet_usd)), ("Pool", dollars(c.prize_usd))]
-    } else {
-        [("Target", fmt_multi(c.target)), ("Min bet", dollars(c.min_bet_usd)), ("Prize", dollars(c.prize_usd))]
-    };
-    let mut cx = cols_left;
-    for (i, (label, value)) in cols.iter().enumerate() {
-        p.text(pos2(cx, rect.center().y - 9.0), Align2::LEFT_CENTER, *label, theme::font(10.5), MUTED);
-        let color = if i == 2 { GOLD } else { TEXT };
-        p.text(pos2(cx, rect.center().y + 9.0), Align2::LEFT_CENTER, value, theme::font_semi(13.0), color);
-        cx += col_w;
+    if c.game.rtp > 0.0 {
+        widgets::tile_badge(p, pos2(ar.right() - 6.0, ar.top() + 6.0), Align2::RIGHT_TOP, &format!("Edge: {:.2}%", 100.0 - c.game.rtp), alpha(Color32::BLACK, 175), Color32::WHITE);
     }
     if c.koth {
-        if let Some(l) = &c.leader {
-            text_cut(p, pos2(cols_left, rect.center().y + 25.0), Align2::LEFT_CENTER, &format!("by {l}"), theme::font(10.0), DIM, col_w - 6.0);
-        }
+        widgets::tile_badge(p, pos2(ar.left() + 6.0, ar.top() + 6.0), Align2::LEFT_TOP, "King of the Hill", alpha(Color32::BLACK, 190), GOLD);
     }
-    let br = Rect::from_min_size(pos2(rect.right() - play_w, rect.center().y - widgets::FIELD_H / 2.0), vec2(play_w, widgets::FIELD_H));
+    p.rect_stroke(ar, CornerRadius::same(9), Stroke::new(1.0, alpha(Color32::BLACK, 120)), StrokeKind::Inside);
+
+    // what it takes, then the prize with the time left beside it
+    let x = rect.left() + PAD + 4.0;
+    let w = rect.width() - 2.0 * (PAD + 4.0);
+    let mut y = ar.bottom() + 10.0;
+    let line = if c.koth {
+        let best = if c.target > 0.0 { fmt_multi(c.target) } else { "–".into() };
+        let by = c.leader.as_ref().map(|l| format!(" by {l}")).unwrap_or_default();
+        format!("Best {best}{by}, min {} bet", dollars(c.min_bet_usd))
+    } else {
+        format!("First to hit {} with min {} bet", fmt_multi(c.target), dollars(c.min_bet_usd))
+    };
+    let mut job = egui::text::LayoutJob::simple(line, theme::font_semi(12.0), TEXT, w);
+    job.wrap.max_rows = 2;
+    let g = p.layout_job(job);
+    p.galley(pos2(x, y), g, TEXT);
+    y += 38.0;
+    p.text(pos2(x, y), Align2::LEFT_TOP, if c.koth { "Pool" } else { "Prize" }, theme::font(11.0), MUTED);
+    p.text(pos2(x, y + 15.0), Align2::LEFT_TOP, dollars(c.prize_usd), theme::font_bold(14.0), GOLD);
+    if let Some(e) = c.ends {
+        p.text(pos2(x + w, y), Align2::RIGHT_TOP, "Ends in", theme::font(11.0), MUTED);
+        p.text(pos2(x + w, y + 16.0), Align2::RIGHT_TOP, until(e), theme::font_semi(12.0), TEXT2);
+    }
+    if !c.game.name.is_empty() {
+        let resp = ui.interact(ar, ui.id().with(("challenge-art", &c.id)), Sense::hover());
+        resp.on_hover_text(format!("{} · {}", c.game.name, c.game.maker()));
+    }
+
+    let supported = Provider::for_producer(&c.game.producer).is_some();
+    let br = Rect::from_min_size(pos2(rect.left() + PAD, rect.bottom() - PAD - widgets::FIELD_H), vec2(rect.width() - 2.0 * PAD, widgets::FIELD_H));
     let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(br).id_salt(("challenge-play", &c.id)));
-    let resp = button(&mut bui, "Play", if supported { Btn::Primary } else { Btn::Ghost }, supported, Some(play_w));
+    let resp = button(&mut bui, "Play", if supported { Btn::Primary } else { Btn::Ghost }, supported, Some(br.width()));
     if supported {
         resp.clicked()
     } else {

@@ -195,15 +195,6 @@ pub fn glow(p: &Painter, center: Pos2, radius: f32, color: Color32) {
     p.add(egui::epaint::RectShape::filled(rect, CornerRadius::ZERO, color).with_texture(tex.id(), uv));
 }
 
-/// A texture filling `rect`, cut to the rect's shape rather than stretched: art of another
-/// shape loses its sides (or its top and bottom).
-pub fn image_cover(p: &Painter, rect: Rect, tex: &TextureHandle, radius: u8) {
-    let [w, h] = tex.size().map(|v| v.max(1) as f32);
-    let (fit_w, fit_h) = ((rect.aspect_ratio() * h / w).min(1.0), (w / h / rect.aspect_ratio()).min(1.0));
-    let uv = Rect::from_center_size(pos2(0.5, 0.5), vec2(fit_w, fit_h));
-    p.add(egui::epaint::RectShape::filled(rect, CornerRadius::same(radius), Color32::WHITE).with_texture(tex.id(), uv));
-}
-
 /// A small label on a game tile ("Edge: 1%"), its `align` corner at `at`. Returns where it went.
 pub fn tile_badge(p: &Painter, at: Pos2, align: Align2, text: &str, fill: Color32, fg: Color32) -> Rect {
     let g = p.layout_no_wrap(text.to_string(), theme::font_semi(10.0), fg);
@@ -222,10 +213,20 @@ pub fn shadow(p: &Painter, rect: Rect, radius: u8, offset_y: f32, blur: f32, str
 /// Wordmark: "FASTBET" in a red-to-yellow gradient, letters `height` points tall.
 /// Its glow spills past the space it takes.
 pub fn wordmark(ui: &mut Ui, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(wordmark_size(height), Sense::hover());
+    paint_wordmark_in(ui.painter(), rect);
+}
+
+/// The space [`wordmark`] takes, glow left out.
+pub fn wordmark_size(height: f32) -> Vec2 {
     let glow = height * logos::WORDMARK_GLOW;
-    let w = (height + 2.0 * glow) * logos::wordmark_aspect() - 2.0 * glow;
-    let (rect, _) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
-    logos::paint_wordmark(ui.painter(), rect.expand(glow).round_to_pixels(ui.ctx().pixels_per_point()));
+    vec2((height + 2.0 * glow) * logos::wordmark_aspect() - 2.0 * glow, height)
+}
+
+/// The wordmark's letters filling `rect` (one of [`wordmark_size`]), its glow around it.
+pub fn paint_wordmark_in(p: &Painter, rect: Rect) {
+    let glow = rect.height() * logos::WORDMARK_GLOW;
+    logos::paint_wordmark(p, rect.expand(glow).round_to_pixels(p.ctx().pixels_per_point()));
 }
 
 // ----------------------------------------------------------------- pills

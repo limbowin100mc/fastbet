@@ -68,7 +68,9 @@ impl Hit {
     }
 }
 
+/// A hit for the Hits list, and for the bell.
 fn push(app: &mut App, hit: Hit) {
+    super::bell::hit(app, hit.clone());
     app.hits.insert(0, hit);
     app.hits.truncate(KEEP);
 }

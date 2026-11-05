@@ -172,7 +172,7 @@ impl App {
         trade!(self, t;
             shell: settings, repaint, #[cfg(target_os = "android")] paste, #[cfg(target_os = "android")] keyboard,
                 sound, account_menu_open, welcome_menu_open, updater, member, gate_login, gate_password, gate_show_pw,
-                was_unlocked, update_open, update_on_start, whats_new, prefs_open, prefs_tab, storage, sound_view, alerts_view, seed_name_editing,
+                was_unlocked, update_open, bell, update_on_start, whats_new, prefs_open, prefs_tab, storage, sound_view, alerts_view, seed_name_editing,
                 seed_preview, update_close_at, logos, images, dirty, last_save, title, tabs, close_armed;
             tab: engine, screen, stage, onboard_error, key_input, mirror_input, mirror_search, mirror_open, cf_open,
                 cf_agent_input, cf_cookie_input, cookies_cleared, open_casino, account_search, remove_row, remove_armed,

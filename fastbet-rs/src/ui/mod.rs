@@ -2,6 +2,8 @@
 //! (left rail, top bar, stats panel) around the lobby and the Limbo page.
 
 pub mod accounts;
+pub mod banner;
+pub mod bell;
 pub mod challenges;
 pub mod code;
 pub mod coins;
@@ -173,6 +175,8 @@ pub struct App {
     /// The app was open last frame: a plan running out stops the runs once.
     was_unlocked: bool,
     pub update_open: bool,
+    /// The bell beside the VIP pill: hits, runs stopped by the balance or an error, updates.
+    pub bell: bell::Bell,
     /// The update check made at start: the dialog opens by itself if it finds one.
     update_on_start: bool,
     /// "What's new" after an update.
@@ -328,6 +332,11 @@ impl App {
             gate_show_pw: false,
             was_unlocked: false,
             update_open: false,
+            // FASTBET_BELL=1: the bell's list open with a notice of each kind (UI work)
+            bell: match std::env::var("FASTBET_BELL").as_deref() {
+                Ok(v) => bell::Bell::preview(v != "closed"),
+                Err(_) => Default::default(),
+            },
             update_on_start: false,
             whats_new: Default::default(),
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
@@ -515,6 +524,34 @@ impl App {
                 let round = crate::originals::Round { game, id: "preview".into(), active: false, currency: cur.clone(), amount: 0, amount_mult: 1.0, payout: 0, multiplier, state };
                 self.orig.last.insert(game, round);
             }
+        }
+        // FASTBET_PREVIEW_ART=1: pictures from the image cache on the originals' and slots' tiles (debug builds)
+        if cfg!(debug_assertions) && std::env::var("FASTBET_PREVIEW_ART").is_ok() {
+            let art = images::cached_portraits(64);
+            let slugs: Vec<&str> = std::iter::once("limbo").chain(crate::originals::Game::all().map(|g| g.slug())).collect();
+            for (slug, image) in slugs.iter().zip(&art) {
+                self.orig.catalog.push(SlotGame { id: slug.to_string(), name: slug.to_string(), producer: String::new(), image: image.clone(), demo: true, rtp: 99.0, provider_game_id: None, studio: None });
+            }
+            for (i, image) in art.iter().enumerate() {
+                let producer = if i % 4 == 3 { "nolimit" } else { "hacksawgaming" };
+                let g = SlotGame { id: format!("preview-{i}"), name: format!("Slot {}", i + 1), producer: producer.into(), image: image.clone(), demo: true, rtp: 96.0 + (i % 5) as f64 * 0.3, provider_game_id: None, studio: None };
+                if i < 12 {
+                    self.catalog.featured.push(g);
+                } else {
+                    self.catalog.all.push(g);
+                }
+            }
+            self.catalog.requested = true;
+            self.catalog.all_done = true;
+            // a King of the Hill round and a few challenges on those games
+            let picks = [(0, true, 1834.5, 0.2, 797.88), (1, false, 10_000.0, 0.4, 1250.0), (2, false, 2000.0, 1.2, 800.0), (3, false, 5000.0, 0.8, 1000.0), (5, false, 6000.0, 0.7, 1200.0)];
+            for (k, (i, koth, target, min_bet_usd, prize_usd)) in picks.into_iter().enumerate() {
+                let Some(game) = self.catalog.featured.get(i).cloned() else { break };
+                let ends = Some(std::time::SystemTime::now() + Duration::from_secs(3_600 * (3 + 7 * k as u64)));
+                let leader = koth.then(|| "Hound971".to_string());
+                self.challenges.list.push(crate::casino::Challenge { id: format!("preview-{k}"), koth, game, target, min_bet_usd, prize_usd, ends, leader });
+            }
+            self.challenges.loaded = true;
         }
         self.provable.client_seed = Some("d0a5a47351e87030faeb9675".into());
         self.provable.nonce = Some(n as u64);
@@ -1891,6 +1928,11 @@ impl App {
                     }
                     if self.auto.running && !a.running {
                         self.alert_run_end(&a);
+                        let game = match self.screen {
+                            Screen::Original(g) => self.casino().original_name(g),
+                            _ => "Limbo",
+                        };
+                        bell::run_ended(self, game, &a.msg);
                     }
                     // Code Mode: the console says how the run ended (a script error says it already)
                     if self.code.running && !a.running {
@@ -1954,6 +1996,10 @@ impl App {
                     let auto = std::env::var("FASTBET_SLOT_RUN").is_ok() && st.info.is_some() && !st.running && self.slot.info.is_none() && st.done == 0;
                     if self.slot.running && !st.running && st.msg == engine::STOPPED_ON_WIN {
                         self.hit_sound();
+                    }
+                    if self.slot.running && !st.running {
+                        let game = self.slot.game.as_ref().map(|g| g.name.clone()).unwrap_or_else(|| "A slot".into());
+                        bell::run_ended(self, &game, &st.msg);
                     }
                     self.slot = st;
                     if auto {
@@ -2159,13 +2205,19 @@ impl App {
                 let pill_rect = egui::Rect::from_center_size(pos2(hr.center().x, hr.center().y), egui::vec2(260.0, 34.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(pill_rect).layout(Layout::centered_and_justified(egui::Direction::LeftToRight)));
                 let wallet = child.horizontal_centered(|ui| wallet::pill(self, ui)).response;
-                // the VIP level, just right of the balance
+                // the VIP level, just right of the balance, then the bell
+                let mut right = wallet.rect.right();
                 if self.casino().has_vip() && self.vip.is_some() {
-                    let left = wallet.rect.right() + 10.0;
+                    let left = right + 10.0;
                     let vr = egui::Rect::from_min_max(pos2(left, hr.center().y - 17.0), pos2(hr.right().max(left + 1.0), hr.center().y + 17.0));
                     let mut vui = ui.new_child(egui::UiBuilder::new().max_rect(vr).layout(Layout::left_to_right(Align::Center)));
                     vip::pill(self, &mut vui);
+                    right = vui.min_rect().right();
                 }
+                let left = right + 8.0;
+                let br = egui::Rect::from_min_max(pos2(left, hr.center().y - 17.0), pos2(hr.right().max(left + 1.0), hr.center().y + 17.0));
+                let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(br).layout(Layout::left_to_right(Align::Center)));
+                bell::button(self, &mut bui);
             });
         });
         if !self.wallet_open {
@@ -2327,6 +2379,7 @@ impl eframe::App for App {
         // the plan's end and the next check come without any input: a quiet window wakes up for them
         ctx.request_repaint_after(Duration::from_secs(self.member.seconds_left().clamp(1, 30)));
         self.startup_update();
+        bell::watch_updates(self);
         if self.whats_new.poll() {
             self.settings.seen_version = self.whats_new.version.clone();
             self.mark_dirty();

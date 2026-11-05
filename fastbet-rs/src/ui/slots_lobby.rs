@@ -1,14 +1,15 @@
-//! Slots lobby, laid out like Antebot's: the title with the search and the provider filter beside
-//! it, then the casino's catalog in sections of artwork tiles with their status and edge.
+//! Slots lobby, laid out like Antebot's: the FastBet Slots banner, the search and the provider
+//! filter under it, then the casino's catalog in sections of artwork tiles with their status and edge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Frame, Margin, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
+use super::banner::{self, Page};
 use super::theme::{self, alpha, mix, BG1, BG2, BG3, DIM, G1, GREEN, INK, LINE, LINE2, MUTED, RED, TEXT, TEXT2};
 use super::widgets::{self, button, Btn};
-use super::App;
+use super::{images, lobby, App};
 use crate::slots::{Provider, SlotGame};
 
 const GAP: f32 = 14.0;
@@ -36,11 +37,11 @@ pub struct Catalog {
 }
 
 /// Tile size: the shape of the casino's artwork (chips.gg's is 4:3 landscape, Stake's portrait).
-fn tile_size(app: &App) -> Vec2 {
+pub(super) fn tile_size(app: &App) -> Vec2 {
     if app.casino().slot_art_landscape() {
-        vec2(172.0, 129.0)
+        vec2(208.0, 156.0)
     } else {
-        vec2(142.0, 186.0)
+        lobby::TILE
     }
 }
 
@@ -83,22 +84,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
     }
 
-    // header: the title, and on its right the search and the provider filter
-    let p = ui.painter_at(full);
-    widgets::glow(&p, pos2(full.left() + 160.0, full.top() - 60.0), 560.0, alpha(Color32::from_rgb(0x8b, 0x5c, 0xf6), 22));
-    let x0 = full.left() + 40.0;
-    let cy = full.top() + 58.0;
-    let title = p.text(pos2(x0, cy), Align2::LEFT_CENTER, "Slots", theme::font_bold(28.0), TEXT);
-    let casino = app.casino();
-    let right = full.right() - 40.0;
-    let pr = Rect::from_min_max(pos2(right - 150.0, cy - 20.0), pos2(right, cy + 20.0));
-    let search_w = 420.0_f32.min(pr.left() - 12.0 - title.right() - 24.0).max(160.0);
-    let sr = Rect::from_min_max(pos2(pr.left() - 12.0 - search_w, cy - 20.0), pos2(pr.left() - 12.0, cy + 20.0));
+    // the banner, and under it the search with the provider filter beside it
+    let band = Rect::from_min_size(full.min, vec2(full.width(), banner::HEIGHT));
+    banner::show(app, ui, band, Page::Slots);
+    let cy = band.bottom() + 38.0;
+    let (prov_w, gap) = (150.0, 12.0);
+    let search_w = 460.0_f32.min(full.width() - 80.0 - prov_w - gap).max(160.0);
+    let left = (full.center().x - (search_w + gap + prov_w) / 2.0).max(full.left() + 40.0);
+    let sr = Rect::from_min_size(pos2(left, cy - 20.0), vec2(search_w, 40.0));
+    let pr = Rect::from_min_size(pos2(sr.right() + gap, cy - 20.0), vec2(prov_w, 40.0));
     search(app, ui, sr);
     provider_button(app, ui, pr);
 
     // the catalog
-    let grid = Rect::from_min_max(pos2(full.left(), full.top() + 100.0), full.max);
+    let grid = Rect::from_min_max(pos2(full.left(), cy + 34.0), full.max);
     let mut gui = ui.new_child(egui::UiBuilder::new().max_rect(grid).layout(egui::Layout::top_down(egui::Align::Min)));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut gui, |ui| {
         Frame::new().inner_margin(Margin { left: 40, right: 40, top: 6, bottom: 8 }).show(ui, |ui| {
@@ -123,9 +122,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 let title = if picked.len() <= 3 { picked.iter().cloned().collect::<Vec<_>>().join(", ") } else { format!("{} providers", picked.len()) };
                 section(app, ui, &title, &games, app.catalog.loading > 0);
             } else {
-                if casino.has_challenges() && super::challenges::banner(app, ui) {
-                    ui.add_space(20.0);
-                }
                 let featured = app.catalog.featured.clone();
                 section(app, ui, "Tested", &featured, app.catalog.loading > 0 && featured.is_empty());
                 ui.add_space(18.0);
@@ -317,19 +313,16 @@ fn tile(app: &mut App, ui: &mut Ui, rect: Rect, g: &SlotGame) -> egui::Response 
     let supported = Provider::for_producer(&g.producer).is_some();
     let resp = ui.interact(rect, egui::Id::new(("slot-tile", &g.id, rect.min.y as i32)), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id.with("lift"), resp.hovered(), 0.12);
-    let r = rect.translate(vec2(0.0, -3.0 * t));
+    let r = images::snap(rect.translate(vec2(0.0, -3.0 * t)), ui.ctx().pixels_per_point());
     let p = ui.painter();
     widgets::shadow(p, r, 10, 4.0 + 5.0 * t, 10.0 + 8.0 * t, (80.0 + 60.0 * t) as u8);
-    match app.images.get(ui.ctx(), &g.image) {
-        Some(tex) => widgets::image_cover(p, r, &tex, 10),
-        None => {
-            p.rect(r, CornerRadius::same(10), BG2, Stroke::new(1.0, LINE), StrokeKind::Inside);
-            let galley = p.layout(g.name.clone(), theme::font_bold(13.0), TEXT, r.width() - 16.0);
-            let size = galley.size();
-            p.galley(pos2(r.center().x - size.x / 2.0, r.center().y - size.y / 2.0), galley, TEXT);
-            if app.images.failed(&g.image) {
-                p.text(pos2(r.center().x, r.bottom() - 14.0), Align2::CENTER_CENTER, g.maker(), theme::font(9.5), DIM);
-            }
+    if !app.images.paint_fit(p, r, &g.image, 10) {
+        p.rect(r, CornerRadius::same(10), BG2, Stroke::new(1.0, LINE), StrokeKind::Inside);
+        let galley = p.layout(g.name.clone(), theme::font_bold(14.0), TEXT, r.width() - 16.0);
+        let size = galley.size();
+        p.galley(pos2(r.center().x - size.x / 2.0, r.center().y - size.y / 2.0), galley, TEXT);
+        if app.images.failed(&g.image) {
+            p.text(pos2(r.center().x, r.bottom() - 14.0), Align2::CENTER_CENTER, g.maker(), theme::font(9.5), DIM);
         }
     }
     // an untested game stays a little dim until hovered
@@ -339,9 +332,9 @@ fn tile(app: &mut App, ui: &mut Ui, rect: Rect, g: &SlotGame) -> egui::Response 
     let edge_color = if supported { G1 } else { LINE2 };
     p.rect_stroke(r, CornerRadius::same(10), Stroke::new(if t > 0.0 { 1.5 } else { 1.0 }, alpha(mix(alpha(Color32::BLACK, 120), edge_color, t), (90.0 + 150.0 * t) as u8)), StrokeKind::Inside);
 
-    status_badge(p, r.left_top() + vec2(6.0, 6.0), supported);
+    status_badge(p, r.left_top() + vec2(7.0, 7.0), supported);
     if g.rtp > 0.0 {
-        widgets::tile_badge(p, pos2(r.right() - 6.0, r.top() + 6.0), Align2::RIGHT_TOP, &format!("Edge: {:.2}%", 100.0 - g.rtp), alpha(Color32::BLACK, 175), Color32::WHITE);
+        widgets::tile_badge(p, pos2(r.right() - 7.0, r.top() + 7.0), Align2::RIGHT_TOP, &format!("Edge: {:.2}%", 100.0 - g.rtp), alpha(Color32::BLACK, 175), Color32::WHITE);
     }
     super::challenges::tile_badge(app, p, r, &g.id);
     let tip = match (supported, &g.studio) {
