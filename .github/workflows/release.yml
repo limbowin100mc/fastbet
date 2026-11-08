@@ -1,6 +1,6 @@
 # Builds FastBet installers on GitHub's machines.
 #
-# Push a tag like v3.1.0 and this builds Windows + Linux installers and puts
+# Push a tag like v3.1.0 and this builds Windows, Linux and macOS installers and puts
 # them on a GitHub Release (the app version is taken from the tag).
 # "Run workflow" on the Actions tab builds the same files without a release;
 # they show up as downloads at the bottom of the run page.
@@ -40,13 +40,21 @@ jobs:
             os: ubuntu-22.04
             formats: deb,appimage
             rustflags: ""
+          - name: macOS-AppleSilicon
+            os: macos-latest
+            formats: app
+            rustflags: ""
+          - name: macOS-Intel
+            os: macos-15-intel
+            formats: app
+            rustflags: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Set version from tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: sed -i "0,/^version = .*/s//version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+        run: perl -0pi -e "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/m" Cargo.toml
 
       - name: Install Linux libraries
         if: runner.os == 'Linux'
@@ -86,10 +94,27 @@ jobs:
           bash packaging/appimage-drop-libs.sh "$(find target/release -maxdepth 3 -type f -name '*.AppImage' | head -1)"
           libxkbcommon.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1 libwayland-server.so.0
 
+      # No Apple developer certificate: with an ad-hoc signature macOS offers "Open Anyway"
+      # instead of calling the downloaded app damaged.
+      - name: Sign the Mac app and pack it into a .dmg
+        if: runner.os == 'macOS'
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          app=$(find target/release -maxdepth 3 -type d -name 'FastBet.app' | head -1)
+          codesign --force --deep --sign - "$app"
+          mkdir dmg-root
+          cp -R "$app" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          # hdiutil sometimes answers "Resource busy" on GitHub's Macs
+          for try in 1 2 3 4 5; do
+            hdiutil create -volname FastBet -srcfolder dmg-root -ov -format UDZO "target/release/FastBet_${version}_$(uname -m).dmg" && break
+            sleep 10
+          done
+
       - name: Collect files
         run: |
           mkdir -p dist
-          find target/release -maxdepth 3 -type f \( -name '*-setup.exe' -o -name '*.deb' -o -name '*.AppImage' \) -exec cp {} dist/ \;
+          find target/release -maxdepth 3 -type f \( -name '*-setup.exe' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) -exec cp {} dist/ \;
           if [ "$RUNNER_OS" = "Windows" ]; then
             version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
             cp target/release/fastbet.exe "dist/FastBet_${version}_x64-portable.exe"
