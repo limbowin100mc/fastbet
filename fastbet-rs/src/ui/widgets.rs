@@ -1371,6 +1371,12 @@ pub fn icon(p: &egui::Painter, r: Rect, name: &str, color: Color32) {
             p.line_segment([tip, tip + vec2(-3.5, -1.0)], s);
             p.line_segment([tip, tip + vec2(0.0, 3.5)], s);
         }
+        "display" => {
+            // a monitor on its stand
+            p.rect_stroke(Rect::from_min_max(at(0.02, 0.1), at(0.98, 0.72)), CornerRadius::same(2), s, StrokeKind::Middle);
+            p.line_segment([at(0.5, 0.72), at(0.5, 0.9)], s);
+            p.line_segment([at(0.26, 0.92), at(0.74, 0.92)], s);
+        }
         "download" => {
             // arrow down into a tray
             p.line_segment([at(0.5, 0.04), at(0.5, 0.66)], s);

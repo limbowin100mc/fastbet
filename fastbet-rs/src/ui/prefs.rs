@@ -10,7 +10,7 @@ use egui::{pos2, vec2, Align, Align2, CornerRadius, Frame, Layout, Margin, Rect,
 use super::theme::{self, alpha, BG1, DIM, G1, G2, GOLD, LINE, MUTED, TEXT, TEXT2};
 use super::widgets::{self, Btn};
 use super::{sound, App};
-use crate::settings::{clean_seed_name, SeedChars, RANDOM_SEED_DEFAULT, RANDOM_SEED_LEN, SEED_NAME_MAX};
+use crate::settings::{clean_seed_name, SeedChars, RANDOM_SEED_DEFAULT, RANDOM_SEED_LEN, SEED_NAME_MAX, UI_SCALES};
 use crate::storage::{self, fmt_bytes, Part, Report};
 
 const WIDTH: f32 = 640.0;
@@ -21,6 +21,7 @@ const BODY_H: f32 = 500.0;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
     #[default]
+    Display,
     Seed,
     Sound,
     Alerts,
@@ -28,10 +29,11 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Seed, Tab::Sound, Tab::Alerts, Tab::Storage];
+    const ALL: [Tab; 5] = [Tab::Display, Tab::Seed, Tab::Sound, Tab::Alerts, Tab::Storage];
 
     fn name(self) -> &'static str {
         match self {
+            Tab::Display => "Display",
             Tab::Seed => "Seed",
             Tab::Sound => "Sound",
             Tab::Alerts => "Alerts",
@@ -41,6 +43,7 @@ impl Tab {
 
     fn icon(self) -> &'static str {
         match self {
+            Tab::Display => "display",
             Tab::Seed => "seed",
             Tab::Sound => "sound",
             Tab::Alerts => "bell",
@@ -135,6 +138,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     let w = page.width() - 44.0;
                     ui.set_width(w);
                     match app.prefs_tab {
+                        Tab::Display => display_page(app, ui, w),
                         Tab::Seed => seed(app, ui, w),
                         Tab::Sound => sound_page(app, ui, w),
                         Tab::Alerts => alerts_page(app, ui, w),
@@ -420,6 +424,28 @@ fn sound_page(app: &mut App, ui: &mut Ui, w: f32) {
                 app.sound.play(file.clone());
             }
         }
+    });
+}
+
+fn display_page(app: &mut App, ui: &mut Ui, w: f32) {
+    heading(ui, "Display", "How big FastBet draws its text, buttons and pictures.");
+    let windows = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
+    let pct = |scale: f32| format!("{}%", (scale * 100.0).round() as u32);
+    let help = "Default follows the scale Windows uses for this screen (Windows Settings → System → Display → Scale).                 A size draws FastBet at that size whatever Windows says, sharp at every size. Bigger sizes fit less on                 the screen, so FastBet's window grows with them, as far as the screen allows.";
+    let size = pct(app.settings.ui_scale().unwrap_or(windows));
+    widgets::card(ui, w, "Size", Some(help), Some(widgets::semi(size, 11.5, G2)), |ui| {
+        let names: Vec<String> = std::iter::once("Default".to_string()).chain(UI_SCALES.iter().map(|s| format!("{s}%"))).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let picked = UI_SCALES.iter().position(|&s| s == app.settings.ui_scale).map_or(0, |i| i + 1);
+        if let Some(i) = widgets::segmented(ui, &names, picked, true) {
+            app.settings.ui_scale = if i == 0 { 0 } else { UI_SCALES[i - 1] };
+            app.mark_dirty();
+        }
+        let note = match app.settings.ui_scale() {
+            None => format!("Windows draws this screen at {}, and FastBet follows it.", pct(windows)),
+            Some(s) => format!("FastBet draws at {}. Windows draws this screen at {}.", pct(s), pct(windows)),
+        };
+        widgets::readout(ui, note, TEXT2, G1);
     });
 }
 

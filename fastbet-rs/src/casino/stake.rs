@@ -404,13 +404,13 @@ impl Stake {
                 Err(CallError::Cloudflare) => {
                     if manual.is_some() && t0.elapsed() > SHOW_CHECK_AFTER {
                         return Err(format!(
-                            "Cloudflare didn't accept your browser's cookies on {mirror}. Open {mirror} in that browser, then copy its cookies \
-                             and User Agent again (they expire, and only work from this computer's IP), or remove them."
+                            "Cloudflare didn't accept the saved browser cookies on {mirror}: they expire, and only work from the IP address \
+                             they were made on (a VPN switched on or off changes it). Log in in a window again from Settings."
                         ));
                     }
                     if t0.elapsed() > CHECK_TIMEOUT {
                         return Err(format!(
-                            "Cloudflare didn't let us through on {mirror}. Try another mirror, or log in with your browser in Settings. \
+                            "Cloudflare didn't let us through on {mirror}. Log in in a window from Settings, or try another mirror. \
                              On a server (VPS), Cloudflare may not trust its IP address at all."
                         ));
                     }

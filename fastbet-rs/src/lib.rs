@@ -110,7 +110,7 @@ pub fn desktop_main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FastBet")
         .with_inner_size([1360.0, 860.0])
-        .with_min_inner_size([1040.0, 640.0])
+        .with_min_inner_size(ui::MIN_WINDOW)
         // FastBet draws its own title bar (ui::titlebar)
         .with_decorations(false)
         .with_app_id("gg.fastbet");

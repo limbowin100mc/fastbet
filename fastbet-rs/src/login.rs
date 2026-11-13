@@ -89,8 +89,9 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
     // FASTBET_WATCH_SCRIPT overrides the injected script, handy when adding a casino.
     let script = std::env::var("FASTBET_WATCH_SCRIPT").unwrap_or_else(|_| id.token_watch_script().to_string());
     let mut ctx = WebContext::new(profile_dir(profile.unwrap_or(id.key())));
+    let page_url = url.map(str::to_string).unwrap_or_else(|| id.login_url(None));
     let builder = WebViewBuilder::new_with_web_context(&mut ctx)
-        .with_url(url.map(str::to_string).unwrap_or_else(|| id.login_url(None)))
+        .with_url(page_url.clone())
         .with_initialization_script(script)
         .with_devtools(true)
         // "Continue with Google / X" open the provider in a popup that hands the login back
@@ -112,6 +113,7 @@ pub fn run_window(id: CasinoId, url: Option<&str>, profile: Option<&str>) -> Res
                     eprintln!("REPORT {t}");
                 }
                 let t = match (id.login_cookie(), id.cookie_login()) {
+                    _ if id.behind_cloudflare() => browser_token(&webview, &page_url, &t),
                     _ if id.login_jar().is_some() => match id.login_jar() {
                         Some((urls, names)) if reports_login(&t) => jar_token(&webview, urls, names, &t),
                         _ => serde_json::json!({ "token": "", "loggedIn": false }).to_string(),
@@ -187,6 +189,29 @@ fn jar_token(webview: &wry::WebView, urls: &[&str], names: &[&str], report: &str
     }
     let cookies = found.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
     let ua = serde_json::from_str::<serde_json::Value>(report).ok().and_then(|v| v["ua"].as_str().map(str::to_string));
+    let token = serde_json::json!({ "cookies": cookies, "ua": ua }).to_string();
+    serde_json::json!({ "token": token, "loggedIn": true }).to_string()
+}
+
+/// A casino behind Cloudflare checks (Stake): the user passes the check and logs in in this
+/// window, and the app then connects as this browser. The token is the window's cookies for the
+/// mirror it opened (`url`) that matter, the site login and Cloudflare's, with its User Agent:
+/// `{"cookies": "session=…; cf_clearance=…", "ua": …}`. Logged in once the site login is there.
+fn browser_token(webview: &wry::WebView, url: &str, report: &str) -> String {
+    use crate::cloudflare::{BOT_COOKIE, COOKIE, SESSION_COOKIE};
+    let mut found: Vec<(String, String)> = vec![];
+    for c in webview.cookies_for_url(url).unwrap_or_default() {
+        if [SESSION_COOKIE, COOKIE, BOT_COOKIE].contains(&c.name()) && !c.value().is_empty() && !found.iter().any(|(n, _)| n == c.name()) {
+            found.push((c.name().to_string(), c.value().to_string()));
+        }
+    }
+    let ua = serde_json::from_str::<serde_json::Value>(report).ok().and_then(|v| v["ua"].as_str().map(str::to_string)).filter(|u| !u.is_empty());
+    let (Some(ua), true) = (ua, found.iter().any(|(n, _)| n == SESSION_COOKIE)) else {
+        return serde_json::json!({ "token": "", "loggedIn": false }).to_string();
+    };
+    // the login first: Cloudflare renews `__cf_bm` now and then, which must not look like a new login
+    found.sort_by_key(|(n, _)| [SESSION_COOKIE, COOKIE, BOT_COOKIE].iter().position(|k| k == n));
+    let cookies = found.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
     let token = serde_json::json!({ "cookies": cookies, "ua": ua }).to_string();
     serde_json::json!({ "token": token, "loggedIn": true }).to_string()
 }

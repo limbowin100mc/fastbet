@@ -640,8 +640,17 @@ impl CasinoId {
   }, 2000);
 })();"#
             }
-            // Stake links with an API token only
-            CasinoId::Stake | CasinoId::StakeUs => "",
+            // Stake's login is the site's `session` cookie, which the window reads itself together
+            // with Cloudflare's (`login::browser_token`); the page only adds its User Agent.
+            CasinoId::Stake | CasinoId::StakeUs => {
+                r#"(function () {
+  if (window.top !== window || window.__fastbetWatch) return;
+  window.__fastbetWatch = true;
+  setInterval(function () {
+    try { window.ipc.postMessage(JSON.stringify({ token: '', loggedIn: false, ua: navigator.userAgent })); } catch (e) {}
+  }, 1500);
+})();"#
+            }
         }
     }
 
@@ -649,8 +658,8 @@ impl CasinoId {
     pub fn token_hint(self) -> &'static str {
         match self {
             CasinoId::ChipsGg => "On chips.gg open Settings → API Keys → Create API Key, copy the key (it is shown only once) and paste it here.",
-            CasinoId::Stake => "On Stake open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
-            CasinoId::StakeUs => "On Stake.us open Settings → Security → API Tokens, create a token, copy it and paste it here. Or log in with your browser below. It is stored on this PC only.",
+            CasinoId::Stake => "Log in to Stake in a window with the button below: no token needed, and any Cloudflare check is passed there. Or paste an API token (on Stake: Settings → Security → API Tokens). It is stored on this PC only.",
+            CasinoId::StakeUs => "Log in to Stake.us in a window with the button below: no token needed, and any Cloudflare check is passed there. Or paste an API token (on Stake.us: Settings → Security → API Tokens). It is stored on this PC only.",
             CasinoId::Shuffle => "Shuffle has no API keys: log in to Shuffle in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Goated => "Goated has no API keys: log in to Goated in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",
             CasinoId::Gambulls => "Gambulls has no API keys: log in to Gambulls in the window that opens with the button below. FastBet takes the login from the site, so your password never reaches the app. It is stored on this PC only.",

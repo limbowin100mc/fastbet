@@ -172,6 +172,9 @@ pub struct Settings {
     pub alert_hits: bool,
     pub alert_runs: bool,
     pub alert_vault: bool,
+    /// Settings → Display: how big FastBet draws, in percent (one of [`UI_SCALES`]); 0 follows
+    /// the Windows display scale.
+    pub ui_scale: u32,
 
     // slots
     pub slot_demo: bool,
@@ -526,6 +529,7 @@ impl Default for Settings {
             alert_hits: true,
             alert_runs: true,
             alert_vault: false,
+            ui_scale: 0,
             slot_demo: true,
             slot_stop_mult_on: false,
             slot_stop_mult: "100".into(),
@@ -855,6 +859,11 @@ impl Settings {
         Some(self.hit_sound_file.trim()).filter(|s| !s.is_empty()).map(PathBuf::from)
     }
 
+    /// Screen pixels per point for the size picked in Settings → Display; `None` = Windows' scale.
+    pub fn ui_scale(&self) -> Option<f32> {
+        UI_SCALES.contains(&self.ui_scale).then(|| self.ui_scale as f32 / 100.0)
+    }
+
     /// The client seed every seed change uses; `None` = a random one.
     pub fn client_seed(&self) -> Option<String> {
         Some(clean_seed_name(&self.seed_name)).filter(|s| self.own_seed && !s.is_empty())
@@ -866,6 +875,9 @@ impl Settings {
         self.seed_length.trim().parse::<usize>().map_or(RANDOM_SEED_DEFAULT, |n| n.clamp(lo, hi))
     }
 }
+
+/// The sizes Settings → Display offers, in percent of one screen pixel per point.
+pub const UI_SCALES: [u32; 5] = [100, 110, 125, 150, 175];
 
 /// Longest client seed name (Antebot's limit too).
 pub const SEED_NAME_MAX: usize = 128;
@@ -906,6 +918,18 @@ mod tests {
         s.seed_name = " !".into();
         assert_eq!(s.client_seed(), None);
         assert_eq!(clean_seed_name(&"a".repeat(200)).len(), SEED_NAME_MAX);
+    }
+
+    #[test]
+    fn display_size_is_one_of_the_offered() {
+        // older settings files have no size: Default, Windows' scale
+        let s: Settings = serde_json::from_str(r#"{"target":"2"}"#).expect("old settings");
+        assert_eq!(s.ui_scale(), None);
+        let s: Settings = serde_json::from_str(r#"{"ui_scale":125}"#).expect("a size");
+        assert_eq!(s.ui_scale(), Some(1.25));
+        // a size typed into the file by hand that the page doesn't offer is Default too
+        let s: Settings = serde_json::from_str(r#"{"ui_scale":133}"#).expect("an odd size");
+        assert_eq!(s.ui_scale(), None);
     }
 
     #[test]

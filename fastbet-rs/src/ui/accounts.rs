@@ -403,6 +403,7 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
     let mut save = false;
     let mut close = false;
     let mut window = false;
+    let mut browser_window = false;
     Frame::new()
         .fill(BG1)
         .stroke(Stroke::new(1.0, LINE))
@@ -459,7 +460,12 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
                         app.token_visible = !app.token_visible;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if id.window_login() {
+                        if id.behind_cloudflare() && cfg!(not(target_os = "android")) {
+                            let hint = "You log in on the casino's own site in a window. Any Cloudflare check is passed there, and no API token is needed.";
+                            if button(ui, &format!("Open {} to log in", picked_mirror(app)), Btn::Ghost, true, None).on_hover_text(hint).clicked() {
+                                browser_window = true;
+                            }
+                        } else if id.window_login() {
                             if pill_button(ui, "log in in a window instead", MUTED, false).clicked() {
                                 window = true;
                             }
@@ -483,6 +489,9 @@ fn settings_card(app: &mut App, ui: &mut Ui) {
     }
     if window {
         app.start_login();
+    }
+    if browser_window {
+        app.open_login_window();
     }
 }
 
@@ -976,17 +985,23 @@ fn check_modal(app: &mut App, ui: &mut Ui, since: std::time::Instant) {
                 if window_only && cred == 2 && button(ui, "Log in again", Btn::Primary, true, None).clicked() {
                     relogin = true;
                 }
+                if cloudflare && cfg!(not(target_os = "android")) && button(ui, "Log in in a window", Btn::Primary, true, None).clicked() {
+                    relogin = true;
+                }
                 if button(ui, "Open settings", Btn::Ghost, true, None).clicked() {
                     open_settings = true;
                 }
-                if cloudflare && reach == 2 && button(ui, "Log in with your browser", Btn::Ghost, true, None).clicked() {
+                if cloudflare && reach == 2 && cfg!(target_os = "android") && button(ui, "Log in with your browser", Btn::Ghost, true, None).clicked() {
                     set_cookie = true;
                 }
             });
         } else if stuck {
             ui.add_space(2.0);
-            ui.add(egui::Label::new(widgets::semi("Stuck on Cloudflare? If the casino website opens in your browser, copy that browser's User Agent and cookies into the app: it then connects as your browser.", 11.5, TEXT2)).wrap());
+            ui.add(egui::Label::new(widgets::semi("Stuck on Cloudflare? Log in to the casino in a window: you pass the check there yourself and the app connects with that login. Or copy your own browser's User Agent and cookies into the app.", 11.5, TEXT2)).wrap());
             ui.horizontal(|ui| {
+                if cfg!(not(target_os = "android")) && button(ui, "Log in in a window", Btn::Primary, true, None).clicked() {
+                    relogin = true;
+                }
                 if button(ui, "Set cookie manually", Btn::Ghost, true, None).clicked() {
                     set_cookie = true;
                 }

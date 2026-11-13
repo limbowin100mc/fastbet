@@ -48,7 +48,7 @@ use crate::slots::{PlayMode, Provider, SlotGame};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{pos2, Align, Frame, Key, Layout, Margin, RichText, Stroke};
+use egui::{pos2, vec2, Align, Frame, Key, Layout, Margin, RichText, Stroke, Vec2};
 
 use crate::casino::{BetRequest, CasinoId, ConnStatus, CurrencyInfo, Market, ProvableState};
 use crate::cloudflare::{Clearance, IpCheck};
@@ -59,6 +59,9 @@ use crate::settings::{Adjust, Settings, Unit};
 use crate::ui::stats::{History, Stats};
 use theme::{BG, BG1, GREEN, LINE, RED, TEXT2};
 use widgets::status_dot;
+
+/// The window's smallest size, in points: what the pages are laid out for.
+pub const MIN_WINDOW: Vec2 = vec2(1040.0, 640.0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -246,6 +249,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::install_visuals(&cc.egui_ctx);
+        // the size is Settings → Display's alone (egui's own Ctrl +/- zoom would fight it)
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
         let ctx = cc.egui_ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
@@ -341,8 +346,9 @@ impl App {
             whats_new: Default::default(),
             // FASTBET_PREFS=1: the Settings window opens at start (UI work)
             prefs_open: std::env::var("FASTBET_PREFS").is_ok(),
-            // FASTBET_PREFS=storage / sound / alerts opens it on that page
+            // FASTBET_PREFS=seed / storage / sound / alerts opens it on that page
             prefs_tab: match std::env::var("FASTBET_PREFS").as_deref() {
+                Ok("seed") => prefs::Tab::Seed,
                 Ok("storage") => prefs::Tab::Storage,
                 Ok("sound") => prefs::Tab::Sound,
                 Ok("alerts") => prefs::Tab::Alerts,
@@ -1266,6 +1272,44 @@ impl App {
         }
     }
 
+    /// Settings → Display: Default leaves egui on Windows' scale for the screen; a size draws that
+    /// many screen pixels per point. The window's smallest size grows with it, up to the screen.
+    fn apply_scale(&self, ctx: &egui::Context) {
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let zoom = self.settings.ui_scale().map_or(1.0, |s| s / native);
+        if (ctx.zoom_factor() - zoom).abs() > 0.001 {
+            ctx.set_zoom_factor(zoom);
+            return;
+        }
+        // the window's sizes come in points measured before a zoom takes over, so the smallest
+        // size is set on the second frame at the new zoom
+        let id = egui::Id::new("scale-min-size");
+        let (at, frames) = ctx.data(|d| d.get_temp::<(f32, u8)>(id)).unwrap_or_default();
+        if at != zoom {
+            ctx.data_mut(|d| d.insert_temp(id, (zoom, 1u8)));
+            ctx.request_repaint();
+            return;
+        }
+        if frames != 1 {
+            return;
+        }
+        ctx.data_mut(|d| d.insert_temp(id, (zoom, 2u8)));
+        let (screen, inner, maximized) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect, i.viewport().maximized == Some(true)));
+        let mut min = MIN_WINDOW;
+        if let Some(screen) = screen {
+            // room for the taskbar
+            min = min.min(screen - vec2(40.0, 80.0)).max(vec2(320.0, 240.0));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min));
+        // Windows doesn't hold a window without its frame to the smallest size, so it's grown here
+        if let Some(inner) = inner.filter(|_| !maximized) {
+            let size = inner.size().max(min);
+            if size != inner.size() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
+    }
+
     /// The update check made at start opens the dialog only when it finds an update.
     fn startup_update(&mut self) {
         if !self.update_on_start {
@@ -1408,6 +1452,20 @@ impl App {
         self.engine.send(Command::SetClearance(clearance));
     }
 
+    /// The login window's report for a casino behind Cloudflare (`login::browser_token`): keeps
+    /// its cookies and User Agent for the mirror it opened and gives back the site login.
+    fn take_browser_login(&mut self, report: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(report).ok()?;
+        let url = self.casino().login_url(self.settings.mirror().as_deref());
+        let mirror = crate::casino::stake::normalize_mirror(&url);
+        let clearance = Clearance::from_input(&mirror, v["ua"].as_str()?, v["cookies"].as_str()?).ok().flatten()?;
+        let session = clearance.session()?;
+        self.cf_agent_input = clearance.user_agent.clone();
+        self.cf_cookie_input = clearance.cookie.clone();
+        self.store_clearance(Some(clearance));
+        Some(session)
+    }
+
     /// Cloudflare section: Remove pressed.
     pub fn remove_clearance(&mut self) {
         self.cf_agent_input.clear();
@@ -1452,7 +1510,7 @@ impl App {
         };
         let Some(key) = self.typed_login(clearance.as_ref()) else {
             self.onboard_error = Some(if self.casino().behind_cloudflare() {
-                format!("Paste your {}, or the cookies of a browser where you're logged in.", self.casino().key_label())
+                format!("Paste your {}, or log in in a window with the button on the right.", self.casino().key_label())
             } else {
                 format!("Paste your {} first.", self.casino().key_label())
             });
@@ -1784,8 +1842,18 @@ impl App {
                 let report = session.last.clone();
                 if report.logged_in && !report.token.is_empty() && session.tried.as_deref() != Some(report.token.as_str()) {
                     session.tried = Some(report.token.clone());
-                    *self.settings.token_mut() = report.token.clone();
-                    self.engine.send(Command::SetToken(Some(report.token)));
+                    // behind Cloudflare the window hands over its cookies and User Agent: the
+                    // site login in them is the token, the rest is how the app connects
+                    let token = if self.casino().behind_cloudflare() {
+                        match self.take_browser_login(&report.token) {
+                            Some(t) => t,
+                            None => return,
+                        }
+                    } else {
+                        report.token
+                    };
+                    *self.settings.token_mut() = token.clone();
+                    self.engine.send(Command::SetToken(Some(token)));
                     return;
                 }
                 let tried = session.tried.is_some();
@@ -2348,6 +2416,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_scale(ctx);
         self.drain_events();
         self.member.tick();
         let unlocked = self.member.unlocked();
