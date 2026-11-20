@@ -114,8 +114,9 @@ const VIP_EVERY: u32 = 3;
 const ME: &str = "query FastbetMe { user { id name balances { available { amount currency } } \
     activeClientSeed { seed } activeServerSeed { seedHash nonce } } }";
 // The site's own currency setup: the USD rate of every coin and fiat (`baseRate`), the fiats it can
-// show amounts in, and the fiats it has launched as wallets.
-const RATES: &str = "query FastbetRates { currencyConfiguration(isAcp: false) { baseRates { currency baseRate } \
+// show amounts in, and the fiats it has launched as wallets. (Its `isAcp` argument was removed
+// from Stake's schema in 2026-11; the query is refused with it.)
+const RATES: &str = "query FastbetRates { currencyConfiguration { baseRates { currency baseRate } \
     launchedFiatCurrencies displayFiatCurrencies } }";
 /// Stake.us sweepstakes coins: in the rates, but not money on stake.com.
 const SOCIAL: &[&str] = &["gold", "sweeps"];
@@ -426,6 +427,15 @@ impl Stake {
                     self.status(ConnStatus::Connecting, msg);
                 }
                 Err(CallError::Blocked) => return Err(format!("{mirror} is blocked from your location. Pick another mirror.")),
+                // Stake itself answered, so the way in works: a refused rates query (Stake changes
+                // its schema now and then) must not keep the account from logging in
+                Err(CallError::Casino(CasinoError::Server(e))) => {
+                    tracing::warn!("stake: connected, but the rates query was refused: {e}");
+                    if shown {
+                        link.transport.show(false);
+                    }
+                    return Ok(());
+                }
                 Err(CallError::Casino(CasinoError::ConnectionLost)) => return Err(format!("The connection to {mirror} was closed")),
                 // a challenge page navigating away drops the request; just ask again
                 Err(CallError::Casino(e)) => {
@@ -525,6 +535,11 @@ impl Stake {
                 Ok(())
             }
             Err(CallError::Blocked) => Err(Some(format!("{mirror} is blocked from your location. Pick another mirror."))),
+            // answered by Stake, not Cloudflare: the cookies got us in
+            Err(CallError::Casino(CasinoError::Server(e))) => {
+                tracing::warn!("stake: connected directly, but the rates query was refused: {e}");
+                Ok(())
+            }
             Err(e) => {
                 tracing::info!("stake: direct connection refused: {}", CasinoError::from(e));
                 self.link.lock().take();
